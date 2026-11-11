@@ -1,0 +1,116 @@
+name: Specification review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths: ["specs/**"]
+
+permissions:
+  contents: read
+  copilot-requests: write
+
+jobs:
+  ambiguity:
+    name: spec-ambiguity
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install -g @github/copilot
+      - name: Prepare review input
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            echo '# Changed specification files'
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- specs
+            echo
+            echo '# Specification diff'
+            git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs
+          } > review-input.md
+      - name: Run persona
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: copilot --agent spec-ambiguity -p 'Read review-input.md and perform the assigned review.' --no-ask-user > spec-ambiguity.txt
+      - run: cat spec-ambiguity.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: spec-ambiguity
+          path: spec-ambiguity.txt
+
+  operability:
+    name: spec-operability
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install -g @github/copilot
+      - name: Prepare review input
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            echo '# Changed specification files'
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- specs
+            echo
+            echo '# Specification diff'
+            git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs
+          } > review-input.md
+      - name: Run persona
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: copilot --agent spec-operability -p 'Read review-input.md and perform the assigned review.' --no-ask-user > spec-operability.txt
+      - run: cat spec-operability.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: spec-operability
+          path: spec-operability.txt
+
+  security:
+    name: spec-security
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install -g @github/copilot
+      - name: Prepare review input
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            echo '# Changed specification files'
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- specs
+            echo
+            echo '# Specification diff'
+            git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs
+          } > review-input.md
+      - name: Run persona
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: copilot --agent spec-security -p 'Read review-input.md and perform the assigned review.' --no-ask-user > spec-security.txt
+      - run: cat spec-security.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: spec-security
+          path: spec-security.txt
