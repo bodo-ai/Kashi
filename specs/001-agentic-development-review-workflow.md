@@ -58,6 +58,7 @@ specs/
 docs/
   development/
     agentic-workflow.md
+```
 
 ## Local developer workflow
 

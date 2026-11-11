@@ -51,10 +51,11 @@ Other approved interactive coding agents are permitted. They must use the reposi
 
 ## 2. Install Superpowers
 
-Install Superpowers for OMP/Pi:
+Install Superpowers for OMP using its plugin marketplace:
 
 ```bash
-pi install git:github.com/obra/superpowers
+omp plugin marketplace add https://github.com/obra/superpowers-marketplace
+omp install superpowers@superpowers-marketplace
 ```
 
 Restart OMP, then confirm that Superpowers skills are available. Follow the workflow it enforces: use brainstorming to establish intent, approve a checked-in design before implementation, then produce an implementation plan. Do not bypass an applicable skill.
