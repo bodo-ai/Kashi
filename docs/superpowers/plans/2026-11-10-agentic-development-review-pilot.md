@@ -57,7 +57,7 @@ Use current official installation commands for each supported platform. Include 
 
 - [ ] **Step 4: Verify the actual local path**
 
-On one supported workstation of each platform family, execute the OMP/Copilot proof prompt, run a manual Roborev review with `agent = "copilot"`, and confirm `roborev status`.
+On a supported Linux/WSL2 workstation, execute the OMP/Copilot proof prompt, run a manual Roborev review with `agent = "copilot"`, and confirm `roborev status`. For macOS, verify package support against upstream installation documentation; a macOS smoke test is not required.
 
 Expected: OMP responds using Copilot; Roborev reports a local review; no setup step creates or changes a GitHub Actions workflow.
 
