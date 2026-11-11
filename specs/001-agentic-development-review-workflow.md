@@ -113,7 +113,7 @@ The workflow—not the model—captures stdout in a text artifact and writes it 
 
 ## GitHub Actions workflows
 
-Both workflows install the current Copilot CLI, authenticate only through `${{ github.token }}`, and use `contents: read` and `copilot-requests: write` for review jobs. They run `copilot --model claude-opus-5.5 --agent <profile> -p <prompt>` noninteractively, using the profile’s strict read-only tool set. They never use `--allow-all`, `--yolo`, `--allow-all-paths`, `COPILOT_GITHUB_TOKEN`, a PAT, or a personal secret. Separate publisher jobs have `actions: read` and `pull-requests: write`, but do not execute PR code or run a model.
+Both workflows install the current Copilot CLI, authenticate only through `${{ github.token }}`, and use `contents: read` and `copilot-requests: write` for review jobs. They run `copilot --model opus --agent <profile> -p <prompt>` noninteractively, using the profile’s strict read-only tool set. They never use `--allow-all`, `--yolo`, `--allow-all-paths`, `COPILOT_GITHUB_TOKEN`, a PAT, or a personal secret. Separate publisher jobs have `actions: read` and `pull-requests: write`, but do not execute PR code or run a model.
 
 The organization administrator must enable GitHub Copilot CLI billed to the organization. CI use then draws from the organization’s Copilot entitlement rather than a developer’s credential.
 
