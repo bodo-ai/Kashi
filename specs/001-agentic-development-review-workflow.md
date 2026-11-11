@@ -17,13 +17,13 @@ The pilot proves whether AI review findings are useful to humans before we build
 3. Run three independent review lenses when a pull request changes `specs/**`.
 4. Run general and conformance review personas on non-draft, same-repository pull requests.
 5. Use organization-billed GitHub Copilot CLI authentication through `GITHUB_TOKEN`; store no developer Copilot credential in CI.
-6. Make review output visible as GitHub Actions job summaries and downloadable workflow artifacts for human review.
+6. Publish each persona’s review as a PR comment, in addition to Actions summaries and artifacts.
 
 ## Non-goals
 
 - Automated implementation, test authoring, commits, branches, pull requests, or merges.
 - Roborev in GitHub Actions.
-- PR comments, inline review comments, comment lifecycle management, JSON report schemas, custom report publishers, or a Node/package-tooling project.
+- Inline review comments, JSON report schemas, custom report publishers, or a Node/package-tooling project.
 - A manifest protocol, separate worktrees, model aliases, LiteLLM, token budgets, fallbacks, or gateways.
 - Automated review of fork-originated pull requests.
 - Replacing deterministic CI, code ownership, or human PR review.
@@ -101,7 +101,7 @@ Every profile must end its output with a short human-readable report containing:
 - rationale and recommended action; and
 - an explicit “no findings” result when appropriate.
 
-The workflow—not the model—captures stdout in a text artifact and writes it to the Actions job summary. Findings are advisory; a finding never automatically fails a PR.
+The workflow—not the model—captures stdout in a text artifact and writes it to the Actions job summary. A separate publisher job posts or updates one PR comment per persona, with Claude Opus 5.5 identified in its heading. Findings are advisory; a finding never automatically fails a PR.
 
 | Profile | Scope | Required review question |
 | --- | --- | --- |
@@ -113,7 +113,7 @@ The workflow—not the model—captures stdout in a text artifact and writes it 
 
 ## GitHub Actions workflows
 
-Both workflows install the current Copilot CLI, authenticate only through `${{ github.token }}`, and declare `contents: read` and `copilot-requests: write`. They run `copilot --agent <profile> -p <prompt>` noninteractively, using the profile’s strict read-only tool set. They never use `--allow-all`, `--yolo`, `--allow-all-paths`, `COPILOT_GITHUB_TOKEN`, a PAT, or a personal secret.
+Both workflows install the current Copilot CLI, authenticate only through `${{ github.token }}`, and use `contents: read` and `copilot-requests: write` for review jobs. They run `copilot --model claude-opus-5.5 --agent <profile> -p <prompt>` noninteractively, using the profile’s strict read-only tool set. They never use `--allow-all`, `--yolo`, `--allow-all-paths`, `COPILOT_GITHUB_TOKEN`, a PAT, or a personal secret. Separate publisher jobs have `actions: read` and `pull-requests: write`, but do not execute PR code or run a model.
 
 The organization administrator must enable GitHub Copilot CLI billed to the organization. CI use then draws from the organization’s Copilot entitlement rather than a developer’s credential.
 
@@ -160,8 +160,8 @@ All persona results are advisory during the pilot. Workflow infrastructure failu
 
 1. A developer can follow the OMP example to authenticate OMP and Copilot CLI separately to their assigned Copilot seat, run a harmless OMP prompt, run manual local Roborev with `agent = "copilot"`, and inspect the result.
 2. The guide supports other coding agents and does not require Roborev’s optional agent hook.
-3. A same-repository PR changing `specs/**` runs the three independent, labeled specification-review jobs and exposes each report in its job summary and artifact.
-4. A same-repository non-draft PR with a valid governing-spec declaration runs independent general and conformance jobs and exposes their reports in summaries and artifacts.
+3. A same-repository PR changing `specs/**` runs the three independent, labeled specification-review jobs and exposes each report in its job summary, artifact, and PR comment.
+4. A same-repository non-draft PR with a valid governing-spec declaration runs independent general and conformance jobs and exposes their reports in summaries, artifacts, and PR comments. Re-runs update each persona’s existing comment.
 5. Persona profiles are read-only and the workflows use neither broad permission bypasses nor personal Copilot credentials.
 6. A draft PR, fork PR, or invalid/missing governing-spec declaration receives no PR persona run.
 7. Roborev does not appear in a GitHub Actions workflow.
