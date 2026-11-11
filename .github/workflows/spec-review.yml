@@ -14,9 +14,59 @@ permissions:
   copilot-requests: write
 
 jobs:
+  check:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      review: ${{ steps.previous.outputs.review }}
+      fingerprint: ${{ steps.diff.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fingerprint specification diff
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs > "$RUNNER_TEMP/spec.diff"
+          echo "fingerprint=$(sha256sum "$RUNNER_TEMP/spec.diff" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          if [ -s "$RUNNER_TEMP/spec.diff" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check previous reviews
+        id: previous
+        uses: actions/github-script@v8
+        env:
+          SPEC_FINGERPRINT: ${{ steps.diff.outputs.fingerprint }}
+          SPEC_CHANGED: ${{ steps.diff.outputs.changed }}
+        with:
+          script: |
+            if (process.env.SPEC_CHANGED !== 'true') {
+              core.setOutput('review', false);
+              return;
+            }
+            const {owner, repo} = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
+            const reviewed = ['spec-ambiguity', 'spec-operability', 'spec-security'].every(persona => {
+              const prefix = `<!-- agentic-review:${persona} -->\n<!-- spec-fingerprint:${process.env.SPEC_FINGERPRINT} -->\n`;
+              return comments.some(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith(prefix));
+            });
+            core.setOutput('review', !reviewed);
+
   ambiguity:
     name: spec-ambiguity
-    if: github.event.pull_request.head.repo.fork == false
+    needs: check
+    if: needs.check.outputs.review == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -52,7 +102,8 @@ jobs:
 
   operability:
     name: spec-operability
-    if: github.event.pull_request.head.repo.fork == false
+    needs: check
+    if: needs.check.outputs.review == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -88,7 +139,8 @@ jobs:
 
   security:
     name: spec-security
-    if: github.event.pull_request.head.repo.fork == false
+    needs: check
+    if: needs.check.outputs.review == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -123,8 +175,7 @@ jobs:
           path: spec-security.txt
 
   publish:
-    needs: [ambiguity, operability, security]
-    if: github.event.pull_request.head.repo.fork == false
+    needs: [check, ambiguity, operability, security]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -133,7 +184,10 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           path: reports
-      - uses: actions/github-script@v8
+      - name: Publish reviews
+        uses: actions/github-script@v8
+        env:
+          SPEC_FINGERPRINT: ${{ needs.check.outputs.fingerprint }}
         with:
           script: |
             const fs = require('fs');
@@ -148,7 +202,7 @@ jobs:
             for (const persona of ['spec-ambiguity', 'spec-operability', 'spec-security']) {
               const marker = `<!-- agentic-review:${persona} -->`;
               const text = fs.readFileSync(`reports/${persona}/${persona}.txt`, 'utf8');
-              const body = `${marker}\n## ${persona} — Claude Opus 5.5\n\n${text.slice(0, 60000)}`;
+              const body = `${marker}\n<!-- spec-fingerprint:${process.env.SPEC_FINGERPRINT} -->\n## ${persona} — Claude Opus 5.5\n\n${text.slice(0, 60000)}`;
               const previous = comments.find(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith(marker));
               if (previous) await github.rest.issues.updateComment({owner, repo, comment_id: previous.id, body});
               else await github.rest.issues.createComment({owner, repo, issue_number, body});

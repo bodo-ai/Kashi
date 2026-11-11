@@ -98,3 +98,7 @@ Roborev does not currently list OMP as a supported agent-hook target. OMP users 
 ## 4. Review pilot operating rule
 
 The GitHub Copilot CI personas use Claude Opus 5.5 and are advisory. Review their PR comments, Actions summaries, and artifacts alongside normal human and deterministic review. After ten same-repository reviewed pull requests, engineering evaluates signal quality, false positives, missed defects, workflow duration, and Copilot credit usage before adding automation or merge blocking.
+
+Specification reviews run automatically for changed spec diffs and are skipped once all three reports for the same diff have been published. Older reports without a fingerprint are reviewed once more.
+
+To request the general and conformance reviews, post `/review` as a new PR conversation comment. The requester must be a repository owner, member, or collaborator; the PR must be open, non-draft, from the same repository, and have a valid governing-spec declaration. Pushes do not request another review; post a new comment when needed. GitHub only runs comment-triggered workflows that exist on the default branch.
