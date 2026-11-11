@@ -82,6 +82,8 @@ Run the first review manually:
 
 ```bash
 roborev review
+roborev wait
+roborev show
 roborev status
 ```
 
