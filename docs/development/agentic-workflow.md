@@ -1,12 +1,12 @@
 # Local agentic-development workflow
 
-This guide supports x64 Linux (including WSL2 Linux) and macOS with Bash, Git, Node.js LTS, and an organization-assigned GitHub Copilot seat. Developers may use any approved coding agent. Oh-my-pi (OMP) is the worked example.
+This guide supports x64 Linux (including WSL2 Linux) and macOS with Bash, Git, Node.js LTS, and an organization-assigned GitHub Copilot seat. Developers may use any coding agent. Oh-my-pi (OMP) is the worked example.
 
 CI authenticates separately with GitHub Actions' `GITHUB_TOKEN`. Do not copy a personal Copilot token, OAuth state, or developer credential into repository secrets.
 
 ## 1. Install a coding agent and Copilot CLI
 
-### Linux or WSL2 Linux
+### Linux
 
 ```bash
 curl -fsSL https://omp.sh/install | sh
@@ -47,18 +47,15 @@ copilot
 # In Copilot CLI: /login
 ```
 
-Other approved interactive coding agents are permitted. They must use the repository rules and authenticate to an entitled provider themselves.
-
 ## 2. Install Superpowers
 
 Install Superpowers for OMP using its plugin marketplace:
 
 ```bash
-omp plugin marketplace add https://github.com/obra/superpowers-marketplace
-omp install superpowers@superpowers-marketplace
+omp install git:github.com/obra/superpowers
 ```
 
-Restart OMP and open `/extensions`. Its Skills view should list Superpowers skills such as `brainstorming`. Follow the workflow it enforces: use brainstorming to establish intent, approve a checked-in design before implementation, then produce an implementation plan. Do not bypass an applicable skill.
+Restart OMP and open `/extensions`. Its Skills view should list Superpowers skills such as `brainstorming`. Follow the workflow it enforces: use brainstorming to establish intent, approve a checked-in design before implementation, then produce an implementation plan.
 
 ## 3. Install and initialize Roborev
 
@@ -89,16 +86,10 @@ roborev status
 
 Roborev is local-only. No GitHub Actions workflow invokes it.
 
-## Optional: Roborev agent hook
 
-`roborev agent-hook install` can inject unresolved-review reminders into supported coding agents. It can extend sessions, steer work toward noisy findings, and edit the live working tree when the agent has broad permissions. Do not install it until local review guidelines have been calibrated on real work.
-
-Roborev does not currently list OMP as a supported agent-hook target. OMP users should use the manual `roborev review` and `roborev status` loop unless support is verified in a later update.
-
-## 4. Review pilot operating rule
+## 4. PR Reviews
 
 The GitHub Copilot CI personas produce advisory findings, but successful completion of the applicable reviews is required for merge.
 
-Post an exact `/review` as a new PR conversation comment. The requester must be a repository owner, member, or collaborator; the PR must be open, non-draft, and from the same repository. Changes under `specs/` receive the three specification reviews, excluding individually unchanged specs whose reviews are already complete. Changes elsewhere receive general review; when the PR also changes specs, conformance review compares the implementation with those specs. No governing-spec declaration is required. Pushes do not request another review; post a new comment for the new head.
+Post an exact `/review` as a new PR conversation comment. The PR must be open, non-draft, and from the same repository. Changes under `specs/` receive the three specification reviews, excluding individually unchanged specs whose reviews are already complete. Changes elsewhere receive general review; when the PR also changes specs, conformance review compares the implementation with those specs. No governing-spec declaration is required. Pushes do not request another review; post a new comment for the new head.
 
-GitHub runs comment-triggered workflows only after they exist on the default branch. Bootstrap the workflow on that branch before enforcing the required status. Then configure branch protection to require the `agentic-review` commit status, require the PR branch to be up to date, and apply the rule to administrators. Without that rule the workflow status does not block merges. Fork PRs are outside the pilot and cannot satisfy this required status without a human-approved bypass or another review process.
