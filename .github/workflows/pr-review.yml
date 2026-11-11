@@ -1,32 +1,53 @@
 name: Pull request review
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-
-concurrency:
-  group: pr-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   eligibility:
-    if: github.event.pull_request.head.repo.fork == false && github.event.pull_request.draft == false
+    if: github.event.issue.pull_request != null
     runs-on: ubuntu-latest
     outputs:
       eligible: ${{ steps.metadata.outputs.eligible }}
       spec: ${{ steps.metadata.outputs.spec }}
+      base: ${{ steps.request.outputs.base }}
+      head: ${{ steps.request.outputs.head }}
+      body: ${{ steps.request.outputs.body }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Resolve review request
+        id: request
+        uses: actions/github-script@v8
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          script: |
+            const {issue, comment} = context.payload;
+            if (!issue.pull_request || comment.body.trim() !== '/review' ||
+                !['OWNER', 'MEMBER', 'COLLABORATOR'].includes(comment.author_association)) {
+              return;
+            }
+            const {owner, repo} = context.repo;
+            const pr = (await github.rest.pulls.get({owner, repo, pull_number: issue.number})).data;
+            if (pr.state !== 'open' || pr.draft || pr.head.repo?.full_name !== `${owner}/${repo}`) {
+              return;
+            }
+            core.setOutput('eligible', true);
+            core.setOutput('base', pr.base.sha);
+            core.setOutput('head', pr.head.sha);
+            core.setOutput('body', pr.body || '');
+      - uses: actions/checkout@v6
+        if: steps.request.outputs.eligible == 'true'
+        with:
+          ref: ${{ steps.request.outputs.head }}
           persist-credentials: false
       - name: Validate governing specification
         id: metadata
+        if: steps.request.outputs.eligible == 'true'
         env:
-          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BODY: ${{ steps.request.outputs.body }}
         run: |
           python3 - <<'PY'
           import os
@@ -59,6 +80,9 @@ jobs:
     if: needs.eligibility.outputs.eligible == 'true'
     name: ${{ matrix.persona }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: pr-review-${{ github.event.issue.number }}-${{ matrix.persona }}
+      cancel-in-progress: true
     permissions:
       contents: read
       copilot-requests: write
@@ -69,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.eligibility.outputs.head }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v7
@@ -78,9 +102,9 @@ jobs:
       - run: npm install -g @github/copilot
       - name: Prepare review input
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ needs.eligibility.outputs.base }}
+          HEAD_SHA: ${{ needs.eligibility.outputs.head }}
+          PR_BODY: ${{ needs.eligibility.outputs.body }}
           SPEC_PATH: ${{ needs.eligibility.outputs.spec }}
         run: |
           {
@@ -110,8 +134,7 @@ jobs:
           path: review.txt
 
   publish:
-    needs: review
-    if: github.event.pull_request.head.repo.fork == false
+    needs: [eligibility, review]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -121,13 +144,15 @@ jobs:
         with:
           path: reports
       - uses: actions/github-script@v8
+        env:
+          REVIEW_HEAD: ${{ needs.eligibility.outputs.head }}
         with:
           script: |
             const fs = require('fs');
             const {owner, repo} = context.repo;
             const issue_number = context.issue.number;
             const pr = await github.rest.pulls.get({owner, repo, pull_number: issue_number});
-            if (pr.data.head.sha !== context.payload.pull_request.head.sha) {
+            if (pr.data.head.sha !== process.env.REVIEW_HEAD) {
               core.warning('Skipping stale review for an older PR head');
               return;
             }
