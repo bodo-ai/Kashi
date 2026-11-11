@@ -97,8 +97,8 @@ Roborev does not currently list OMP as a supported agent-hook target. OMP users 
 
 ## 4. Review pilot operating rule
 
-The GitHub Copilot CI personas use Claude Opus 5.5 and are advisory. Review their PR comments, Actions summaries, and artifacts alongside normal human and deterministic review. After ten same-repository reviewed pull requests, engineering evaluates signal quality, false positives, missed defects, workflow duration, and Copilot credit usage before adding automation or merge blocking.
+The GitHub Copilot CI personas use Claude Opus 5.5. Their findings are advisory, but successful completion of the applicable reviews is required for merge.
 
-Specification reviews run automatically for changed spec diffs and are skipped once all three reports for the same diff have been published. Older reports without a fingerprint are reviewed once more.
+Post an exact `/review` as a new PR conversation comment. The requester must be a repository owner, member, or collaborator; the PR must be open, non-draft, and from the same repository. Changes under `specs/` receive the three specification reviews; changes elsewhere receive general and conformance reviews and require a valid governing-spec declaration. A mixed PR receives both. Previously published spec reviews of an unchanged spec diff are reused. Pushes do not request another review; post a new comment for the new head.
 
-To request the general and conformance reviews, post `/review` as a new PR conversation comment. The requester must be a repository owner, member, or collaborator; the PR must be open, non-draft, from the same repository, and have a valid governing-spec declaration. Pushes do not request another review; post a new comment when needed. GitHub only runs comment-triggered workflows that exist on the default branch.
+GitHub runs comment-triggered workflows only after they exist on the default branch. Bootstrap the workflow on that branch before enforcing the required status. Then configure branch protection to require the `agentic-review` commit status, require the PR branch to be up to date, and apply the rule to administrators. Without that rule the workflow status does not block merges. Fork PRs are outside the pilot and cannot satisfy this required status without a human-approved bypass or another review process.
