@@ -31,10 +31,10 @@ Start OMP from the repository and authenticate to GitHub Copilot through its sup
 
 ```bash
 omp
-# In OMP: /login
+# In OMP: /login github-copilot
 ```
 
-Select an entitled Copilot model, then run a harmless read-only prompt such as:
+In OMP, run `/model` and select an entitled `github-copilot/...` model. Then run a harmless read-only prompt such as:
 
 ```text
 List the files at the repository root. Do not edit anything.
@@ -58,7 +58,7 @@ omp plugin marketplace add https://github.com/obra/superpowers-marketplace
 omp install superpowers@superpowers-marketplace
 ```
 
-Restart OMP, then confirm that Superpowers skills are available. Follow the workflow it enforces: use brainstorming to establish intent, approve a checked-in design before implementation, then produce an implementation plan. Do not bypass an applicable skill.
+Restart OMP and open `/extensions`. Its Skills view should list Superpowers skills such as `brainstorming`. Follow the workflow it enforces: use brainstorming to establish intent, approve a checked-in design before implementation, then produce an implementation plan. Do not bypass an applicable skill.
 
 ## 3. Install and initialize Roborev
 
