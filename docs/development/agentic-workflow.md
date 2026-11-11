@@ -97,4 +97,4 @@ Roborev does not currently list OMP as a supported agent-hook target. OMP users 
 
 ## 4. Review pilot operating rule
 
-The GitHub Copilot CI personas are advisory. Review their Actions summaries and artifacts alongside normal human and deterministic review. After ten same-repository reviewed pull requests, engineering evaluates signal quality, false positives, missed defects, workflow duration, and Copilot credit usage before adding automation or merge blocking.
+The GitHub Copilot CI personas use Claude Opus 5.5 and are advisory. Review their PR comments, Actions summaries, and artifacts alongside normal human and deterministic review. After ten same-repository reviewed pull requests, engineering evaluates signal quality, false positives, missed defects, workflow duration, and Copilot credit usage before adding automation or merge blocking.
