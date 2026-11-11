@@ -97,8 +97,8 @@ Roborev does not currently list OMP as a supported agent-hook target. OMP users 
 
 ## 4. Review pilot operating rule
 
-The GitHub Copilot CI personas use Claude Opus 5.5. Their findings are advisory, but successful completion of the applicable reviews is required for merge.
+The GitHub Copilot CI personas produce advisory findings, but successful completion of the applicable reviews is required for merge.
 
-Post an exact `/review` as a new PR conversation comment. The requester must be a repository owner, member, or collaborator; the PR must be open, non-draft, and from the same repository. Changes under `specs/` receive the three specification reviews; changes elsewhere receive general and conformance reviews and require a valid governing-spec declaration. A mixed PR receives both. Previously published spec reviews of an unchanged spec diff are reused. Pushes do not request another review; post a new comment for the new head.
+Post an exact `/review` as a new PR conversation comment. The requester must be a repository owner, member, or collaborator; the PR must be open, non-draft, and from the same repository. Changes under `specs/` receive the three specification reviews, excluding individually unchanged specs whose reviews are already complete. Changes elsewhere receive general review; when the PR also changes specs, conformance review compares the implementation with those specs. No governing-spec declaration is required. Pushes do not request another review; post a new comment for the new head.
 
 GitHub runs comment-triggered workflows only after they exist on the default branch. Bootstrap the workflow on that branch before enforcing the required status. Then configure branch protection to require the `agentic-review` commit status, require the PR branch to be up to date, and apply the rule to administrators. Without that rule the workflow status does not block merges. Fork PRs are outside the pilot and cannot satisfy this required status without a human-approved bypass or another review process.

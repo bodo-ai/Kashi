@@ -26,11 +26,10 @@ jobs:
       head: ${{ steps.request.outputs.head }}
       merge: ${{ steps.request.outputs.merge }}
       body: ${{ steps.request.outputs.body }}
-      spec: ${{ steps.metadata.outputs.spec }}
-      code_eligible: ${{ steps.metadata.outputs.eligible }}
       spec_changed: ${{ steps.diff.outputs.changed }}
       other_changed: ${{ steps.diff.outputs.other_changed }}
-      fingerprint: ${{ steps.diff.outputs.fingerprint }}
+      pending_specs: ${{ steps.previous.outputs.pending }}
+      reviewed_specs: ${{ steps.previous.outputs.reviewed }}
       spec_needed: ${{ steps.previous.outputs.review }}
     steps:
       - name: Resolve review request
@@ -82,7 +81,6 @@ jobs:
         run: |
           git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs > "$RUNNER_TEMP/spec.diff"
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)specs' > "$RUNNER_TEMP/other-files"
-          echo "fingerprint=$(sha256sum "$RUNNER_TEMP/spec.diff" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           if [ -s "$RUNNER_TEMP/spec.diff" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -98,53 +96,31 @@ jobs:
         id: previous
         uses: actions/github-script@v8
         env:
-          SPEC_FINGERPRINT: ${{ steps.diff.outputs.fingerprint }}
-          SPEC_CHANGED: ${{ steps.diff.outputs.changed }}
+          BASE_SHA: ${{ steps.request.outputs.base }}
+          HEAD_SHA: ${{ steps.request.outputs.head }}
         with:
           script: |
-            if (process.env.SPEC_CHANGED !== 'true') {
-              core.setOutput('review', false);
-              return;
-            }
+            const {execFileSync} = require('child_process');
+            const {createHash} = require('crypto');
             const {owner, repo} = context.repo;
-            const issue_number = context.issue.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
-            const reviewed = ['spec-ambiguity', 'spec-operability', 'spec-security'].every(persona => {
-              const prefix = `<!-- agentic-review:${persona} -->\n<!-- spec-fingerprint:${process.env.SPEC_FINGERPRINT} -->\n`;
-              return comments.some(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith(prefix));
-            });
-            core.setOutput('review', !reviewed);
-      - name: Validate governing specification
-        id: metadata
-        if: steps.request.outputs.eligible == 'true' && steps.diff.outputs.other_changed == 'true'
-        env:
-          PR_BODY: ${{ steps.request.outputs.body }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import pathlib
-          import re
-
-          body = os.environ.get('PR_BODY', '')
-          declarations = re.findall(r'<!-- agentic-review:[\s\S]*?-->', body)
-          markers = body.count('<!-- agentic-review:')
-          spec = ''
-          eligible = False
-          if markers == 1 and len(declarations) == 1:
-              declaration = declarations[0]
-              match = re.fullmatch(r'<!-- agentic-review: spec=(specs/[0-9]{3}-[a-z0-9]+(?:-[a-z0-9]+)*\.md) -->', declaration)
-              if match:
-                  spec = match.group(1)
-                  root = pathlib.Path.cwd().resolve()
-                  path = (root / spec).resolve()
-                  eligible = path.is_relative_to(root / 'specs') and path.is_file()
-              elif declaration == '<!-- agentic-review: spec-exception=human-approved -->':
-                  eligible = bool(body.replace(declaration, '').strip())
-          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              output.write(f'eligible={str(eligible).lower()}\n')
-              if eligible and spec:
-                  output.write(f'spec={spec}\n')
-          PY
+            const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number: context.issue.number});
+            const record = comments.find(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith('<!-- agentic-review:spec-record -->\n'));
+            let reviewed = {};
+            if (record) {
+              const encoded = record.body.match(/<!-- spec-reviewed:([A-Za-z0-9+/=]+) -->/);
+              if (encoded) reviewed = JSON.parse(Buffer.from(encoded[1], 'base64').toString('utf8'));
+            }
+            const base = process.env.BASE_SHA, head = process.env.HEAD_SHA;
+            const files = execFileSync('git', ['diff', '--name-only', '-z', '--no-renames', base, head, '--', 'specs']).toString('utf8').split('\0').filter(Boolean);
+            const pending = {};
+            for (const file of files) {
+              const diff = execFileSync('git', ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-renames', base, head, '--', file]);
+              const fingerprint = createHash('sha256').update(diff).digest('hex');
+              if (reviewed[file] !== fingerprint) pending[file] = fingerprint;
+            }
+            core.setOutput('pending', JSON.stringify(pending));
+            core.setOutput('reviewed', JSON.stringify(reviewed));
+            core.setOutput('review', Object.keys(pending).length > 0);
 
   spec_review:
     needs: eligibility
@@ -172,14 +148,15 @@ jobs:
         env:
           BASE_SHA: ${{ needs.eligibility.outputs.base }}
           HEAD_SHA: ${{ needs.eligibility.outputs.head }}
+          PENDING_SPECS: ${{ needs.eligibility.outputs.pending_specs }}
         run: |
-          {
-            echo '# Changed specification files'
-            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- specs
-            echo
-            echo '# Specification diff'
-            git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs
-          } > review-input.md
+          node - <<'NODE'
+          const fs = require('fs');
+          const {execFileSync} = require('child_process');
+          const files = Object.keys(JSON.parse(process.env.PENDING_SPECS));
+          const diff = execFileSync('git', ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-renames', process.env.BASE_SHA, process.env.HEAD_SHA, '--', ...files]);
+          fs.writeFileSync('review-input.md', '# Changed specification files\n' + files.map(file => JSON.stringify(file)).join('\n') + '\n\n# Specification diff\n' + diff.toString('utf8'));
+          NODE
       - name: Run persona
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -195,7 +172,7 @@ jobs:
 
   pr_review:
     needs: eligibility
-    if: needs.eligibility.outputs.other_changed == 'true' && needs.eligibility.outputs.code_eligible == 'true'
+    if: needs.eligibility.outputs.other_changed == 'true'
     name: ${{ matrix.persona }}
     runs-on: ubuntu-latest
     permissions:
@@ -204,7 +181,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        persona: [pr-review, conformance]
+        persona: ${{ fromJSON(needs.eligibility.outputs.spec_changed == 'true' && '["pr-review","conformance"]' || '["pr-review"]') }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -220,7 +197,6 @@ jobs:
           BASE_SHA: ${{ needs.eligibility.outputs.base }}
           HEAD_SHA: ${{ needs.eligibility.outputs.head }}
           PR_BODY: ${{ needs.eligibility.outputs.body }}
-          SPEC_PATH: ${{ needs.eligibility.outputs.spec }}
         run: |
           {
             echo '# Pull request description'
@@ -229,13 +205,11 @@ jobs:
             echo '# Changed files'
             git diff --name-only "$BASE_SHA" "$HEAD_SHA"
             echo
+            echo '# Changed specifications'
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- specs
+            echo
             echo '# Pull request diff'
             git diff --find-renames "$BASE_SHA" "$HEAD_SHA"
-            if [ -n "$SPEC_PATH" ]; then
-              echo
-              echo "# Governing specification: $SPEC_PATH"
-              cat "$SPEC_PATH"
-            fi
           } > review-input.md
       - name: Run persona
         env:
@@ -275,9 +249,9 @@ jobs:
           SPEC_NEEDED: ${{ needs.eligibility.outputs.spec_needed }}
           SPEC_RESULT: ${{ needs.spec_review.result }}
           OTHER_CHANGED: ${{ needs.eligibility.outputs.other_changed }}
-          CODE_ELIGIBLE: ${{ needs.eligibility.outputs.code_eligible }}
           PR_RESULT: ${{ needs.pr_review.result }}
-          SPEC_FINGERPRINT: ${{ needs.eligibility.outputs.fingerprint }}
+          PENDING_SPECS: ${{ needs.eligibility.outputs.pending_specs }}
+          REVIEWED_SPECS: ${{ needs.eligibility.outputs.reviewed_specs }}
         with:
           script: |
             const fs = require('fs');
@@ -300,19 +274,26 @@ jobs:
               if (process.env.ELIGIBILITY_RESULT !== 'success' ||
                   (process.env.SPEC_CHANGED !== 'true' && process.env.OTHER_CHANGED !== 'true') ||
                   (process.env.SPEC_NEEDED === 'true' && process.env.SPEC_RESULT !== 'success') ||
-                  (process.env.OTHER_CHANGED === 'true' &&
-                    (process.env.CODE_ELIGIBLE !== 'true' || process.env.PR_RESULT !== 'success'))) {
+                  (process.env.OTHER_CHANGED === 'true' && process.env.PR_RESULT !== 'success')) {
                 throw new Error('Required reviews did not complete successfully');
               }
               const personas = [];
               if (process.env.SPEC_NEEDED === 'true') personas.push('spec-ambiguity', 'spec-operability', 'spec-security');
-              if (process.env.OTHER_CHANGED === 'true') personas.push('pr-review', 'conformance');
+              if (process.env.OTHER_CHANGED === 'true') personas.push('pr-review');
+              if (process.env.OTHER_CHANGED === 'true' && process.env.SPEC_CHANGED === 'true') personas.push('conformance');
               const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
               for (const persona of personas) {
                 const marker = `<!-- agentic-review:${persona} -->`;
-                const fingerprint = persona.startsWith('spec-') ? `\n<!-- spec-fingerprint:${process.env.SPEC_FINGERPRINT} -->` : '';
                 const text = fs.readFileSync(`reports/${persona}/${persona}.txt`, 'utf8');
-                const body = `${marker}${fingerprint}\n## ${persona} — Claude Opus 5.5\n\n${text.slice(0, 60000)}`;
+                const body = `${marker}\n## ${persona}\n\n${text.slice(0, 60000)}`;
+                const previous = comments.find(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith(marker));
+                if (previous) await github.rest.issues.updateComment({owner, repo, comment_id: previous.id, body});
+                else await github.rest.issues.createComment({owner, repo, issue_number, body});
+              }
+              if (process.env.SPEC_NEEDED === 'true') {
+                const marker = '<!-- agentic-review:spec-record -->';
+                const reviewed = {...JSON.parse(process.env.REVIEWED_SPECS), ...JSON.parse(process.env.PENDING_SPECS)};
+                const body = `${marker}\n<!-- spec-reviewed:${Buffer.from(JSON.stringify(reviewed)).toString('base64')} -->`;
                 const previous = comments.find(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith(marker));
                 if (previous) await github.rest.issues.updateComment({owner, repo, comment_id: previous.id, body});
                 else await github.rest.issues.createComment({owner, repo, issue_number, body});

@@ -14,8 +14,8 @@ The pilot proves whether AI review findings are useful to humans before we build
 
 1. Keep specifications in `specs/` as the authoritative, versioned source of implementation intent.
 2. Provide a local setup guide for a coding agent, GitHub Copilot, Superpowers, and local-only Roborev.
-3. On an explicit `/review` comment, run three independent review lenses for changes to `specs/**`, without repeating a completed review of an unchanged spec diff.
-4. On the same request, run general and conformance review personas when files outside `specs/**` change.
+3. On an explicit `/review` comment, run three independent review lenses for changes to `specs/**`, without repeating completed reviews of individual unchanged spec diffs.
+4. On the same request, run general review for changes outside `specs/**` and conformance review when the PR also changes specs.
 5. Use organization-billed GitHub Copilot CLI authentication through `GITHUB_TOKEN`; store no developer Copilot credential in CI.
 6. Publish each persona’s review as a PR comment, in addition to Actions summaries and artifacts.
 
@@ -41,7 +41,7 @@ The pilot proves whether AI review findings are useful to humans before we build
 
 ```text
 specs/
-  001-agentic-development-review-workflow.md
+  agent-development-review-workflow.md
   README.md
 .github/
   agents/
@@ -52,7 +52,6 @@ specs/
     conformance.agent.md
   workflows/
     pr-review.yml
-  pull_request_template.md
 .roborev.toml
 docs/
   development/
@@ -100,7 +99,7 @@ Every profile must end its output with a short human-readable report containing:
 - rationale and recommended action; and
 - an explicit “no findings” result when appropriate.
 
-The workflow—not the model—captures stdout in a text artifact and writes it to the Actions job summary. A separate publisher job posts or updates one PR comment per persona, with Claude Opus 5.5 identified in its heading. Findings are advisory; a finding never automatically fails a PR.
+The workflow—not the model—captures stdout in a text artifact and writes it to the Actions job summary. A separate publisher job posts or updates one PR comment per persona. Findings are advisory; a finding never automatically fails a PR.
 
 | Profile | Scope | Required review question |
 | --- | --- | --- |
@@ -108,35 +107,21 @@ The workflow—not the model—captures stdout in a text artifact and writes it 
 | `spec-operability` | Changed specification and related delivery/operational documents. | Does the design name observable failure handling, ownership, and verification where needed? |
 | `spec-security` | Changed specification and named security-sensitive interfaces. | Does the design introduce a credible authorization, data, secret, supply-chain, or trust-boundary gap? |
 | `pr-review` | Pull-request diff and changed files. | Does the change introduce correctness, regression, security, or repository-rule problems? |
-| `conformance` | Pull-request diff and governing specification. | Does the implementation meet each stated acceptance criterion, or is evidence insufficient? |
+| `conformance` | Pull-request diff and changed specifications. | Does the implementation meet each stated acceptance criterion, or is evidence insufficient? |
 
 ## GitHub Actions workflow
 
-The workflow installs the current Copilot CLI, authenticates only through `${{ github.token }}`, and uses `contents: read` and `copilot-requests: write` for review jobs. It runs `copilot --model opus --agent <profile> -p <prompt>` noninteractively, using the profile’s strict read-only tool set. It never uses `--allow-all`, `--yolo`, `--allow-all-paths`, `COPILOT_GITHUB_TOKEN`, a PAT, or a personal secret. The publisher has `actions: read`, `pull-requests: write`, and `statuses: write`, but does not execute PR code or run a model.
+The workflow installs the current Copilot CLI, authenticates only through `${{ github.token }}`, and uses `contents: read` and `copilot-requests: write` for review jobs. It runs `copilot --agent <profile> -p <prompt>` noninteractively, using the profile’s strict read-only tool set. It never uses `--allow-all`, `--yolo`, `--allow-all-paths`, `COPILOT_GITHUB_TOKEN`, a PAT, or a personal secret. The publisher has `actions: read`, `pull-requests: write`, and `statuses: write`, but does not execute PR code or run a model.
 
 The organization administrator must enable GitHub Copilot CLI billed to the organization. CI use then draws from the organization’s Copilot entitlement rather than a developer’s credential.
 
 ### Requested reviews
 
-`pr-review.yml` runs only on newly created PR conversation comments. An exact `/review` comment from a repository owner, member, or collaborator requests reviews of the current open, non-draft, same-repository PR. For changes to `specs/**`, it runs `spec-ambiguity`, `spec-operability`, and `spec-security` as independent parallel jobs unless all three bot-authored persona comments already record the same base/head spec-diff fingerprint. Comments without a fingerprint do not count as a completed review. Each job supplies the spec diff and changed-file list, uploads its stdout as an artifact, and appends it to its job summary.
+`pr-review.yml` runs only on newly created PR conversation comments. An exact `/review` comment from a repository owner, member, or collaborator requests reviews of the current open, non-draft, same-repository PR. For changed files under `specs/**`, it runs `spec-ambiguity`, `spec-operability`, and `spec-security` as independent parallel jobs only for files whose current individual diffs are absent from the bot-authored completed-review record. The record is updated only after all three personas and their publication succeed. Each job supplies the selected spec diffs and file list, uploads its stdout as an artifact, and appends it to its job summary.
 
 ### Pull-request review
 
-For changes outside `specs/**`, the request also runs `pr-review` and `conformance`, provided the PR body contains exactly one declaration:
-
-```text
-<!-- agentic-review: spec=specs/NNN-kebab-case-title.md -->
-```
-
-or:
-
-```text
-<!-- agentic-review: spec-exception=human-approved -->
-```
-
-The PR body is eligible only when it contains exactly one complete, allowed declaration and no other `<!-- agentic-review:` marker. A malformed or duplicate marker makes the PR ineligible. The spec path must exist at the PR head and match `specs/[0-9][0-9][0-9]-*.md`. The exception declaration requires non-empty human-written text after all agentic-review comments are removed from the body.
-
-For an eligible code-review request, the workflow creates a review-input file with the PR diff, changed-file list, PR metadata, and the governing specification or exception reason. It runs `pr-review` and `conformance` as separate jobs, then uploads each stdout file and writes it to the job summary. Conformance may cite test output when it is present in its inputs, but must label unproven criteria `insufficient evidence`.
+For changes outside `specs/**`, the request runs `pr-review`. When the same PR also changes specs, it runs `conformance` independently against those changed specs. No governing-spec declaration is required. Each job receives the PR diff, changed-file list, and PR description, then uploads its stdout and writes it to the job summary. Conformance may cite test output when it is present in its inputs, but must label unproven criteria `insufficient evidence`.
 
 Fork-originated PRs are intentionally out of scope for the pilot: they receive no Copilot persona run, artifact, comment, or write-capable token. Human review remains the only review path.
 
@@ -144,12 +129,8 @@ Fork-originated PRs are intentionally out of scope for the pilot: they receive n
 
 `specs/README.md` defines this repository convention:
 
-- Specifications are named `NNN-kebab-case-title.md`.
-- A feature PR declares its governing spec using the PR-template comment.
-- A specification changes through its own reviewed PR before implementation starts.
-- A missing governing spec is a human-approved exception with a written reason.
-
-`.github/pull_request_template.md` contains both declaration forms and brief instructions that exactly one is required.
+- Any file under `specs/` may be a specification; no numbered naming convention or PR declaration is required.
+- A specification should be reviewed before implementation starts.
 
 Protect the base branch with the required commit status `agentic-review`, require the branch to be up to date, and apply the rule to administrators. The workflow sets this status on the reviewed PR head and test merge commit to pending, then to success only after every applicable review and publication succeeds against the same head, base, and merge commit; failure or stale results remain blocking. If GitHub has not generated a test merge commit, request another review when it is available. A new head requires another `/review`. Findings remain advisory and do not determine the status. The comment-triggered workflow must first exist on the default branch; bootstrap it before enforcing the required status.
 
@@ -157,10 +138,10 @@ Protect the base branch with the required commit status `agentic-review`, requir
 
 1. A developer can follow the OMP example to authenticate OMP and Copilot CLI separately to their assigned Copilot seat, run a harmless OMP prompt, run manual local Roborev with `agent = "copilot"`, and inspect the result.
 2. The guide supports other coding agents and does not require Roborev’s optional agent hook.
-3. An authorized `/review` request for a PR changing `specs/**` runs the three independent specification-review jobs and exposes each report in its job summary, artifact, and PR comment. A completed review of an unchanged spec diff is not repeated; a changed spec diff is reviewed again.
-4. An authorized `/review` request for a same-repository non-draft PR changing files outside `specs/**`, with a valid governing-spec declaration, runs independent general and conformance jobs and exposes their reports in summaries, artifacts, and PR comments. Re-runs update each persona’s existing comment.
+3. An authorized `/review` request reviews only changed specs whose current individual diffs lack a completed review, and exposes each persona report in its job summary, artifact, and PR comment.
+4. An authorized `/review` request for a same-repository non-draft PR changing files outside `specs/**` runs general review; when it also changes specs, it runs conformance review against them. Reports appear in summaries, artifacts, and PR comments. Re-runs update each persona’s existing comment.
 5. Persona profiles are read-only and the workflow uses neither broad permission bypasses nor personal Copilot credentials.
-6. Without an authorized `/review` comment, or for a draft PR, fork PR, or invalid/missing governing-spec declaration for a code change, no PR persona runs. The required `agentic-review` status blocks merge until applicable reviews complete.
+6. Without an authorized `/review` comment, or for a draft or fork PR, no PR persona runs. The required `agentic-review` status blocks merge until applicable reviews complete.
 7. Roborev does not appear in a GitHub Actions workflow.
 8. The workflow passes `actionlint`; the local guide is verified on a clean supported workstation; and one same-repository PR verifies the real GitHub Actions surface.
 
