@@ -17,13 +17,8 @@ cd ..
 
 # install torch-mlir + tabulate
 uv pip install -r requirements.txt
-# Roundtrip simple linear model through FX->MLIR->FX
+# Convert simple linear model through FX->MLIR
+# TODO: MLIR -> FX
 python simple_linear.py
-# Roundtrip simple llm model (NOTE: currently will throw an error):
-# [rank0]:     raise NotImplementedError(
-# [rank0]:     ...<2 lines>...
-# [rank0]:     )
-# [rank0]: torch._dynamo.exc.BackendCompilerFailed: backend='mlir_roundtrip_backend' raised:
-# [rank0]: NotImplementedError: Could not deduce type from value info: tensor_meta=None, val=<torch._library.fake_class_registry.FakeScriptObject object at 0x33d2c5550> <class 'torch._library.fake_class_registry.FakeScriptObject'>
 python simple_llm.py
 ```

@@ -1,5 +1,6 @@
 
 import os
+
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
 
@@ -9,15 +10,61 @@ import torch.fx as fx
 from torch._dynamo import register_backend
 from torch._dynamo.backends.common import aot_autograd
 from torch._functorch.aot_autograd import make_boxed_func
-
+from torch._library.fake_class_registry import FakeScriptObject
+from torch.fx.node import map_arg
+from torch._subclasses.fake_tensor import FakeTensor
 
 from torch_mlir.fx import stateless_fx_import
-from torch_mlir.ir import Module, IntegerAttr, StringAttr
+from torch_mlir.extras.fx_importer import FxImporter, ContextCache
+from torch_mlir.ir import Module, IntegerAttr, StringAttr, Type
+from torch_mlir import ir
+from torch_mlir.dialects import torch as torch_d
 
 from vllm import LLM, ModelRegistry, SamplingParams
 from vllm.model_executor.layers.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+
+
+class VllmContextCache(ContextCache):
+    def value_info_to_type(
+        self, val, *, tensor_meta=None, mutable=False
+    ):
+        print("!!!Using VllmContextCache!!!")
+
+        if isinstance(val, FakeScriptObject):
+            return Type.parse(
+                "!torch.any",
+                context=self._c,
+            )
+
+        if isinstance(val, tuple) and all(
+            isinstance(x, FakeTensor) for x in val
+        ):
+            return Type.parse(
+                "!torch.list<vtensor>",
+                context=self._c,
+            )
+
+        return super().value_info_to_type(
+            val,
+            tensor_meta=tensor_meta,
+            mutable=mutable,
+        )
+
+
+
+class VllmFxImporter(FxImporter):
+    def __init__(self, **kwargs):
+
+        print("!!!Initializing VllmFxImporter!!!")
+
+        super().__init__(**kwargs)
+
+        self._cc = VllmContextCache(
+            self._c,
+            py_attr_tracker=self._py_attr_tracker,
+        )
 
 
 def mlir_to_fx(module: Module) -> fx.GraphModule:
@@ -93,12 +140,33 @@ def normalize_fx(gm: fx.GraphModule):
     Convert FX graph into format expected by Torch MLIR.
     Torch MLIR expects FX graphs to use ATen operations.
     """
-    breakpoint()
 
     for node in gm.graph.nodes:
         if node.op == "call_function":
             if node.target is torch._C._nn.linear:
                 node.target = torch.ops.aten.linear.default
+
+            elif node.target is torch.nn.functional.embedding:
+                # NOTE: aten.embedding expects arguments in a different order than F.embedding
+                # TODO: support other arguments e.g. padding_idx
+                input_ids, weight = node.args[:2]
+                node.target = torch.ops.aten.embedding.default
+                node.args = (weight, input_ids, -1, False, False)
+                node.kwargs = {}
+
+            elif node.target is torch.empty:
+                assert len(node.args) == 1
+
+                size = node.args[0]
+                node.target = torch.ops.aten.empty.memory_format
+                node.args = (size,)
+
+            # vLLM custom ops:
+            elif node.target is torch.ops.vllm.unified_kv_cache_update:
+                node.target = torch.ops.vllm.unified_kv_cache_update.default
+
+            elif node.target is torch.ops.vllm.unified_attention_with_output:
+                node.target = torch.ops.vllm.unified_attention_with_output.default
 
         elif node.op == "call_method":
             if node.target == "view":
@@ -114,6 +182,15 @@ def normalize_fx(gm: fx.GraphModule):
                 node.args = (x, shape)
                 node.kwargs = {}
 
+            elif node.target == "chunk":
+                x, chunks = node.args
+                dim = node.kwargs.get("dim", 0)
+
+                node.op = "call_function"
+                node.target = torch.ops.aten.chunk.default
+                node.args = (x, chunks, dim)
+                node.kwargs = {}
+
         if "val" not in node.meta:
             if "example_value" in node.meta:
                 node.meta["val"] = node.meta["example_value"]
@@ -123,35 +200,73 @@ def normalize_fx(gm: fx.GraphModule):
     return gm
 
 
+def normalize_torch_size(gm):
+    """ Remove torch.Size constructor from the graph and replace all uses with a tuple/list """
+    graph = gm.graph
+
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not torch.Size:
+            continue
+
+        assert len(node.args) == 1
+        assert not node.kwargs
+        assert isinstance(node.args[0], (tuple, list))
+
+        shape = list(node.args[0])
+
+        for user in list(node.users):
+            user.args = map_arg(
+                user.args,
+                lambda n: shape if n is node else n,
+            )
+            user.kwargs = map_arg(
+                user.kwargs,
+                lambda n: shape if n is node else n,
+            )
+
+        graph.erase_node(node)
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
+
 @register_backend(name="mlir_roundtrip_backend")
 def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
     print("\nOriginal Dynamo FX:")
     gm.graph.print_tabular()
-
-    gm = normalize_fx(gm)
+    # Normalize FX graph into the form Torch MLIR expects
+    # the alternative would be to run this backend before AOTAutograd
+    # but at that point some operators (e.g. linear) would be inlined
+    # and some information would be lost.
+    gm_norm = normalize_fx(gm)
+    gm_norm = normalize_torch_size(gm_norm)
 
     print("\nNormalized ATen FX:")
-    gm.graph.print_tabular()
+    gm_norm.graph.print_tabular()
 
+    context = ir.Context()
+    torch_d.register_dialect(context)
+    vllm_importer = VllmFxImporter(context=context)
     module = stateless_fx_import(
-        gm,
+        gm_norm,
         output_type="raw",
+        fx_importer=vllm_importer
     )
 
     print("\nGenerated MLIR:")
     print(module)
 
-    gm = mlir_to_fx(module)
-
-    print("\nReconstructed FX:")
-    gm.graph.print_tabular()
+    # TODO: implement MLIR to FX
+    # gm = mlir_to_fx(module)
+    # print("\nReconstructed FX:")
+    # gm.graph.print_tabular()
 
     return gm.forward
 
 
 def debug_backend(graph: torch.fx.GraphModule, example_inputs):
     print("\n========== Dynamo FX Graph ==========", flush=True)
-    breakpoint()
     graph.graph.print_tabular()
     print("=====================================\n", flush=True)
 
@@ -168,6 +283,7 @@ debug_backend_aot = aot_autograd(
 )
 
 register_backend(name="debug_backend")(debug_backend_aot)
+
 
 @support_torch_compile
 class MyModel(nn.Module):
@@ -265,28 +381,6 @@ def main():
     )
 
     torch.manual_seed(42)
-
-    # baseline_llm = LLM(
-    #     model="facebook/opt-125m",
-    #     hf_overrides={
-    #         "architectures": ["MyModelForCausalLM"]
-    #     },
-    #     load_format="dummy",
-    #     max_model_len=128,
-    #     kv_cache_memory_bytes=256 * 1024 * 1024,  # 256 MiB
-    #     compilation_config={
-    #     "mode": 2,
-    #     "backend": "debug_backend",
-    # },
-    # )
-
-    # outputs = baseline_llm.generate(
-    #     ["Hello, my name is"],
-    #     SamplingParams(max_tokens=4),
-    # )
-
-    # baseline = outputs[0].outputs[0].token_ids
-
 
     mlir_llm = LLM(
         model="facebook/opt-125m",
