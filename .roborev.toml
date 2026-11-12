@@ -1,0 +1,6 @@
+agent = "copilot"
+
+review_guidelines = """
+Focus findings on correctness, security, and divergence from an approved specification.
+Do not recommend unrequested validation, retries, abstractions, or style-only changes.
+"""
