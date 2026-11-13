@@ -18,7 +18,7 @@ cd ..
 # install torch-mlir + tabulate
 uv pip install -r requirements.txt
 # Convert simple linear model through FX->MLIR
-# TODO: MLIR -> FX
 python simple_linear.py
+# Convert partial LLM decode block through FX->MLIR
 python simple_llm.py
 ```
