@@ -1,0 +1,61 @@
+name: Native mutation testing
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Initialize diagnostics
+        run: printf 'Mutation job diagnostics\n' > "$RUNNER_TEMP/mutation.log"
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Clang and Mull
+        shell: bash
+        run: |
+          (
+            set -e
+            curl --fail --location --retry 3 \
+              https://github.com/mull-project/mull/releases/download/0.36.0/Mull-0.36.0-ubuntu-amd64-24.04.deb \
+              --output "$RUNNER_TEMP/mull.deb"
+            curl --fail --location --retry 3 \
+              https://github.com/mull-project/mull/releases/download/0.36.0/Mull-19-0.36.0-LLVM-19.1.1-ubuntu-amd64-24.04.deb \
+              --output "$RUNNER_TEMP/mull-19.deb"
+            echo 'a978ea47f3bf8f8d66cb7df657551b2da69456ebfc92a752db127a68f9380796  '"$RUNNER_TEMP/mull.deb" | sha256sum --check
+            echo 'fba484339988f6cc1e2dbc0ddd365d502aadad30c4f2914651c137e2540f4a0b  '"$RUNNER_TEMP/mull-19.deb" | sha256sum --check
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends 'clang-19=1:19.1.1-1ubuntu1~24.04.2' "$RUNNER_TEMP/mull.deb" "$RUNNER_TEMP/mull-19.deb"
+            clang-19 --version
+            clang++-19 --version
+            mull-runner-19 --version | tee "$RUNNER_TEMP/mull-version.txt"
+            grep -F 'mull 0.36.0, LLVM 19.1.1' "$RUNNER_TEMP/mull-version.txt"
+            mull-reporter-19 --version
+            test -f /usr/lib/mull-ir-frontend-19
+          ) 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.80.0
+          run-install: false
+      - name: Install locked environment
+        run: pixi install --locked
+      - name: Run mutation tests
+        shell: bash
+        env:
+          MULL_DIFF_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+        run: pixi run --locked test-mutation 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-reports
+          path: |
+            build/mutation/reports/
+            ${{ runner.temp }}/mutation.log
+          if-no-files-found: warn
