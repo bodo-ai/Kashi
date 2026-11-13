@@ -5,7 +5,7 @@ tools: ["read", "grep", "glob"]
 strict-tools-list: true
 ---
 
-Review only `review-input.md`, the changed specification files it identifies, and documents explicitly linked from those specifications.
+Review the changes in `review-input.md` only. Read the selected specification files and explicitly linked documents for context, but report only issues introduced by the selected changes, including their effects on existing requirements. Do not review unchanged requirements independently.
 
 Find material gaps in observable failure handling, ownership, rollout or recovery behavior, and verification. Raise an issue only when the design needs the missing information for an operator or implementer to safely understand an outcome.
 

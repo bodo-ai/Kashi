@@ -79,6 +79,7 @@ jobs:
           BASE_SHA: ${{ steps.request.outputs.base }}
           HEAD_SHA: ${{ steps.request.outputs.head }}
         run: |
+          BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
           git diff --find-renames "$BASE_SHA" "$HEAD_SHA" -- specs > "$RUNNER_TEMP/spec.diff"
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- . ':(exclude)specs' > "$RUNNER_TEMP/other-files"
           if [ -s "$RUNNER_TEMP/spec.diff" ]; then
@@ -110,7 +111,8 @@ jobs:
               const encoded = record.body.match(/<!-- spec-reviewed:([A-Za-z0-9+/=]+) -->/);
               if (encoded) reviewed = JSON.parse(Buffer.from(encoded[1], 'base64').toString('utf8'));
             }
-            const base = process.env.BASE_SHA, head = process.env.HEAD_SHA;
+            const head = process.env.HEAD_SHA;
+            const base = execFileSync('git', ['merge-base', process.env.BASE_SHA, head], {encoding: 'utf8'}).trim();
             const files = execFileSync('git', ['diff', '--name-only', '-z', '--no-renames', base, head, '--', 'specs']).toString('utf8').split('\0').filter(Boolean);
             const pending = {};
             for (const file of files) {
@@ -154,7 +156,8 @@ jobs:
           const fs = require('fs');
           const {execFileSync} = require('child_process');
           const files = Object.keys(JSON.parse(process.env.PENDING_SPECS));
-          const diff = execFileSync('git', ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-renames', process.env.BASE_SHA, process.env.HEAD_SHA, '--', ...files]);
+          const base = execFileSync('git', ['merge-base', process.env.BASE_SHA, process.env.HEAD_SHA], {encoding: 'utf8'}).trim();
+          const diff = execFileSync('git', ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-renames', base, process.env.HEAD_SHA, '--', ...files]);
           fs.writeFileSync('review-input.md', '# Changed specification files\n' + files.map(file => JSON.stringify(file)).join('\n') + '\n\n# Specification diff\n' + diff.toString('utf8'));
           NODE
       - name: Run persona
@@ -198,6 +201,7 @@ jobs:
           HEAD_SHA: ${{ needs.eligibility.outputs.head }}
           PR_BODY: ${{ needs.eligibility.outputs.body }}
         run: |
+          BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
           {
             echo '# Pull request description'
             printf '%s\n' "$PR_BODY"
