@@ -1,5 +1,6 @@
 
 import os
+import operator
 
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
@@ -19,6 +20,7 @@ from torch_mlir.extras.fx_importer import FxImporter, ContextCache
 from torch_mlir.ir import Module, IntegerAttr, StringAttr, Type
 from torch_mlir import ir
 from torch_mlir.dialects import torch as torch_d
+from torch_mlir.extras.fx_importer import TORCH_DTYPE_TO_INT
 
 from vllm import LLM, ModelRegistry, SamplingParams
 from vllm.model_executor.layers.attention import Attention
@@ -67,10 +69,46 @@ class VllmFxImporter(FxImporter):
         )
 
 
+INT_TO_TORCH_DTYPE = {
+    value: dtype
+    for dtype, value in TORCH_DTYPE_TO_INT.items()
+}
+
+
+def reconstruct_args(target, operands, values):
+    """ 
+    Torch MLIR uses positional args, but in the reverse direction, 
+    some functions might have keyword-only arguments (see aten.empty as an example). 
+    """
+    schema_args = target._schema.arguments
+
+    if len(operands) != len(schema_args):
+        raise ValueError(
+            f"{target}: expected {len(schema_args)} "
+            f"operands, got {len(operands)}"
+        )
+
+    args = []
+    kwargs = {}
+
+    for schema_arg, operand in zip(schema_args, operands):
+        value = values[operand]
+
+        # Torch-MLIR encodes ScalarType as an integer.
+        if schema_arg.name == "dtype" and value is not None:
+            value = INT_TO_TORCH_DTYPE[value]
+
+        if schema_arg.kwarg_only:
+            kwargs[schema_arg.name] = value
+        else:
+            args.append(value)
+
+    return tuple(args), kwargs
+
+
 def mlir_to_fx(module: Module) -> fx.GraphModule:
     graph = fx.Graph()
 
-    # Find the main MLIR function.
     main = next(
         op for op in module.body.operations
         if op.operation.name == "func.func"
@@ -78,25 +116,54 @@ def mlir_to_fx(module: Module) -> fx.GraphModule:
             op.attributes["sym_name"]
         ).value == "main"
     )
-
     block = main.regions[0].blocks[0]
 
-    # MLIR SSA value -> FX node or Python constant.
     values = {
         arg: graph.placeholder(f"arg{i}")
         for i, arg in enumerate(block.arguments)
     }
 
-    ops = {
+    torch_ops = {
         "torch.aten.linear": torch.ops.aten.linear.default,
         "torch.aten.view": torch.ops.aten.view.default,
+        "torch.aten.embedding": torch.ops.aten.embedding.default,
+        "torch.aten.chunk": torch.ops.aten.chunk.default,
+        "torch.aten.empty.memory_format": torch.ops.aten.empty.memory_format
+    }
+
+    # torch.operator
+    custom_ops = {
+        "torch.vllm.unified_kv_cache_update":
+            torch.ops.vllm.unified_kv_cache_update.default,
+
+        "torch.vllm.unified_attention_with_output":
+            torch.ops.vllm.unified_attention_with_output.default,
     }
 
     for op in block.operations:
         operation = op.operation
         name = operation.name
 
-        if name == "torch.constant.int":
+        if name == "func.return":
+            outputs = tuple(
+                values[arg] for arg in operation.operands
+            )
+            graph.output(outputs)
+
+        elif name == "torch.constant.none":
+            values[operation.results[0]] = None
+
+        elif name == "torch.constant.bool":
+            attr = operation.attributes["value"]
+            values[operation.results[0]] = bool(IntegerAttr(attr).value)
+
+        elif name == "torch.constant.device":
+            attr = operation.attributes["value"]
+            values[operation.results[0]] = torch.device(
+                StringAttr(attr).value
+            )
+
+        elif name == "torch.constant.int":
             value = IntegerAttr(
                 operation.attributes["value"]
             ).value
@@ -108,23 +175,44 @@ def mlir_to_fx(module: Module) -> fx.GraphModule:
                 values[arg] for arg in operation.operands
             ]
 
-        elif name in ops:
-            args = tuple(
-                values[arg] for arg in operation.operands
-            )
+        elif name == "torch.prim.ListUnpack":
+            source = values[operation.operands[0]]
 
+            for i, result in enumerate(operation.results):
+                values[result] = graph.call_function(
+                    operator.getitem,
+                    args=(source, i),
+                )
+
+        elif name in torch_ops:
+            args, kwargs = reconstruct_args(torch_ops[name], operation.operands, values)
             result = graph.call_function(
-                ops[name],
+                torch_ops[name],
                 args=args,
+                kwargs=kwargs,
             )
-
             values[operation.results[0]] = result
 
-        elif name == "func.return":
-            outputs = tuple(
-                values[arg] for arg in operation.operands
-            )
-            graph.output(outputs)
+        elif name == "torch.operator":
+            op_name = StringAttr(operation.attributes["name"]).value
+            if op_name in custom_ops:
+                result = graph.call_function(
+                    custom_ops[op_name],
+                    args=tuple(values[arg] for arg in operation.operands),
+                )
+                if len(operation.results) == 1:
+                    values[operation.results[0]] = result
+                elif len(operation.results) == 0:
+                    # Side-effect-only operation.
+                    pass
+                else:
+                    raise NotImplementedError(
+                        f"Multiple results for {op_name}"
+                    )
+            else:
+                raise NotImplementedError(
+                    f"Unsupported torch.operator: {op_name}"
+                )
 
         else:
             raise NotImplementedError(
@@ -257,12 +345,11 @@ def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
     print("\nGenerated MLIR:")
     print(module)
 
-    # TODO: implement MLIR to FX
-    # gm = mlir_to_fx(module)
-    # print("\nReconstructed FX:")
-    # gm.graph.print_tabular()
+    gm_reconstructed = mlir_to_fx(module)
+    print("\nReconstructed FX:")
+    gm_reconstructed.graph.print_tabular()
 
-    return gm.forward
+    return gm_reconstructed.forward
 
 
 def debug_backend(graph: torch.fx.GraphModule, example_inputs):
