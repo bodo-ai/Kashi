@@ -291,6 +291,7 @@ jobs:
               for (const persona of personas) {
                 const marker = `<!-- agentic-review:${persona} -->`;
                 const text = fs.readFileSync(`reports/${persona}/${persona}.txt`, 'utf8');
+                if (!text.trim()) continue;
                 const body = `${marker}\n## ${persona}\n\n${text.slice(0, 60000)}`;
                 const previous = comments.find(c => c.user.login === 'github-actions[bot]' && c.body?.startsWith(marker));
                 if (previous) await github.rest.issues.updateComment({owner, repo, comment_id: previous.id, body});
