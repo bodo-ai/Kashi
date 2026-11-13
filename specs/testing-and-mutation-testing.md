@@ -1,4 +1,4 @@
-# 003 — Python and C++ Testing
+# Python and C++ Testing
 
 **Status:** Proposed
 

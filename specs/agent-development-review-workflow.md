@@ -1,4 +1,4 @@
-# 001 — Agentic Development Review Pilot
+# Agentic Development Review Pilot
 
 **Status:** Proposed  
 **Date:** 2026-11-10  
