@@ -1,4 +1,8 @@
 .worktrees/
 .superpowers/
+.pixi/
+build/
+dist/
+__pycache__/
 # roborev snapshots
 /.roborev/
