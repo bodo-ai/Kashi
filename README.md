@@ -1,4 +1,4 @@
-# ML Compiler
+# Kashi
 
 Repository skeleton for a future compiler that captures PyTorch FX graphs in Python and optimizes MLIR in C++. The compiler pipeline is not implemented.
 
@@ -8,7 +8,7 @@ Install [Pixi](https://pixi.sh/latest/installation/). The supported development 
 
 ```sh
 pixi install --locked
-pixi run python -c 'import ml_compiler._native'
+pixi run python -c 'import kashi._native'
 ```
 
 Pixi installs the project in editable mode. Python source changes are picked up automatically. After changing C++ or CMake files, rebuild and reinstall with:
@@ -46,7 +46,7 @@ build, then use `pixi run ctest --test-dir build/test-cpp -C Debug -R '<test-nam
 
 Put native units in `cpp/lib/`, public headers in `cpp/include/`, and Catch2
 test sources in `cpp/tests/` (`.cpp`, `.cc`, or `.cxx`). CMake links the units
-into `ml_compiler_core`, links tests against that library and Catch2, and
+into `kashi_core`, links tests against that library and Catch2, and
 registers each Catch2 case with CTest. If test sources exist but no cases are
 discovered, the command fails.
 
@@ -67,7 +67,7 @@ unavailable locally.
 
 ## Layout
 
-- `python/src/ml_compiler/`: Python package and future FX integration.
+- `python/src/kashi/`: Python package and future FX integration.
 - `python/tests/`: Python API and import tests.
 - `cpp/bindings/`: Python native module.
 - `cpp/include/`, `cpp/lib/`, `cpp/tests/`: C++ headers, native units and tests.

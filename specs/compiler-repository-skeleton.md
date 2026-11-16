@@ -20,7 +20,7 @@ pixi.lock                       # Locked development environment
 CMakeLists.txt                  # Native build and installation
 README.md                       # Scope, prerequisites, and build instructions
 python/
-  src/ml_compiler/              # Python package; future FX capture and API
+  src/kashi/                    # Python package; future FX capture and API
   tests/                        # Future Python tests
 cpp/
   bindings/                     # Python-to-C++ native extension
@@ -34,7 +34,7 @@ Empty directories may use tracking files. Existing unrelated repository content 
 
 ## Packaging contract
 
-- `pyproject.toml` uses `scikit-build-core` as its build backend and declares nanobind as a build dependency. CMake builds a private extension importable as `ml_compiler._native` and installs it into the Python package.
+- `pyproject.toml` uses `scikit-build-core` as its build backend and declares nanobind as a build dependency. CMake builds a private extension importable as `kashi._native` and installs it into the Python package.
 - Both a regular installation and an editable installation are supported. Documentation identifies a supported Python version, a C++ compiler, CMake, and a build tool, and gives commands to build and install locally.
 - The extension may contain only the minimal module initialization needed to build and import it. No compiler behavior or placeholder compiler API is provided.
 - The skeleton does not require PyTorch or an LLVM/MLIR installation to build: no compiler code uses them yet. Future work must specify how a compatible LLVM/MLIR installation is discovered and linked, and how its native libraries are distributed. Python object and MLIR ownership and interchange are also future decisions.
@@ -57,11 +57,11 @@ Empty directories may use tracking files. Existing unrelated repository content 
 ## Acceptance criteria
 
 1. A fresh checkout contains the documented layout and explains the role of each major directory.
-2. In a clean environment with documented prerequisites, a regular installation builds and `import ml_compiler._native` succeeds.
+2. In a clean environment with documented prerequisites, a regular installation builds and `import kashi._native` succeeds.
 3. An editable installation also builds and imports the extension. The documentation explains how to rebuild after native source changes.
 4. A wheel can be built locally and installed into a clean environment, where the extension imports successfully.
 5. The package does not claim to implement the compiler pipeline or expose placeholder compiler behavior.
-6. On each supported platform, `pixi install --locked` creates the documented environment from the checked-in lock file, and `pixi run python -c "import ml_compiler._native"` succeeds. Verify the macOS paths on both Apple silicon and Intel, or explicitly report any platform that could not be exercised.
+6. On each supported platform, `pixi install --locked` creates the documented environment from the checked-in lock file, and `pixi run python -c "import kashi._native"` succeeds. Verify the macOS paths on both Apple silicon and Intel, or explicitly report any platform that could not be exercised.
 
 ## References
 

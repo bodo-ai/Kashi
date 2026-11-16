@@ -27,7 +27,7 @@ These are proposed engineering choices, not an assertion that the user has appro
 ### Python
 
 - Use pytest, with tests under `python/tests/` and discovery configured in `pyproject.toml`. Execute against the installed package, not an ad hoc source-path override. Pixi supplies pytest as a development dependency, with `pixi.lock` updated accordingly.
-- The initial suite checks that the installed `ml_compiler` package and its `_native` extension can be imported. When public behavior exists, test results, boundaries, and failure cases through the Python API, including the Python/native boundary where relevant.
+- The initial suite checks that the installed `kashi` package and its `_native` extension can be imported. When public behavior exists, test results, boundaries, and failure cases through the Python API, including the Python/native boundary where relevant.
 - Tests must be isolated and deterministic, and must not require network access, GPUs, PyTorch, or LLVM/MLIR unless a future test explicitly declares and provides those prerequisites.
 - A documented `pixi run test-python` runs the suite and returns nonzero for failures or no collected tests.
 
