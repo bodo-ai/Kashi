@@ -17,7 +17,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from torch_mlir.fx import stateless_fx_import
 from torch_mlir.extras.fx_importer import FxImporter, ContextCache
-from torch_mlir.ir import Module, IntegerAttr, StringAttr, Type
+from torch_mlir.ir import Module, IntegerAttr, FloatAttr, StringAttr, Type
 from torch_mlir import ir
 from torch_mlir.dialects import torch as torch_d
 from torch_mlir.extras.fx_importer import TORCH_DTYPE_TO_INT
@@ -45,6 +45,12 @@ class VllmContextCache(ContextCache):
         ):
             return Type.parse(
                 "!torch.list<vtensor>",
+                context=self._c,
+            )
+
+        if isinstance(val, torch.Size):
+            return Type.parse(
+                "!torch.list<int>",
                 context=self._c,
             )
 
@@ -105,6 +111,20 @@ def reconstruct_args(target, operands, values):
 
     return tuple(args), kwargs
 
+def resolve_aten_target(name):
+    prefix = "torch.aten."
+    if not name.startswith(prefix):
+        raise NotImplementedError(f"Unsupported MLIR operation: {name}")
+
+    op_name, separator, overload = name[len(prefix):].partition(".")
+    try:
+        op_packet = getattr(torch.ops.aten, op_name)
+        return getattr(op_packet, overload if separator else "default")
+    except (AttributeError, RuntimeError) as error:
+        raise NotImplementedError(
+            f"Unsupported ATen operation: {name}"
+        ) from error
+
 
 def mlir_to_fx(module: Module) -> fx.GraphModule:
     graph = fx.Graph()
@@ -123,16 +143,14 @@ def mlir_to_fx(module: Module) -> fx.GraphModule:
         for i, arg in enumerate(block.arguments)
     }
 
-    torch_ops = {
-        "torch.aten.linear": torch.ops.aten.linear.default,
-        "torch.aten.view": torch.ops.aten.view.default,
-        "torch.aten.embedding": torch.ops.aten.embedding.default,
-        "torch.aten.chunk": torch.ops.aten.chunk.default,
-        "torch.aten.empty.memory_format": torch.ops.aten.empty.memory_format
-    }
 
     # torch.operator
     custom_ops = {
+        "torch._C.rms_norm": torch.ops._C.rms_norm.default,
+        "torch._C.fused_add_rms_norm": torch.ops._C.fused_add_rms_norm.default,
+        "torch._C.rotary_embedding": torch.ops._C.rotary_embedding.default,
+        "torch._C.silu_and_mul": torch.ops._C.silu_and_mul.default,
+
         "torch.vllm.unified_kv_cache_update":
             torch.ops.vllm.unified_kv_cache_update.default,
 
@@ -169,6 +187,12 @@ def mlir_to_fx(module: Module) -> fx.GraphModule:
             ).value
 
             values[operation.results[0]] = int(value)
+        elif name == "torch.constant.float":
+            value = FloatAttr(operation.attributes["value"]).value
+            values[operation.results[0]] = float(value)
+        elif name == "torch.constant.str":
+            value = StringAttr(operation.attributes["value"]).value
+            values[operation.results[0]] = value
 
         elif name == "torch.prim.ListConstruct":
             values[operation.results[0]] = [
@@ -184,13 +208,18 @@ def mlir_to_fx(module: Module) -> fx.GraphModule:
                     args=(source, i),
                 )
 
-        elif name in torch_ops:
-            args, kwargs = reconstruct_args(torch_ops[name], operation.operands, values)
-            result = graph.call_function(
-                torch_ops[name],
-                args=args,
-                kwargs=kwargs,
+        elif name.startswith("torch.aten."):
+            target = resolve_aten_target(name)
+            args, kwargs = reconstruct_args(
+                target,
+                operation.operands,
+                values,
             )
+            result = graph.call_function(target, args=args, kwargs=kwargs)
+            if len(operation.results) != 1:
+                raise NotImplementedError(
+                    f"Expected one result for {name}, got {len(operation.results)}"
+                )
             values[operation.results[0]] = result
 
         elif name == "torch.operator":
@@ -233,6 +262,19 @@ def normalize_fx(gm: fx.GraphModule):
         if node.op == "call_function":
             if node.target is torch._C._nn.linear:
                 node.target = torch.ops.aten.linear.default
+            elif node.target is torch._C._autograd._get_data_attr:
+                node.target = torch.ops.aten.detach.default
+            elif node.target is torch.ops._C.rms_norm:
+                node.target = torch.ops._C.rms_norm.default
+
+            elif node.target is torch.ops._C.fused_add_rms_norm:
+                node.target = torch.ops._C.fused_add_rms_norm.default
+
+            elif node.target is torch.ops._C.rotary_embedding:
+                node.target = torch.ops._C.rotary_embedding.default
+
+            elif node.target is torch.ops._C.silu_and_mul:
+                node.target = torch.ops._C.silu_and_mul.default
 
             elif node.target is torch.nn.functional.embedding:
                 # NOTE: aten.embedding expects arguments in a different order than F.embedding
@@ -257,10 +299,45 @@ def normalize_fx(gm: fx.GraphModule):
                 node.target = torch.ops.vllm.unified_attention_with_output.default
 
         elif node.op == "call_method":
-            if node.target == "view":
+            if node.target == "long":
+                x, = node.args
+                node.op = "call_function"
+                node.target = torch.ops.aten.to.dtype
+                node.args = (x, torch.int64)
+                node.kwargs = {}
+
+            elif node.target == "size":
+                x, *size_args = node.args
+                dim = node.kwargs.get("dim", size_args[0] if size_args else None)
+                node.op = "call_function"
+                node.target = (
+                    torch.ops.aten.size.int
+                    if dim is not None
+                    else torch.ops.aten.size.default
+                )
+                node.args = (x, dim) if dim is not None else (x,)
+                node.kwargs = {}
+
+            elif node.target == "split":
+                x, split_size_or_sections, *split_args = node.args
+                dim = node.kwargs.get("dim", split_args[0] if split_args else 0)
+                node.op = "call_function"
+                node.target = (
+                    torch.ops.aten.split_with_sizes.default
+                    if isinstance(split_size_or_sections, (tuple, list))
+                    else torch.ops.aten.split.Tensor
+                )
+                node.args = (x, split_size_or_sections, dim)
+                node.kwargs = {}
+
+            elif node.target == "view":
                 x, *shape = node.args
 
-                if len(shape) == 1 and isinstance(
+                if len(shape) == 1 and isinstance(shape[0], fx.Node) and isinstance(
+                    shape[0].meta.get("val"), torch.Size
+                ):
+                    shape = shape[0]
+                elif len(shape) == 1 and isinstance(
                     shape[0], (tuple, list)
                 ):
                     shape = list(shape[0])

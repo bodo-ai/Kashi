@@ -21,4 +21,7 @@ uv pip install -r requirements.txt
 python simple_linear.py
 # Convert partial LLM decode block through FX->MLIR
 python simple_llm.py
+# Convert full Qwen3 0.6B through FX->MLIR without checkpoint weights.
+# Configuration and tokenizer metadata may still be resolved.
+python simple_llm_qwen3.py
 ```
