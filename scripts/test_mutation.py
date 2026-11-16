@@ -276,8 +276,8 @@ def main():
     nanobind = run([sys.executable, "-m", "nanobind", "--cmake_dir"], env=env, capture=True).strip()
     prefix = ";".join([sys.prefix, *filter(None, env.get("CMAKE_PREFIX_PATH", "").split(os.pathsep))])
     run(["cmake", "-S", ROOT, "-B", BUILD, "-G", "Ninja",
-         "-DML_COMPILER_BUILD_TESTS=ON", "-DML_COMPILER_MUTATION=ON",
-         f"-DML_COMPILER_MULL_PLUGIN={plugin}", f"-DCMAKE_CXX_COMPILER={compiler}",
+         "-DKASHI_BUILD_TESTS=ON", "-DKASHI_MUTATION=ON",
+         f"-DKASHI_MULL_PLUGIN={plugin}", f"-DCMAKE_CXX_COMPILER={compiler}",
          "-DCMAKE_BUILD_TYPE=Debug", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
          f"-DPython_EXECUTABLE={sys.executable}", f"-Dnanobind_DIR={nanobind}",
          f"-DCMAKE_PREFIX_PATH={prefix}"], env=env)

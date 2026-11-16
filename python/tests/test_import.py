@@ -2,8 +2,8 @@
 
 
 def test_package_imports():
-    import ml_compiler
+    import kashi
 
 
 def test_native_extension_imports():
-    import ml_compiler._native
+    import kashi._native

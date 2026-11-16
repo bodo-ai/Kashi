@@ -51,11 +51,11 @@ jobs:
           "$RUNNER_TEMP/wheel-env/bin/python" -I - <<'PY'
           import pathlib
           import sys
-          import ml_compiler
-          import ml_compiler._native
+          import kashi
+          import kashi._native
 
           environment = pathlib.Path(sys.prefix).resolve()
-          for module in (ml_compiler, ml_compiler._native):
+          for module in (kashi, kashi._native):
               path = pathlib.Path(module.__file__).resolve()
               print(f"{module.__name__}: {path}")
               if not path.is_relative_to(environment):

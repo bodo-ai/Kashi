@@ -3,14 +3,14 @@ requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "ml-compiler"
+name = "kashi"
 version = "0.1.0"
 description = "Python and MLIR compiler development skeleton"
 readme = "README.md"
 requires-python = ">=3.10"
 
 [tool.scikit-build]
-wheel.packages = ["python/src/ml_compiler"]
+wheel.packages = ["python/src/kashi"]
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
@@ -32,7 +32,7 @@ catch2 = ">=3,<4"
 nanobind = ">=2"
 
 [tool.pixi.pypi-dependencies]
-ml-compiler = { path = ".", editable = true }
+kashi = { path = ".", editable = true }
 
 [tool.pixi.tasks]
 test-python = "python -m pytest"

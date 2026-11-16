@@ -3005,5 +3005,5 @@ packages:
   size: 433687
   timestamp: 1786599629846
 - pypi: ./
-  name: ml-compiler
+  name: kashi
   requires_python: '>=3.10'
