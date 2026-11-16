@@ -91,5 +91,7 @@ Roborev is local-only. No GitHub Actions workflow invokes it.
 
 The GitHub Copilot CI personas produce advisory findings, but successful completion of the applicable reviews is required for merge.
 
-Post an exact `/review` as a new PR conversation comment. The PR must be open, non-draft, and from the same repository. Changes under `specs/` receive the three specification reviews, excluding individually unchanged specs whose reviews are already complete. Changes elsewhere receive general review; when the PR also changes specs, conformance review compares the implementation with those specs. No governing-spec declaration is required. Pushes do not request another review; post a new comment for the new head.
+Post an exact `/review` as a new PR conversation comment. The PR must be open, non-draft, and from the same repository. The workflow compares the PR head with its merge base, as GitHub does for the PR diff. Changes under `specs/` receive the three specification reviews, excluding individually unchanged specs whose reviews are already complete. Review findings concern the selected changes and their effects, not unrelated pre-existing requirements; the full selected specs and linked documents provide context. Changes elsewhere receive general review; when the PR also changes specs, conformance review compares the implementation with those specs. No governing-spec declaration is required. Pushes do not request another review; post a new comment for the new head.
+
+Published persona comments, job summaries, and artifacts contain the final review response, not the agent's intermediate messages or tool activity. The publisher skips empty or whitespace-only responses; the review job fails if Copilot produces no nonempty final response.
 
