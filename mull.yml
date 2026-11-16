@@ -1,0 +1,24 @@
+# Restrict mutations to project-owned native code; tests and binding glue are
+# deliberately excluded. Regexes match both absolute and relative paths.
+strict: true
+mutators:
+  - cxx_add_to_sub
+  - cxx_sub_to_add
+  - cxx_mul_to_div
+  - cxx_div_to_mul
+  - cxx_rem_to_div
+  - cxx_eq_to_ne
+  - cxx_ne_to_eq
+  - cxx_le_to_gt
+  - cxx_lt_to_ge
+  - cxx_ge_to_lt
+  - cxx_gt_to_le
+  - cxx_le_to_lt
+  - cxx_lt_to_le
+  - cxx_ge_to_gt
+  - cxx_gt_to_ge
+includePaths:
+  - '(^|/)cpp/(lib|include)/'
+excludePaths:
+  - '(^|/)cpp/(tests|bindings)/'
+  - '(^|/)(generated|_deps|third_party|vendor)/'

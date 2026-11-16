@@ -1,4 +1,4 @@
-# 002 — Compiler Repository Skeleton
+# Compiler Repository Skeleton
 
 **Status:** Proposed
 
