@@ -19,7 +19,18 @@ pixi run python -m pip install --no-deps -e .
 
 The rebuild uses an isolated Python build environment.
 
-Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available. PyTorch and LLVM/MLIR are not needed for this skeleton; their integration is future work.
+Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available. The default environment does not require PyTorch or LLVM/MLIR; the compiler pipeline is not implemented yet.
+
+## vLLM and MLIR development
+
+The optional `vllm-mlir` environment adds the CPU dependencies for the FX–MLIR work without changing the default environment. It uses Python 3.14, vLLM 0.33.0, PyTorch 2.14.0, and IREE compiler/runtime 3.14.0. vLLM 0.33.0 requires PyTorch 2.14.0; the newer PyTorch 2.15.0 does not satisfy that requirement.
+
+This environment targets Apple silicon with macOS 14 or newer. Upstream macOS CPU support is experimental.
+
+```sh
+pixi install --locked -e vllm-mlir
+pixi run --locked -e vllm-mlir python -c 'import iree.compiler, iree.runtime, torch, vllm; from iree.compiler.extras.fx_importer import FxImporter'
+```
 
 ## Tests
 

@@ -33,7 +33,7 @@ class SimpleVllm(nn.Module):
             head_size=head_size,
             scale=head_size ** -0.5,
             num_kv_heads=num_heads,
-            prefix=f"{prefix}.attn",
+            prefix=f"{prefix}.attn.0",
         )
 
         self.o_proj = nn.Linear(
