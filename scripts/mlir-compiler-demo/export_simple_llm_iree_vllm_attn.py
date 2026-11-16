@@ -18,7 +18,7 @@ installing anything for you; e.g. in a venv that has vllm:
 `uv pip install iree-turbine` into the vllm venv.
 
     python export_simple_llm_iree_vllm_attn.py [--seq-len 128]
-        [--dtype float16] [--dynamic] [--with-lm-head]
+        [--dtype float16] [--device cuda] [--dynamic] [--with-lm-head]
 
 =============================================================================
 DEVIATIONS FROM simple_llm.py
@@ -63,6 +63,11 @@ New, specific to keeping vLLM's Attention (SUBSTANTIVE; read these):
     Side effect: the aten ops in the graph are not decomposed/functionalized
     like export_simple_llm_iree.py's. Closer to what torch-mlir sees in
     simple_llm.py (a pre-AOT dynamo graph).
+ 7. Model and example input are placed on --device (default "cuda"). Without
+    this everything is on CPU and the IR records `torch.constant.device "cpu"`
+    (from the `torch.empty(..., device=query.device)` in vLLM's Attention),
+    whereas simple_llm.py runs on CUDA and records "cuda:0". Needs a visible
+    GPU and a little GPU memory for the (random, ~190 MB fp16) weights.
 """
 
 import argparse
@@ -144,6 +149,8 @@ def main():
     parser.add_argument("--dynamic", action="store_true",
                         help="export num_tokens as a dynamic dimension")
     parser.add_argument("--with-lm-head", action="store_true")
+    parser.add_argument("--device", default="cuda",
+                        help="device for model and example input (default cuda)")
     parser.add_argument("--output", default="artifacts/simple-llm-vllm-attn-frontend.mlir")
     args = parser.parse_args()
     dtype = getattr(torch, args.dtype)
@@ -161,8 +168,9 @@ def main():
     torch.set_default_dtype(dtype)
     try:
         with set_current_vllm_config(vllm_config):
-            # Random weights on CPU, as with vLLM's load_format="dummy".
-            model = MyModelForCausalLM().to(dtype=dtype)
+            # Random weights, as with vLLM's load_format="dummy". Created on
+            # --device (deviation 7).
+            model = MyModelForCausalLM().to(dtype=dtype, device=args.device)
     finally:
         torch.set_default_dtype(prev_dtype)
     model.eval()
@@ -171,7 +179,7 @@ def main():
     wrapper = SimpleLLMForward(model, args.with_lm_head).eval()
 
     # Fixed-shape example input (1-D, no batch dim, like vLLM's flat tokens).
-    example_input = torch.ones((args.seq_len,), dtype=torch.long)
+    example_input = torch.ones((args.seq_len,), dtype=torch.long, device=args.device)
 
     # Deviation 3: no eager reference run (vLLM attention needs a forward
     # context). Expected output shape/dtype instead.

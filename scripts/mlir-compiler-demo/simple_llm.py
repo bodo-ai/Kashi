@@ -477,6 +477,7 @@ def main():
         load_format="dummy",
         max_model_len=128,
         kv_cache_memory_bytes=256 * 1024 * 1024,  # 256 MiB
+        gpu_memory_utilization=0.5,  # default 0.92 failed the free-memory check at startup
         compilation_config={
         "mode": 2,
         "backend": "mlir_roundtrip_backend",
