@@ -4,7 +4,7 @@ An experimental ML compiler that captures PyTorch FX graphs, translates them to 
 
 ## Development setup
 
-Install [Pixi](https://pixi.sh/latest/installation/). The supported development platforms are Linux x86-64 and macOS on Apple silicon and Intel. On macOS, install Xcode Command Line Tools (`xcode-select --install`), including the Apple SDK.
+Install [Pixi 0.82.0 or newer](https://pixi.sh/latest/installation/). The supported development platforms are Linux x86-64 and macOS on Apple silicon. On macOS, install Xcode Command Line Tools (`xcode-select --install`), including the Apple SDK.
 
 ```sh
 pixi install --locked
@@ -19,27 +19,26 @@ pixi run python -m pip install --no-deps -e .
 
 The rebuild uses an isolated Python build environment.
 
-Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available. The default environment does not require PyTorch or LLVM/MLIR; the compiler pipeline is not implemented yet.
+Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available.
 
 ## vLLM and MLIR development
 
-An optional Pixi environment provides the dependencies required for compiler development on MacOs-Arm/Linux-64 CPU-only platforms without changing the default environment.
+The default Pixi environment selects a locked platform based on the host. GPU variants take priority over the CPU fallback:
 
-The environment uses Python 3.14, PyTorch 2.14.0, vLLM 0.33.0, and IREE compiler/runtime 3.14.0.
-To run the comprehensive python test suite:
+| Platform | Requirements | Python / PyTorch |
+| --- | --- | --- |
+| `linux-64-cuda` | NVIDIA driver supporting CUDA 13.0, compute capability 7.5+, glibc 2.39+ | 3.12 / 2.14.0 CUDA 13.0 |
+| `linux-64-rocm` | AMD GPU, compatible ROCm driver, glibc 2.39+ | 3.12 / 2.13.0 ROCm 10.0 |
+| `linux-64-cpu` | glibc 2.39+ | 3.12 / 2.14.0 CPU |
+| `osx-arm64-cpu` | macOS 14+ on Apple silicon | 3.12 / 2.14.0 |
 
-```sh
-pixi install --locked -e vllm-mlir-cpu
-pixi run --locked -e vllm-mlir-cpu test-python
-```
+All variants use vLLM 0.33.0 and IREE compiler/runtime 3.14.0. Python 3.12 and the shared Linux glibc requirement avoid a [Pixi lock validation bug](https://github.com/prefix-dev/pixi/issues/7040) with differing rich-platform wheel tags. ROCm uses PyTorch 2.13 to match its upstream vLLM wheel. Pixi detects AMD GPU presence but does not check ROCm driver compatibility or guarantee that the wheel supports the detected GPU; consult the [vLLM GPU requirements](https://docs.vllm.ai/en/v0.33.0/getting_started/installation/gpu/). Upstream macOS CPU support in vLLM is experimental.
 
-Upstream macOS CPU support in vLLM is experimental.
+Use `pixi info` to inspect the selected platform. To select a specific compatible variant, pass `--platform`, for example `pixi run --locked --platform linux-64-cpu test-python`.
 
 ## Tests
 
-The default Pixi environment supplies pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. No GPU, PyTorch, or LLVM/MLIR installation is needed for the basic Python and native tests.
-
-Compiler and vLLM tests require the optional development environment described above and are skipped when their dependencies are unavailable.
+The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.
 
 Run the basic suites from the repository root:
 
