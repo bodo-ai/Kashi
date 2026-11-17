@@ -29,7 +29,7 @@ def test_import_fx_preserves_aten_linear(linear, meta_key):
 
     y.meta[meta_key] = linear(*example_inputs)
 
-    result = import_fx(gm, example_inputs)
+    result = import_fx(gm)
 
     assert result.module.operation.verify()
     assert "torch.aten.linear" in str(result.module)
@@ -66,7 +66,7 @@ def test_import_fx_preserves_aten_embedding(embedding, indices_first, kwargs):
     weight.meta["val"], indices.meta["val"] = example_inputs
     y.meta["val"] = torch.ops.aten.embedding.default(*example_inputs)
 
-    result = import_fx(gm, example_inputs)
+    result = import_fx(gm)
 
     assert result.module.operation.verify()
     assert "torch.aten.embedding" in str(result.module)
@@ -91,7 +91,7 @@ def test_import_fx_preserves_aten_view(op, target, shape):
     x.meta["val"] = example_inputs[0]
     y.meta["val"] = example_inputs[0].view(3, 2)
 
-    result = import_fx(gm, example_inputs)
+    result = import_fx(gm)
 
     assert result.module.operation.verify()
     assert "torch.aten.view" in str(result.module)
@@ -121,7 +121,7 @@ def test_import_fx_preserves_chunk_with_getitem(op, target):
     chunks.meta["val"] = chunk_vals
     first.meta["val"], second.meta["val"] = chunk_vals
 
-    result = import_fx(gm, example_inputs)
+    result = import_fx(gm)
 
     assert result.module.operation.verify()
     assert "torch.aten.chunk" in str(result.module)
@@ -142,7 +142,7 @@ def test_import_fx_preserves_aten_empty(empty):
 
     y.meta["val"] = torch.empty(2, 3, dtype=torch.float16, device="cpu")
 
-    result = import_fx(gm, [])
+    result = import_fx(gm)
 
     assert result.module.operation.verify()
     module = str(result.module)
@@ -162,7 +162,7 @@ def test_import_fx_preserves_torch_size_feeding_empty():
     size.meta["val"] = torch.Size([2, 3])
     y.meta["val"] = torch.empty(2, 3, dtype=torch.float32, device="cpu")
 
-    result = import_fx(gm, [])
+    result = import_fx(gm)
 
     assert result.module.operation.verify()
     assert "torch.aten.empty.memory_format" in str(result.module)
@@ -184,6 +184,6 @@ def _view_graph(output):
     ids=["bare", "one-tuple", "two-tuple"],
 )
 def test_import_fx_records_out_spec(output):
-    result = import_fx(_view_graph(output), [])
+    result = import_fx(_view_graph(output))
 
     assert result.out_spec == pytree.tree_flatten(output(0))[1]

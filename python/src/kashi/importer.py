@@ -19,7 +19,7 @@ class ImportedModule:
     out_spec: pytree.TreeSpec
 
 
-def import_fx(gm: torch.fx.GraphModule, example_inputs) -> ImportedModule:
+def import_fx(gm: torch.fx.GraphModule) -> ImportedModule:
     """Import ``gm`` as a Torch-dialect MLIR module.
 
     The input graph is not modified; normalization runs on a structural copy.
