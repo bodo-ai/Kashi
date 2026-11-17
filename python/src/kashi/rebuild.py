@@ -1,5 +1,7 @@
 """MLIR to FX reconstruction for Torch-dialect modules produced by ``import_fx``."""
 
+import operator
+
 import torch
 from iree.compiler import ir
 from torch.utils import _pytree as pytree
@@ -118,7 +120,18 @@ def _constant(attr_type):
     return convert
 
 
+def _list_unpack(graph, op, operands):
+    (src,) = operands
+    if not isinstance(src, torch.fx.Node):
+        raise _error(op, "only the result of an operation can be unpacked")
+    return [
+        graph.call_function(operator.getitem, (src, i))
+        for i in range(len(op.results))
+    ]
+
+
 _STRUCTURAL = {
+    "torch.prim.ListUnpack": _list_unpack,
     "torch.constant.int": _constant(ir.IntegerAttr),
     "torch.constant.float": _constant(ir.FloatAttr),
     "torch.constant.bool": _constant(ir.BoolAttr),
