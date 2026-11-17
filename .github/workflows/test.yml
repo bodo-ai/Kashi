@@ -37,7 +37,7 @@ jobs:
       - name: Install locked environment
         run: pixi install --locked
       - name: Python tests
-        run: pixi run --locked test-python
+        run: pixi run --locked -e vllm-mlir-cpu test-python
       - name: Native tests
         run: pixi run --locked test-cpp
       - name: Build wheel
