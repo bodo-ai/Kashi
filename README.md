@@ -1,6 +1,6 @@
 # Kashi
 
-Repository skeleton for a future compiler that captures PyTorch FX graphs in Python and optimizes MLIR in C++. The compiler pipeline is not implemented.
+An experimental ML compiler that captures PyTorch FX graphs, translates them to MLIR, and reconstructs executable FX graphs. The project includes a PyTorch compilation backend and integration with vLLM.
 
 ## Development setup
 
@@ -23,20 +23,25 @@ Build a wheel with `pixi run python -m build --wheel`. Standard Python build too
 
 ## vLLM and MLIR development
 
-The optional `vllm-mlir` environment adds the CPU dependencies for the FX–MLIR work without changing the default environment. It uses Python 3.14, vLLM 0.33.0, PyTorch 2.14.0, and IREE compiler/runtime 3.14.0. vLLM 0.33.0 requires PyTorch 2.14.0; the newer PyTorch 2.15.0 does not satisfy that requirement.
+An optional Pixi environment provides the dependencies required for compiler development on MacOs-Arm/Linux-64 CPU-only platforms without changing the default environment.
 
-This environment targets Apple silicon with macOS 14 or newer. Upstream macOS CPU support is experimental.
+The environment uses Python 3.14, PyTorch 2.14.0, vLLM 0.33.0, and IREE compiler/runtime 3.14.0.
+To run the comprehensive python test suite:
 
 ```sh
-pixi install --locked -e vllm-mlir
-pixi run --locked -e vllm-mlir python -c 'import iree.compiler, iree.runtime, torch, vllm; from iree.compiler.extras.fx_importer import FxImporter'
+pixi install --locked -e vllm-mlir-cpu
+pixi run --locked -e vllm-mlir-cpu test-python
 ```
+
+Upstream macOS CPU support in vLLM is experimental.
 
 ## Tests
 
-The locked Pixi environment supplies pytest, Catch2 v3, CMake, Ninja,
-nanobind, Python and a C++ compiler. No GPU, PyTorch or LLVM/MLIR is needed.
-Run the suites from the repository root:
+The default Pixi environment supplies pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. No GPU, PyTorch, or LLVM/MLIR installation is needed for the basic Python and native tests.
+
+Compiler and vLLM tests require the optional development environment described above and are skipped when their dependencies are unavailable.
+
+Run the basic suites from the repository root:
 
 ```sh
 pixi install --locked
