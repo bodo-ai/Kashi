@@ -1,6 +1,6 @@
 # vLLM Integration: Symbolic Shapes, Opaque Inputs and Custom Operators
 
-**Status:** Proposed; pending human approval
+**Status:** Approved
 **Parent:** [vLLM FX–MLIR–FX Compilation Plugin](vllm-mlir-compilation.md) §2, §4–6, §9.3, milestone M2 (architectural reference only; this document sets the scope)
 **Builds on:** [Standalone TorchDynamo Backend](dynamo-backend.md), [MLIR → FX Reconstruction](mlir-fx-reconstruction.md)
 
