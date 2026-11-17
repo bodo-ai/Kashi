@@ -16,7 +16,12 @@ def _resolve_aten(op, name: str) -> torch._ops.OpOverload:
     base, _, overload = name.removeprefix("torch.aten.").partition(".")
     overload = overload or "default"
     packet = getattr(torch.ops.aten, base, None)
-    if packet is None or overload not in packet.overloads():
+    # The namespace object has its own attributes (e.g. ``name``); only an
+    # OpOverloadPacket is an operator.
+    if (
+        not isinstance(packet, torch._ops.OpOverloadPacket)
+        or overload not in packet.overloads()
+    ):
         raise _error(op, f"no torch.ops.aten.{base}.{overload}")
     return getattr(packet, overload)
 
