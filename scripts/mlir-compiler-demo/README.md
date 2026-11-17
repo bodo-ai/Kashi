@@ -24,4 +24,6 @@ python simple_llm.py
 # Convert full Qwen3 0.6B through FX->MLIR without checkpoint weights.
 # Configuration and tokenizer metadata may still be resolved.
 python simple_llm_qwen3.py
+# Compare normalized-only and FX->MLIR->FX Qwen3 outputs (dummy weights).
+python compare_simple_llm_qwen3.py
 ```

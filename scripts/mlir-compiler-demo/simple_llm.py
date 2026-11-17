@@ -428,6 +428,12 @@ def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
 
     return gm_reconstructed.forward
 
+@register_backend(name="normalized_fx_backend")
+def normalized_fx_backend(gm: fx.GraphModule, example_inputs):
+    gm_norm = normalize_fx(gm)
+    gm_norm = normalize_torch_size(gm_norm)
+    return gm_norm.forward
+
 
 def debug_backend(graph: torch.fx.GraphModule, example_inputs):
     print("\n========== Dynamo FX Graph ==========", flush=True)
