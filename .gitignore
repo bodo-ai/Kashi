@@ -9,5 +9,8 @@ __pycache__/
 mi300x-benchmark-*.tar.gz
 mi300x-benchmark-*.tar.gz.part
 mi300x-benchmark-*.json
+runpod-benchmark-*.tar.gz
+runpod-benchmark-*.tar.gz.part
+runpod-benchmark-*.json
 # roborev snapshots
 /.roborev/

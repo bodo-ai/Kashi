@@ -105,7 +105,7 @@ class Worker:
         self.manifest = {
             'schema_version': 1, 'run_id': config.get('run_id'), 'pod_id': pod_id,
             'started_at': self.started, 'ended_at': None, 'status': 'starting',
-            'gpu': {'type': config.get('gpu', 'AMD Instinct MI300X OAM'), 'count': 1},
+            'gpu': {'type': config.get('gpu'), 'count': 1},
             'data_center': os.environ.get('RUNPOD_DC_ID') or config.get('data_center') or UNAVAILABLE,
             'image': {'reference': config.get('image'), 'digest': UNAVAILABLE},
             'model': {'id': MODEL, 'revision': UNAVAILABLE},
@@ -157,6 +157,8 @@ class Worker:
             raise ValueError('seed must be a nonnegative integer')
         if type(self.config.get('profile')) is not bool:
             raise ValueError('profile must be a boolean')
+        if self.config.get('gpu') not in ('AMD Instinct MI300X OAM', 'AMD Instinct MI350 OAM'):
+            raise ValueError('a supported GPU is required')
         if not self.config.get('run_id') or not self.config.get('image'):
             raise ValueError('run_id and image are required')
         self.remaining()

@@ -24,7 +24,7 @@ def config():
     return {"run_id": "run-1", "deadline": time.time() + 300,
             "image": "image:test", "prompts": 4, "warmups": 2,
             "input_len": 16, "output_len": 8, "concurrency": 2,
-            "seed": 0, "profile": False}
+            "seed": 0, "profile": False, "gpu": "AMD Instinct MI300X OAM"}
 
 
 def test_manifest_records_actual_data_center(config, tmp_path, monkeypatch):

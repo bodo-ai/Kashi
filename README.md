@@ -77,29 +77,25 @@ which is visible to users with account or API access.
 
 ```sh
 export RUNPOD_API_KEY=...
-python scripts/runpod_benchmark.py watchdog-check
 python scripts/runpod_benchmark.py run --output-dir ./results
 python scripts/runpod_benchmark.py run --profile --output-dir ./results
 ```
 
-The manually initiated `watchdog-check` rents a test Pod and must confirm
-Pod-scoped self-termination for the account before benchmarking. Actual MI300X
-serving and ROCm profiling remain unverified until a real run succeeds. Use
-`run --help` for workload, image, deadline, and placement options. Synthetic
-text measures throughput, not tool-calling or reasoning quality.
-
-If Pod creation returns HTTP 400, the command also reports current secure-cloud
-MI300X availability from the Runpod catalog. This later snapshot is not proof
-of the rejection's cause and may differ by data center; HTTP 400 can also mean
-an invalid request.
 
 To wait for availability locally, add `--wait-for-capacity MINUTES` to
 `watchdog-check` or `run`. The wait is bounded and occurs before Pod creation;
 the benchmark's own deadline starts afterward. The catalog does not reserve
 capacity, so placement can still fail. No Runpod queued deployment is created.
 
-For an explicitly selected MI350X, add `--gpu 'AMD Instinct MI350 OAM'` to
-`run`. The MI300X recipe and image are not yet verified on MI350X.
+Both `run` and `watchdog-check` default to MI300X, then MI350X when the first
+is unavailable. Override the order with, for example:
+
+```sh
+python scripts/runpod_benchmark.py run --gpu 'AMD Instinct MI350 OAM' 'AMD Instinct MI300X OAM'
+```
+
+Selection uses a catalog snapshot and does not reserve a GPU. A rejected or
+ambiguous create is not retried on another GPU. Prices may differ by GPU.
 
 On interruption or host loss, run `python scripts/runpod_benchmark.py recover`
 before another paid run. The controller also reconciles its durable local

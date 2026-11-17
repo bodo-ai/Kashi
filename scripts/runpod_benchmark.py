@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the specified single-MI300X vLLM benchmark on a temporary Runpod Pod."""
+"""Run the specified vLLM benchmark on a temporary Runpod GPU Pod."""
 import argparse
 import base64
 import hashlib
@@ -16,8 +16,9 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runpod_recovery as recovery
 
-GPU = 'AMD Instinct MI300X OAM'
+GPU_OPTIONS = ('AMD Instinct MI300X OAM', 'AMD Instinct MI350 OAM')
 IMAGE = 'vllm/vllm-openai-rocm:latest'
+# Keep the existing journal location so outstanding Pods remain recoverable.
 STATE = Path.home() / '.local' / 'state' / 'runpod-mi300x-benchmark'
 
 
@@ -42,7 +43,7 @@ def parse_args(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     run = sub.add_parser('run', help='create, benchmark and terminate one Pod')
     run.add_argument('--image', default=IMAGE)
-    run.add_argument('--gpu', choices=[GPU, 'AMD Instinct MI350 OAM'], default=GPU)
+    run.add_argument('--gpu', nargs='+', choices=GPU_OPTIONS, default=list(GPU_OPTIONS), help='GPU types in preference order')
     run.add_argument('--disk', type=positive, default=100)
     run.add_argument('--deadline', type=positive, default=90, help='overall deadline in minutes')
     run.add_argument('--data-center')
@@ -60,6 +61,7 @@ def parse_args(argv=None):
     attest.add_argument('run_id')
     attest.add_argument('--name', required=True)
     check = sub.add_parser('watchdog-check', help='manually create a temporary Pod to verify Pod-scoped self-termination')
+    check.add_argument('--gpu', nargs='+', choices=GPU_OPTIONS, default=list(GPU_OPTIONS), help='GPU types in preference order')
     check.add_argument('--wait-for-capacity', type=positive, metavar='MINUTES', help='poll locally for capacity before creating a Pod')
     return parser.parse_args(argv)
 
@@ -121,38 +123,40 @@ def report_unresolved(records):
     for r in records:
         print(f"Unconfirmed cleanup: name={r.get('name')} id={r.get('pod_id') or 'unknown'} account={r.get('account')} elapsed={max(0, int(time.time() - r.get('started_at', time.time())))}s error={r.get('last_error') or 'outcome unconfirmed'}. Terminate this exact Pod in https://www.runpod.io/console/pods; run recover, or attest after verifying termination.", file=sys.stderr)
 
-def pod_body(name, image, disk, code, env, data_center=None):
-    body = {'name': name, 'image': image, 'gpu': {'id': GPU, 'count': 1}, 'disk': disk,
+def pod_body(name, image, disk, code, env, gpu_id, data_center=None):
+    body = {'name': name, 'image': image, 'gpu': {'id': gpu_id, 'count': 1}, 'disk': disk,
             'entrypoint': ['python3', '-u', '-c'], 'cmd': [code], 'ports': ['8765/http'], 'env': env}
     if data_center:
         body['dataCenterIds'] = [data_center]
     return body
 
 
-def wait_for_capacity(api, seconds, data_center, gpu_id=GPU):
+def wait_for_capacity(api, seconds, data_center, gpu_options):
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    while True:
         catalog = api.request('GET', '/catalog/gpus?include=AVAILABILITY&product=POD&count=1')
-        gpu = next((g for g in catalog.get('gpus', []) if g.get('id') == gpu_id), None)
-        if not gpu or gpu.get('availability') not in ('NONE', 'LOW', 'MEDIUM', 'HIGH'):
-            raise RuntimeError(f'{gpu_id} capacity information is unavailable')
-        availability = gpu['availability']
-        if data_center and availability != 'NONE':
-            centers = gpu.get('dataCenters')
-            if not isinstance(centers, list):
-                raise RuntimeError('data center capacity information is unavailable')
-            center = next((c for c in centers if c.get('id') == data_center), None)
-            availability = center.get('availability') if center else 'NONE'
-            if availability not in ('NONE', 'LOW', 'MEDIUM', 'HIGH'):
-                raise RuntimeError('data center capacity information is unavailable')
-        if time.monotonic() >= deadline:
-            break
-        if availability != 'NONE':
-            print(f'Current {gpu_id} capacity: {availability}; attempting placement.', flush=True)
-            return
-        print(f'Waiting for {gpu_id} capacity...', flush=True)
-        time.sleep(min(30, max(0, deadline - time.monotonic())))
-    raise TimeoutError('capacity wait expired without creating a Pod')
+        by_id = {gpu.get('id'): gpu for gpu in catalog['gpus']}
+        for gpu_id in gpu_options:
+            gpu = by_id.get(gpu_id)
+            if not gpu or gpu.get('availability') not in ('NONE', 'LOW', 'MEDIUM', 'HIGH'):
+                raise RuntimeError(f'{gpu_id} capacity information is unavailable')
+            availability = gpu['availability']
+            if data_center and availability != 'NONE':
+                centers = gpu.get('dataCenters')
+                if not isinstance(centers, list):
+                    raise RuntimeError('data center capacity information is unavailable')
+                center = next((c for c in centers if c.get('id') == data_center), None)
+                availability = center.get('availability') if center else 'NONE'
+                if availability not in ('NONE', 'LOW', 'MEDIUM', 'HIGH'):
+                    raise RuntimeError('data center capacity information is unavailable')
+            if availability != 'NONE':
+                print(f'Selected {gpu_id}: capacity {availability}; attempting placement.', flush=True)
+                return gpu_id
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('capacity wait expired without creating a Pod')
+        print('Waiting for preferred GPU capacity...', flush=True)
+        time.sleep(min(30, remaining))
 
 
 def main(argv=None):
@@ -176,15 +180,13 @@ def main(argv=None):
                 print('No unresolved journal records.')
                 return 0
             if args.command == 'watchdog-check':
-                if args.wait_for_capacity:
-                    wait_for_capacity(api, args.wait_for_capacity * 60, None)
-                return watchdog_check(args, api, journal, account)
+                gpu_id = wait_for_capacity(api, (args.wait_for_capacity or 0) * 60, None, args.gpu)
+                return watchdog_check(args, api, journal, account, gpu_id)
             marker = args.state_dir / 'watchdog-confirmed.json'
             if not marker.exists() or json.loads(marker.read_text()).get('account') != account:
                 raise RuntimeError('Pod-scoped self-termination has not been confirmed for this account; run watchdog-check manually first')
-            if args.wait_for_capacity:
-                wait_for_capacity(api, args.wait_for_capacity * 60, args.data_center, args.gpu)
-            return run_benchmark(args, api, journal, account)
+            gpu_id = wait_for_capacity(api, (args.wait_for_capacity or 0) * 60, args.data_center, args.gpu)
+            return run_benchmark(args, api, journal, account, gpu_id)
     except (Exception, KeyboardInterrupt) as error:
         print(f'error: {type(error).__name__}: {error}', file=sys.stderr)
         return 1
@@ -198,7 +200,7 @@ def create(api, journal, account, name, deadline, body, run_id):
     except recovery.APIError as error:
         if error.status == 400:
             journal.remove(run_id)
-            gpu_id = body.get('gpu', {}).get('id', GPU)
+            gpu_id = body.get('gpu', {}).get('id', 'unknown GPU')
             availability = 'unavailable'
             try:
                 catalog = api.request('GET', '/catalog/gpus?include=AVAILABILITY&product=POD&count=1')
@@ -232,9 +234,9 @@ def cleanup(api, journal, run_id, name, account, pod_id):
     return False
 
 
-def watchdog_check(args, api, journal, account):
+def watchdog_check(args, api, journal, account, gpu_id):
     run_id = secrets.token_hex(16)
-    name = 'mi300x-watchdog-' + run_id
+    name = 'runpod-watchdog-' + run_id
     deadline = time.time() + 300
     # The scoped credential is supplied by Runpod, never by the controller.
     code = "import os,time,urllib.request; time.sleep(20); r=urllib.request.Request('https://api.runpod.io/v2/pods/'+os.environ['RUNPOD_POD_ID'],method='DELETE',headers={'Authorization':'Bearer '+os.environ['RUNPOD_API_KEY']}); urllib.request.urlopen(r,timeout=20).read(); time.sleep(60)"
@@ -243,7 +245,7 @@ def watchdog_check(args, api, journal, account):
     observed = False
     try:
         print('Creating a billable watchdog test Pod.')
-        pod = create(api, journal, account, name, deadline, pod_body(name, IMAGE, 10, code, {}), run_id)
+        pod = create(api, journal, account, name, deadline, pod_body(name, IMAGE, 10, code, {}, gpu_id), run_id)
         pod_id = pod['id']
         while time.time() < deadline:
             time.sleep(5)
@@ -273,15 +275,15 @@ def watchdog_check(args, api, journal, account):
             cleanup(api, journal, run_id, name, account, pod_id)
 
 
-def run_benchmark(args, api, journal, account):
+def run_benchmark(args, api, journal, account, gpu_id):
     run_id = secrets.token_hex(16)
-    name = 'mi300x-benchmark-' + run_id
+    name = 'runpod-benchmark-' + run_id
     deadline = time.time() + args.deadline * 60
     secret = secrets.token_urlsafe(32)
     config = {'run_id': run_id, 'deadline': deadline, 'image': args.image, 'prompts': args.prompts,
               'warmups': args.warmups, 'input_len': args.input_len, 'output_len': args.output_len,
               'concurrency': args.concurrency, 'seed': args.seed, 'profile': args.profile,
-              'data_center': args.data_center, 'gpu': args.gpu}
+              'data_center': args.data_center, 'gpu': gpu_id}
     worker = (Path(__file__).resolve().parent / 'runpod_worker.py').read_bytes()
     code = "import base64;exec(compile(base64.b64decode('" + base64.b64encode(worker).decode() + "'),'<worker>','exec'))"
     env = {'BENCH_SECRET': secret, 'BENCH_CONFIG': json.dumps(config)}
@@ -295,9 +297,8 @@ def run_benchmark(args, api, journal, account):
     start = time.time()
     rate = None
     try:
-        print(f'Provisioning one {args.gpu} Pod...')
-        body = pod_body(name, args.image, args.disk, code, env, args.data_center)
-        body['gpu']['id'] = args.gpu
+        print(f'Provisioning one {gpu_id} Pod...')
+        body = pod_body(name, args.image, args.disk, code, env, gpu_id, args.data_center)
         pod = create(api, journal, account, name, deadline, body, run_id)
         pod_id = pod['id']
         rate = pod.get('cost')
