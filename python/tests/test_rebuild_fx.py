@@ -1,6 +1,8 @@
 import pytest
 torch = pytest.importorskip("torch")
 
+import operator
+
 from iree.compiler import ir
 from torch.utils import _pytree as pytree
 
@@ -178,3 +180,42 @@ func.func @main(%arg0: !torch.int) -> !torch.int {
 def test_rebuild_rejects(src, match):
     with pytest.raises(NotImplementedError, match=match):
         rebuild_fx(_parse(src))
+
+
+CHUNK = """
+func.func @main(%arg0: !torch.vtensor<[2,6],f32>) -> (!torch.vtensor<[2,3],f32>, !torch.vtensor<[2,3],f32>) {
+  %int2 = torch.constant.int 2
+  %int-1 = torch.constant.int -1
+  %0 = torch.aten.chunk %arg0, %int2, %int-1 : !torch.vtensor<[2,6],f32>, !torch.int, !torch.int -> !torch.list<vtensor>
+  %1:2 = torch.prim.ListUnpack %0 : !torch.list<vtensor> -> !torch.vtensor<[2,3],f32>, !torch.vtensor<[2,3],f32>
+  return %1#0, %1#1 : !torch.vtensor<[2,3],f32>, !torch.vtensor<[2,3],f32>
+}
+"""
+
+
+def test_rebuild_chunk():
+    gm = rebuild_fx(_parse(CHUNK))
+
+    assert _targets(gm) == [
+        torch.ops.aten.chunk.default,
+        operator.getitem,
+        operator.getitem,
+    ]
+    x = torch.randn(2, 6)
+    a, b = gm(x)
+    torch.testing.assert_close((a, b), x.chunk(2, dim=-1))
+
+
+UNPACK_LITERAL_LIST = """
+func.func @main(%arg0: !torch.vtensor<[2],f32>) -> !torch.int {
+  %int1 = torch.constant.int 1
+  %0 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %1:2 = torch.prim.ListUnpack %0 : !torch.list<int> -> !torch.int, !torch.int
+  return %1#0 : !torch.int
+}
+"""
+
+
+def test_rebuild_rejects_unpack_of_literal_list():
+    with pytest.raises(NotImplementedError, match="torch.prim.ListUnpack"):
+        rebuild_fx(_parse(UNPACK_LITERAL_LIST))
