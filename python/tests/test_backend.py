@@ -111,3 +111,62 @@ def test_sees_parameter_updates():
 
     torch.testing.assert_close(compiled(x), model(x))
     assert len(spy.calls) == 1
+
+
+# --- Symbolic dimensions, custom operators and opaque inputs. ---------------
+
+
+class SymbolicModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(10, 8)
+        self.linear = nn.Linear(8, 24)
+
+    def forward(self, ids):
+        q, k, v = self.linear(self.embed(ids)).chunk(3, dim=-1)
+        return q.view(-1, 2, 4), torch.empty(ids.shape[0], 8)
+
+
+def test_symbolic_dimension_reuses_compiled_graph():
+    torch.manual_seed(0)
+    model, spy = SymbolicModel(), Spy()
+    compiled = torch.compile(model, backend=spy)
+    first = torch.tensor([1, 2, 3])
+    torch._dynamo.mark_dynamic(first, 0)
+
+    for ids in (first, torch.tensor([1, 2, 3, 4, 5])):
+        (view, empty), (expected_view, expected_empty) = compiled(ids), model(ids)
+        torch.testing.assert_close(view, expected_view)
+        assert (empty.shape, empty.dtype) == (expected_empty.shape, expected_empty.dtype)
+    assert len(spy.calls) == 1
+
+
+def _call_targets(gm):
+    return [n.target for n in gm.graph.nodes if n.op == "call_function"]
+
+
+def test_custom_ops_with_opaque_inputs():
+    import kashi_test_ops
+
+    model = kashi_test_ops.OpsModel(kashi_test_ops.Tag(2.0), kashi_test_ops.Tag(3.0))
+    spy = Spy()
+    compiled = torch.compile(model, backend=spy, fullgraph=True)
+    first = torch.randn(3, 4)
+    torch._dynamo.mark_dynamic(first, 0)
+
+    for x in (first, torch.randn(5, 4)):
+        out, d = compiled(x)
+        torch.testing.assert_close(out, (x + 3.0).view(-1))
+        torch.testing.assert_close(d, x * 2.0)
+    assert len(spy.calls) == 1
+
+    gm, fn = spy.calls[0]
+    ops = torch.ops.kashi_test
+    assert [t for t in _call_targets(gm) if t in (ops.scale, ops.write)] == [
+        ops.scale,
+        ops.write,
+    ]
+    rebuilt = [
+        t for t in _call_targets(fn.__self__) if t in (ops.scale.default, ops.write.default)
+    ]
+    assert rebuilt == [ops.scale.default, ops.write.default]

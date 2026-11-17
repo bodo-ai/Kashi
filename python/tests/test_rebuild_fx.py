@@ -161,8 +161,8 @@ func.func @main(%arg0: !torch.vtensor<[2],f32>) -> !torch.vtensor<[2],f32> {
 """
 
 NON_TENSOR_ARG = """
-func.func @main(%arg0: !torch.int) -> !torch.int {
-  return %arg0 : !torch.int
+func.func @main(%arg0: !torch.float) -> !torch.float {
+  return %arg0 : !torch.float
 }
 """
 
@@ -173,7 +173,7 @@ func.func @main(%arg0: !torch.int) -> !torch.int {
         (MULTI_RESULT, "torch.aten.var_mean.correction"),
         (CUSTOM_OP, "torch.operator"),
         (NON_TORCH_OP, "arith.constant"),
-        (NON_TENSOR_ARG, "!torch.int"),
+        (NON_TENSOR_ARG, "!torch.float"),
     ],
     ids=["multi-result", "torch.operator", "non-torch-op", "non-tensor-arg"],
 )
@@ -297,3 +297,87 @@ def _with_unparseable_op(name, num_operands):
 def test_rebuild_rejects_unresolvable_aten_op(name, num_operands, match):
     with pytest.raises(NotImplementedError, match=match):
         rebuild_fx(_with_unparseable_op(name, num_operands))
+
+
+# --- Scalar/opaque arguments and torch.operator. -----------------------------
+
+CUSTOM = """
+func.func @main(%arg0: !torch.int, %arg1: !torch.vtensor<[?,4],f32>, %arg2: !torch.any, %arg3: !torch.any) -> (!torch.vtensor<[?,4],f32>, !torch.vtensor<[?,4],f32>) {
+  %0 = torch.operator "torch.kashi_test.scale"(%arg1, %arg2) : (!torch.vtensor<[?,4],f32>, !torch.any) -> !torch.vtensor<[?,4],f32>
+  %int4 = torch.constant.int 4
+  %1 = torch.prim.ListConstruct %arg0, %int4 : (!torch.int, !torch.int) -> !torch.list<int>
+  %int6 = torch.constant.int 6
+  %none = torch.constant.none
+  %cpu = torch.constant.device "cpu"
+  %2 = torch.aten.empty.memory_format %1, %int6, %none, %cpu, %none, %none : !torch.list<int>, !torch.int, !torch.none, !torch.Device, !torch.none, !torch.none -> !torch.vtensor<[?,4],f32>
+  torch.operator "torch.kashi_test.write"(%arg1, %2, %arg3, %0) : (!torch.vtensor<[?,4],f32>, !torch.vtensor<[?,4],f32>, !torch.any, !torch.vtensor<[?,4],f32>) -> ()
+  return %2, %0 : !torch.vtensor<[?,4],f32>, !torch.vtensor<[?,4],f32>
+}
+"""
+
+
+@pytest.fixture
+def test_ops():
+    import kashi_test_ops
+
+    return kashi_test_ops
+
+
+def test_rebuild_scalar_and_opaque_arguments(test_ops):
+    gm = rebuild_fx(_parse(CUSTOM))
+
+    placeholders = gm.graph.find_nodes(op="placeholder")
+    assert len(placeholders) == 4
+    (empty,) = gm.graph.find_nodes(
+        op="call_function", target=torch.ops.aten.empty.memory_format
+    )
+    assert empty.args[0] == [placeholders[0], 4]
+
+
+def test_rebuild_custom_operator(test_ops):
+    gm = rebuild_fx(_parse(CUSTOM))
+
+    scale, empty, write = _call_nodes(gm)
+    assert [scale.target, empty.target, write.target] == [
+        torch.ops.kashi_test.scale.default,
+        torch.ops.aten.empty.memory_format,
+        torch.ops.kashi_test.write.default,
+    ]
+    x, tag_a, tag_b = (gm.graph.find_nodes(op="placeholder")[i] for i in (1, 2, 3))
+    assert scale.args == (x, tag_a)
+    assert write.args == (x, empty, tag_b)
+    assert write.kwargs == {"dep": scale}
+
+
+def test_rebuild_zero_result_operator_runs_once(test_ops):
+    gm = rebuild_fx(_parse(CUSTOM))
+    x = torch.randn(3, 4)
+
+    out, d = gm(3, x, test_ops.Tag(2.0), test_ops.Tag(3.0))
+
+    assert _targets(gm).count(torch.ops.kashi_test.write.default) == 1
+    torch.testing.assert_close(out, x + 3.0)
+    torch.testing.assert_close(d, x * 2.0)
+
+
+def _with_operator(name):
+    return _parse(f"""
+func.func @main(%arg0: !torch.vtensor<[2],f32>, %arg1: !torch.any) -> !torch.vtensor<[2],f32> {{
+  %0 = torch.operator "{name}"(%arg0, %arg1) : (!torch.vtensor<[2],f32>, !torch.any) -> !torch.vtensor<[2],f32>
+  return %0 : !torch.vtensor<[2],f32>
+}}
+""")
+
+
+@pytest.mark.parametrize(
+    "name, match",
+    [
+        ("torch.kashi_test.missing", "no torch.ops.kashi_test.missing.default"),
+        ("torch.no_such_ns.op", "no torch.ops.no_such_ns.op.default"),
+        ("torch.kashi_test.scale.bogus", "no torch.ops.kashi_test.scale.bogus"),
+    ],
+    ids=["unknown-op", "unknown-namespace", "unknown-overload"],
+)
+def test_rebuild_rejects_unresolvable_operator(test_ops, name, match):
+    with pytest.raises(NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"):
+        rebuild_fx(_with_operator(name))
