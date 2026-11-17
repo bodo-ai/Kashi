@@ -1,6 +1,6 @@
 # Standalone TorchDynamo Backend
 
-**Status:** Proposed; pending human approval
+**Status:** Approved
 **Parent:** [vLLM FX–MLIR–FX Compilation Plugin](vllm-mlir-compilation.md) §3, §9.1 "Compilation backend", milestone M1 (architectural reference only; this document sets the scope)
 
 ## Intent
@@ -70,8 +70,8 @@ Models (small `nn.Module`s with fixed seeds):
 - A single-tensor return, to cover bare vs tuple output.
 - A model using `torch.empty(...)` (with constant size), comparing only shape and dtype of the uninitialized output.
 
-Unsupported-op test: a model using an operation `import_fx` does not support (e.g. `torch.relu`) raises when compiled and called, rather than returning eager results.
+An unsupported-op (no-fallback) test is deferred: candidate ops such as `relu` may soon be supported. Check 2 above covers the backend not returning the original graph.
 
 ## Left to the builder
 
-Exact model definitions, sizes and seeds; the specific unsupported op; whether `compile_fx` carries type annotations beyond the above; asserting on the wrapped exception type vs its cause.
+Exact model definitions, sizes and seeds; whether `compile_fx` carries type annotations beyond the above.
