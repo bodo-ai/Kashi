@@ -4,5 +4,10 @@
 build/
 dist/
 __pycache__/
+# Runpod benchmark artifacts, sidecars, and extracted traces
+/results/
+mi300x-benchmark-*.tar.gz
+mi300x-benchmark-*.tar.gz.part
+mi300x-benchmark-*.json
 # roborev snapshots
 /.roborev/

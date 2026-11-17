@@ -65,6 +65,56 @@ plugin; see `.github/workflows/mutation.yml` for the pinned Linux installation.
 Use the scheduled or manually dispatched Linux workflow when the toolchain is
 unavailable locally.
 
+## Runpod MI300X benchmark
+
+`scripts/runpod_benchmark.py` runs the workload described in
+[`specs/runpod-mi300x-vllm-benchmark.md`](specs/runpod-mi300x-vllm-benchmark.md).
+It uses Python 3.10 or newer and does not require a local GPU or Docker.
+It creates billable Pods; neither the deadline nor the cost estimate is a
+hard spending cap. Consider a dedicated prepaid account with auto-pay disabled
+and limited credits. The optional `HF_TOKEN` is sent in the Pod environment,
+which is visible to users with account or API access.
+
+```sh
+export RUNPOD_API_KEY=...
+python scripts/runpod_benchmark.py watchdog-check
+python scripts/runpod_benchmark.py run --output-dir ./results
+python scripts/runpod_benchmark.py run --profile --output-dir ./results
+```
+
+The manually initiated `watchdog-check` rents a test Pod and must confirm
+Pod-scoped self-termination for the account before benchmarking. Actual MI300X
+serving and ROCm profiling remain unverified until a real run succeeds. Use
+`run --help` for workload, image, deadline, and placement options. Synthetic
+text measures throughput, not tool-calling or reasoning quality.
+
+If Pod creation returns HTTP 400, the command also reports current secure-cloud
+MI300X availability from the Runpod catalog. This later snapshot is not proof
+of the rejection's cause and may differ by data center; HTTP 400 can also mean
+an invalid request.
+
+To wait for availability locally, add `--wait-for-capacity MINUTES` to
+`watchdog-check` or `run`. The wait is bounded and occurs before Pod creation;
+the benchmark's own deadline starts afterward. The catalog does not reserve
+capacity, so placement can still fail. No Runpod queued deployment is created.
+
+For an explicitly selected MI350X, add `--gpu 'AMD Instinct MI350 OAM'` to
+`run`. The MI300X recipe and image are not yet verified on MI350X.
+
+On interruption or host loss, run `python scripts/runpod_benchmark.py recover`
+before another paid run. The controller also reconciles its durable local
+journal automatically at startup. If cleanup cannot be confirmed, inspect
+and terminate the exact Pod in the [Runpod console](https://www.runpod.io/console/pods).
+After independently verifying termination, clear an unresolved entry with
+`python scripts/runpod_benchmark.py attest RUN_ID --name EXACT_POD_NAME`.
+The watchdog cannot stop a Pod whose container never starts or whose API is
+unreachable; such a Pod may continue billing until manually terminated.
+
+The output directory contains a `.tar.gz` artifact and a JSON cleanup sidecar.
+Inspect the manifest and benchmark JSON with `tar -xzf FILE.tar.gz` and a JSON
+viewer. Open compressed profiling traces directly in [Perfetto](https://ui.perfetto.dev/).
+Files marked `partial` are diagnostics, not successful benchmark results.
+
 ## Layout
 
 - `python/src/kashi/`: Python package and future FX integration.
