@@ -263,3 +263,37 @@ def test_rebuild_empty_decodes_dtype_and_device():
 def test_rebuild_rejects_bad_enum(operand, match):
     with pytest.raises(NotImplementedError, match=match):
         rebuild_fx(_parse(_empty(**operand)))
+
+
+IDENTITY = """
+func.func @main(%arg0: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
+  return %arg0 : !torch.vtensor<[2,3],f32>
+}
+"""
+
+
+def _with_unparseable_op(name, num_operands):
+    """The torch dialect parser rejects these ops; building them directly is
+    the only way to reach rebuild_fx's guards against torch-mlir/PyTorch drift."""
+    with ir.Context() as ctx, ir.Location.unknown():
+        ctx.allow_unregistered_dialects = True
+        module = ir.Module.parse(IDENTITY)
+        block = module.body.operations[0].regions[0].blocks[0]
+        (arg,) = block.arguments
+        with ir.InsertionPoint(block.operations[0]):
+            ir.Operation.create(name, results=[arg.type], operands=[arg] * num_operands)
+    return module
+
+
+@pytest.mark.parametrize(
+    "name, num_operands, match",
+    [
+        ("torch.aten.view.bogus", 2, "no torch.ops.aten.view.bogus"),
+        ("torch.aten.view", 1, "expected 2 operands, found 1"),
+        ("torch.aten.name", 1, "no torch.ops.aten.name.default"),
+    ],
+    ids=["unknown-overload", "operand-count", "namespace-attribute"],
+)
+def test_rebuild_rejects_unresolvable_aten_op(name, num_operands, match):
+    with pytest.raises(NotImplementedError, match=match):
+        rebuild_fx(_with_unparseable_op(name, num_operands))
