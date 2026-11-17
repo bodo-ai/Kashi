@@ -18,6 +18,7 @@ def compile_fx(
 ) -> Callable[..., Any]:
     """Import ``gm`` to MLIR, verify it, and return the rebuilt graph's
     ``forward``. Errors propagate; there is no fallback to ``gm``."""
-    imported = import_fx(gm, example_inputs)
-    imported.module.operation.verify()
+    imported = import_fx(gm)
+    if not imported.module.operation.verify():
+        raise RuntimeError(f"Verification failed for imported module:\n{imported.module}")
     return rebuild_fx(imported.module, imported.out_spec).forward
