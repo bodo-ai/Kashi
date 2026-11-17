@@ -94,6 +94,7 @@ def model_dir(tmp_path, monkeypatch):
     ModelRegistry.register_model("SimpleVllmForCausalLM", SimpleVllmForCausalLM)
     (tmp_path / "config.json").write_text(json.dumps(CONFIG))
     vllm_backend_spy.CALLS.clear()
+    vllm_backend_spy.TOKEN_COUNTS.clear()
     return tmp_path
 
 
@@ -128,6 +129,9 @@ def test_vllm_matches_uncompiled_vllm(model_dir):
     assert len(vllm_backend_spy.CALLS) == 1
     gm, fn = vllm_backend_spy.CALLS[0]
     assert fn is not gm.forward
+    # ...and the rebuilt callable actually ran for batched prefill (5 + 9
+    # tokens) and for decode (one token per prompt).
+    assert {14, 2} <= set(vllm_backend_spy.TOKEN_COUNTS)
 
     vllm_ops = torch.ops.vllm
     assert _vllm_targets(gm) == [
