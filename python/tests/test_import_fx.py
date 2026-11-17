@@ -3,6 +3,8 @@ torch = pytest.importorskip("torch")
 
 import operator
 
+from torch.utils import _pytree as pytree
+
 from kashi.importer import import_fx
 
 @pytest.mark.parametrize(
@@ -29,7 +31,7 @@ def test_import_fx_preserves_aten_linear(linear, meta_key):
 
     result = import_fx(gm, example_inputs)
 
-    assert result.module_op.verify()
+    assert result.module.operation.verify()
     assert "torch.aten.linear" in str(result.module)
 
 
@@ -66,7 +68,7 @@ def test_import_fx_preserves_aten_embedding(embedding, indices_first, kwargs):
 
     result = import_fx(gm, example_inputs)
 
-    assert result.module_op.verify()
+    assert result.module.operation.verify()
     assert "torch.aten.embedding" in str(result.module)
 
 
@@ -91,7 +93,7 @@ def test_import_fx_preserves_aten_view(op, target, shape):
 
     result = import_fx(gm, example_inputs)
 
-    assert result.module_op.verify()
+    assert result.module.operation.verify()
     assert "torch.aten.view" in str(result.module)
 
 
@@ -121,7 +123,7 @@ def test_import_fx_preserves_chunk_with_getitem(op, target):
 
     result = import_fx(gm, example_inputs)
 
-    assert result.module_op.verify()
+    assert result.module.operation.verify()
     assert "torch.aten.chunk" in str(result.module)
 
 
@@ -142,7 +144,7 @@ def test_import_fx_preserves_aten_empty(empty):
 
     result = import_fx(gm, [])
 
-    assert result.module_op.verify()
+    assert result.module.operation.verify()
     module = str(result.module)
     assert "torch.aten.empty.memory_format" in module
     assert "f16" in module
@@ -162,5 +164,26 @@ def test_import_fx_preserves_torch_size_feeding_empty():
 
     result = import_fx(gm, [])
 
-    assert result.module_op.verify()
+    assert result.module.operation.verify()
     assert "torch.aten.empty.memory_format" in str(result.module)
+
+
+def _view_graph(output):
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    y = graph.call_function(torch.ops.aten.view.default, (x, [6]))
+    graph.output(output(y))
+    x.meta["val"] = torch.randn(2, 3)
+    y.meta["val"] = torch.randn(6)
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [lambda y: y, lambda y: (y,), lambda y: (y, y)],
+    ids=["bare", "one-tuple", "two-tuple"],
+)
+def test_import_fx_records_out_spec(output):
+    result = import_fx(_view_graph(output), [])
+
+    assert result.out_spec == pytree.tree_flatten(output(0))[1]

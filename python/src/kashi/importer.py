@@ -1,20 +1,35 @@
 """FX to MLIR importer built on IREE's packaged Torch FX importer."""
 
 import operator
+from dataclasses import dataclass
 
 import torch
+from iree.compiler import ir
 from iree.compiler.extras.fx_importer import FxImporter
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils import _pytree as pytree
 
 
-def import_fx(gm: torch.fx.GraphModule, example_inputs) -> FxImporter:
+@dataclass(frozen=True)
+class ImportedModule:
+    """A Torch-dialect module and the pytree structure of the graph output,
+    which the importer flattens into ``func.return`` operands."""
+
+    module: ir.Module
+    out_spec: pytree.TreeSpec
+
+
+def import_fx(gm: torch.fx.GraphModule, example_inputs) -> ImportedModule:
     """Import ``gm`` as a Torch-dialect MLIR module.
 
     The input graph is not modified; normalization runs on a structural copy.
     """
+    normalized = _normalize(gm)
+    (output,) = normalized.graph.find_nodes(op="output")
+    out_spec = pytree.tree_flatten(output.args[0])[1]
     importer = FxImporter()
-    importer.import_graph_module(_normalize(gm))
-    return importer
+    importer.import_graph_module(normalized)
+    return ImportedModule(importer.module, out_spec)
 
 
 def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
