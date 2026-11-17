@@ -400,6 +400,7 @@ def normalize_torch_size(gm):
 def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
     print("\nOriginal Dynamo FX:")
     gm.graph.print_tabular()
+    print(gm.graph)
     # Normalize FX graph into the form Torch MLIR expects
     # the alternative would be to run this backend before AOTAutograd
     # but at that point some operators (e.g. linear) would be inlined
