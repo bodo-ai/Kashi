@@ -129,7 +129,7 @@ UNINITIALIZED = {"aten.empty.memory_format", "torch.empty", "torch.Size-feeding-
 def test_round_trip_matches_original(case):
     gm, inputs = CASES[case]()
 
-    imported = import_fx(gm, inputs)
+    imported = import_fx(gm)
     rebuilt = rebuild_fx(imported.module, imported.out_spec)
 
     expected, actual = gm(*inputs), rebuilt(*inputs)
