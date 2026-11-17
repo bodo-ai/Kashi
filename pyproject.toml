@@ -14,6 +14,7 @@ wheel.packages = ["python/src/kashi"]
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
+pythonpath = ["python/tests"]
 addopts = ["--import-mode=importlib"]
 
 [tool.pixi.workspace]
