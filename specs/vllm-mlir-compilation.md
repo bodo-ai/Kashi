@@ -21,7 +21,7 @@ Upstream details below use vLLM **0.34.0** and its CPU PyTorch **2.14.0+cpu** re
 - Represent Dynamo's symbolic values, ordinary Python/FX call forms, dispatcher operators, vLLM custom operators, and live opaque runtime objects without baking in example values.
 - Make operator handling reusable and schema-driven where possible. Model-specific node sequences, hardcoded layer names, and per-model graph translators are not the architecture.
 - Provide a straightforward MLIR pass hook without requiring optimizations or a new dialect in the first milestone.
-- Establish a required Linux x86-64 CPU end-to-end test and keep the translator device-neutral for later CUDA and other platforms.
+- Establish a required Linux x86-64 CPU end-to-end test and keep the translator device-neutral for later CUDA and other platforms. The tests must also be runnable from a local Mac Arm CPU environment.
 
 ### Non-goals
 
@@ -123,8 +123,6 @@ Use the IREE-packaged `iree.compiler.extras.fx_importer.FxImporter` as the first
 
 The low-level graph import APIs assume a functionalized/stateless graph; raw Dynamo graphs are not generally that form. The prototype shows a useful case that works despite this limitation. Adapt only the constructs needed for the supported subset, validate the resulting MLIR, and fail when equivalence cannot be established. Importer hooks, `ContextCache`, fake-object types and private fields are version-sensitive. Use the same IREE binding/context family throughout; do not combine independently built MLIR libraries [4, 13].
 
-Some importer versions remove `aten._assert_async.msg` or rewrite operations during import [4]. The adapter must prevent such behavior-changing rewrites or reject affected graphs, and must not silently lose vLLM custom calls or their dependencies.
-
 ### Normalization policy
 
 1. Inspect every FX node before import so unsupported nodes cannot be silently skipped. Preserve graph inputs, outputs, call ordering and live state. Copy graph structure before normalization because both local rewrites and the upstream importer may mutate it.
@@ -184,42 +182,111 @@ Unsupported input or MLIR must fail with an actionable diagnostic. Do not silent
 
 ## 9. Testing and acceptance
 
-Tests target behavior, not the prototype's hardcoded operator table. Use pytest in the existing Python test layout. The core skeleton tests must remain runnable without optional compiler dependencies. The M1 component job must provide PyTorch and the importer; the M2 CPU integration job must additionally provide vLLM and fail rather than silently skip. Use local fixtures and no network.
+Testing is organized into three levels: compiler-component tests, compiler round-trip tests, and vLLM integration tests.
 
-The tests below check observable behavior; this project does not build a comprehensive side-effect analysis test framework.
+The goal is to validate each compiler stage independently, then verify that the complete pipeline preserves executable behavior. Tests should focus on observable behavior and intermediate representations rather than private implementation details.
 
-### Compiler-component acceptance (M1)
+### 9.1 Compiler-component tests (M1)
 
-1. Import and reconstruct embedding and linear, assert `torch.aten.linear` survives, and compare executable outputs. Cover non-default arguments; unsupported options must fail explicitly, never be replaced with defaults.
-2. Exercise exact overloads and packets; positional, keyword-only, optional and default arguments; scalars, dtype/device and shape values; builtins and tensor methods. Test supported live attributes and opaque objects. Include an optional FX placeholder used with `None` and a tensor when its graph contract permits both, as distinct from operator defaults.
-3. Compare output structure and view behavior for tuples/lists, a multi-result operator, a list-valued result, `None`, and `chunk` views, including a case returning fewer chunks than requested.
-4. Capture symbolic shape arithmetic and run the same reconstructed graph on multiple valid token counts. Exercise size one and zero where permitted; distinguish legitimate guard recapture from actual symbolic reuse.
-5. Round-trip a focused example with two registered CPU custom operators: one writes an output buffer and returns `None`, and the other reads it. Compare the output and call order with the original graph, and verify that importing does not run the real kernels.
-6. Test that changing a supported MLIR constant changes the reconstructed graph's output. An unsupported FX or MLIR operation, including an assertion the importer would otherwise drop, must be preserved or produce a useful error rather than run an unmodified fallback.
+Each major compiler stage must have focused tests that validate its output independently.
 
-### Reference-model vLLM engine acceptance (M2)
+**FX → MLIR import**
 
-Use the required `SimpleVllmForCausalLM` fixture identified above, preserving its computational structure and real `vllm.Attention`. Register it with vLLM normally and supply a local small configuration, deterministic weights and any fixture-only loading code needed by the selected vLLM version. The required runner is Linux x86-64 with vLLM's CPU prerequisites. A starting configuration is one layer, vocabulary 128, hidden size 64, two heads of size 32, FP32 and block size 32 [19]. Token-ID prompts avoid a remote model or tokenizer. The prototype's dummy-weight setup can be a smoke test; the comparison fixture must use identical, nontrivial weights.
+Given a supported FX graph, verify that the imported MLIR:
 
-Run the reference with vLLM compilation disabled and the plugin in a separate equivalent engine, using the same device, weights and input sequence. The plugin run uses the prototype's trace-once configuration with `VLLM_DISABLE_COMPILE_CACHE=1` and `VLLM_USE_AOT_COMPILE=0` set before importing vLLM. Also exercise stock mode once to validate the documented guarded alternative. Record the resolved mode/backend; the plugin must actually be invoked, not merely configured.
+- Passes MLIR verification.
+- Contains expected high-level operations, including `torch.aten.linear`.
+- Preserves relevant operands, results, constants, tensor types, and symbolic dimensions.
+- Represents supported custom operators without silently dropping or replacing them.
+- Rejects unsupported constructs with actionable diagnostics.
 
-The required test establishes that:
+**MLIR → FX reconstruction**
 
-1. The model is registered and executed by the normal vLLM engine with real CPU attention.
-2. The backend imports its FX graph; MLIR contains high-level linear and the captured vLLM attention/cache operations; the rebuilt callable runs for actual requests, not only warmup.
-3. Prompt lengths include one and several larger token counts, and generation includes at least four tokens so prefill and multiple decode steps are exercised. Instrument the rebuilt callable in the test to record actual token dimensions during requests, and require the same trace-once graph to execute at size one and a larger size; prompt length alone does not establish this. Compare hidden states or logits and generated token IDs/log probabilities against the unmodified path, using deterministic greedy sampling. Prompt and output log probabilities can provide per-step observations without a remote tokenizer.
-4. Exercise attention and the existing KV cache through prefill and decode. Use different prefixes with the same suffix and weights chosen so at least one compared reference value differs by more than twice its applicable absolute-plus-relative tolerance; compare both plugin continuations with their reference values. The focused component test checks custom-operator order and output-buffer behavior without replacing vLLM attention.
-5. Capture and compare the model's `inputs_embeds` branch in a separate model instance. For the vLLM test, use `enable_prompt_embeds=True` and a local `prompt_embeds` tensor [21]; compare it with an uncompiled engine using the same embeddings and weights. Do not switch a `None`-specialized trace-once input in place.
+Given an independently constructed MLIR module, verify that the reconstructed FX:
 
-For vLLM 0.34, the x86 CPU runner inherits the model runner that honors `enable_prompt_embeds`; the standalone CPU runner only selects `inputs_embeds` for multimodal inputs [22]. Do not assume the embedding test covers other CPU runners without testing their actual behavior.
+- Contains the expected PyTorch operators and overloads.
+- Preserves arguments, constants, output structure, and symbolic shape expressions.
+- Reconstructs supported custom operators and their dependencies.
+- Handles supported multiple-result and zero-result operations.
+- Rejects unsupported operations with useful diagnostics.
 
-For the same FP32 CPU backend, start with `rtol=1e-4`, `atol=1e-5` and exact integer/structure comparison. Different kernels, devices or lower precision can require justified tolerances; near-tied logits can change greedy tokens even when numerical differences are small. Compare logits/log probabilities and use a fixture with a clear selection margin before requiring exact token equality.
+Tests should not rely exclusively on MLIR produced by the project's own importer.
 
-Together the component and engine tests cover model registration, plugin selection, import, high-level/custom operators, reconstruction, execution, varied prefill/decode token counts, numerical agreement, and custom-operator behavior and runtime dependencies.
+**MLIR pass pipeline**
 
-### Later tests
+Verify that a valid MLIR module passes through the initial non-transforming pipeline and remains valid.
 
-Validate later Inductor delegation and additional devices against real vLLM execution, including focused custom-operator and variable-token tests. Add model architectures using representative real captures, not architecture-specific graph walkers. vLLM piecewise integration, distributed execution, quantization, AOT/boxed calling conventions and persisted caches need their own tests before support is claimed. Effect-aware MLIR optimization testing belongs to the separate workstream.
+**Compilation backend**
+
+Verify that the registered compiler backend accepts supported FX graphs and returns a callable with the correct input/output conventions.
+
+### 9.2 Compiler round-trip tests (M1)
+
+Test the complete FX → MLIR → FX pipeline using representative PyTorch models and FX graphs.
+
+For each supported case, execute the original and reconstructed graphs using the same inputs and compare tensor values, shapes, dtypes, and output structures.
+
+Initial coverage should include linear, embedding, view/reshape, and multi-output operations, along with the following required cases.
+
+**Symbolic-shape reuse**
+
+Compile or round-trip a graph with a symbolic dimension once, then execute the same reconstructed callable with multiple valid values of that dimension.
+
+Verify numerical equivalence with the original graph and ensure that symbolic dimensions have not been replaced with concrete values from tracing examples.
+
+This test must distinguish reuse of the same graph from Dynamo recompilation.
+
+**Custom-operator preservation**
+
+Use a small registered test operator to verify that custom operations survive FX → MLIR → FX reconstruction.
+
+Verify both structural preservation and executable behavior, including relevant argument dependencies and supported operations with no return value.
+
+The project does not need to implement new MLIR side-effect modeling or alias analysis for this test.
+
+**Unsupported operations**
+
+Verify that unsupported FX or MLIR constructs produce useful errors rather than silently falling back to the original graph.
+
+### 9.3 vLLM integration tests (M2)
+
+Use `python/tests/models/simple_vllm_model.py` as the required reference architecture, including the real `vllm.Attention` implementation.
+
+**Initial integration**
+
+Register the model with vLLM, enable the plugin, and verify that:
+
+- The backend is invoked.
+- The captured graph completes the FX → MLIR → FX round trip.
+- The reconstructed callable executes within vLLM.
+- A normal inference request completes successfully.
+
+**End-to-end correctness**
+
+Run equivalent model instances with and without the plugin using identical weights and deterministic inference settings.
+
+Compare observable outputs, preferably hidden states or logits, within justified numerical tolerances.
+
+**Prefill and decode**
+
+Exercise multiple token counts, including prefill and decode. Verify that the reconstructed graph handles the relevant symbolic dimensions and preserves real vLLM custom-operator execution.
+
+Where the chosen compilation mode permits a single graph to be reused across those sizes, explicitly verify that reuse.
+
+**Additional integration coverage**
+
+After the initial integration succeeds, expand tests to alternative input branches such as `inputs_embeds`, additional prompt lengths, and other relevant runtime configurations.
+
+### 9.4 Testing principles
+
+- Test compiler stages independently before testing the complete pipeline.
+- Prefer structural IR assertions over full serialized-IR comparisons.
+- Use independent MLIR fixtures for reverse-translation tests.
+- Compare original and reconstructed behavior for supported operations.
+- Keep component and round-trip tests independent of the full vLLM runtime wherever possible.
+- Use the reference model for end-to-end acceptance.
+- Add regression tests as new operator forms and compatibility issues are discovered.
+- Keep effect-aware MLIR optimization testing outside this project's scope.
 
 ## 10. Dependencies and implementation milestones
 
