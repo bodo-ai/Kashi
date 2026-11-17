@@ -9,7 +9,7 @@ Build an out-of-tree backend that imports a TorchDynamo FX graph into MLIR, runs
 
 The user supplied a prototype and reports that it runs this round trip through vLLM. It uses `DYNAMO_TRACE_ONCE`, IREE's packaged Torch FX importer, normalization of a small set of raw Dynamo calls, an importer type extension, and an MLIR-to-FX visitor. That is evidence for a practical starting path, not proof that its restricted mappings preserve every graph. The prototype was supplied in the conversation, not found in the repository. This design review did not execute it or install its dependencies.
 
-Upstream details below use vLLM **0.34.0** and its CPU PyTorch **2.14.0+cpu** requirement as a reference [1, 2]. The prototype's dependency versions were not provided. Neither this reference nor the inspected importer sources establish a tested common version tuple.
+The tested component stack is vLLM **0.33.0** (CPU wheel), PyTorch **2.14.0** and IREE **3.14.0**, pinned in the `vllm-mlir` Pixi environment. Upstream details and links below were researched against vLLM 0.34.0 [1, 2]; behavior was re-checked against 0.33.0 where noted, and linked line numbers may differ. vLLM 0.33 on PyTorch ≥ 2.10 enables AOT compilation by default, which requires a serializable backend result; the integration tests disable it (`VLLM_USE_AOT_COMPILE=0`). The prototype's dependency versions were not provided.
 
 ## 1. Goals and non-goals
 
@@ -52,7 +52,7 @@ The end-to-end harness may choose smaller dimensions, deterministic weights, a l
 | --- | --- | --- |
 | Direct Dynamo backend, IREE-packaged Torch importer, and a schema-driven reverse translator | **Proposed.** | Closest to the working prototype; reuses Torch dialect and PyTorch execution. The raw importer needs a narrow adapter and an explicit supported subset. |
 | Direct upstream Torch-MLIR importer | Alternative distribution of the same approach. | Similar importer and dialect; useful if its tested versions are a better fit. Do not mix its MLIR bindings with IREE's. |
-| vLLM `VLLM_COMPILE`/`CompilerInterface` adapter | Later option. | Could retain vLLM's piecewise compiler, but uses an internal cache/compiler contract, may split attention out, and vLLM 0.34 CPU rewrites mode 3 and replaces the backend [5, 6]. |
+| vLLM `VLLM_COMPILE`/`CompilerInterface` adapter | Later option. | Could retain vLLM's piecewise compiler, but uses an internal cache/compiler contract, may split attention out, and vLLM 0.33/0.34 CPU rewrites mode 3 and replaces the backend [5, 6]. |
 | Export/AOTAutograd before importing | Not the initial path. | Normalizes more operators but can decompose `linear`, functionalize mutation, and change input/output conventions or freeze state [3]. |
 
 ### vLLM configuration
@@ -66,7 +66,7 @@ CompilationConfig(
 )
 ```
 
-In vLLM 0.34, mode 2 calls the backend for the `@support_torch_compile`-decorated model forward, and a dotted name is resolved to the backend function [5, 7]. The prototype registered a short name in the current process; the packaged plugin should also expose a `torch_dynamo_backends` entry point so a name or dotted path works in workers [9]. Model registration is separate: use `ModelRegistry` or a `vllm.general_plugins` entry point as appropriate [10].
+In vLLM 0.33 (checked) and 0.34, mode 2 calls the backend for the `@support_torch_compile`-decorated model forward, and a dotted name is resolved to the backend function [5, 7]. The prototype registered a short name in the current process; the packaged plugin should also expose a `torch_dynamo_backends` entry point so a name or dotted path works in workers [9]. Model registration is separate: use `ModelRegistry` or a `vllm.general_plugins` entry point as appropriate [10].
 
 **Guard trade-off:** vLLM's trace-once mode normally drops Dynamo guards. The plugin must not specialize symbolic sizes from example inputs or add assumptions, but it cannot restore guards that vLLM removes. Validate the target's prefill/decode sizes under the selected vLLM configuration; use vLLM's unbacked or guard-evaluation options when compatible, or choose stock mode when ordinary guard/recompilation behavior is needed [8]. Supported behavior is limited to the tested shape domain and the selected vLLM guard policy; successful tests do not make guard dropping universally safe.
 
@@ -157,7 +157,7 @@ Source maps should identify the FX node and original stack location where availa
 
 Reconstruct vLLM custom-operator calls in their captured order, with the same arguments and dependencies, including calls with no result. Preserve their observable behavior rather than replacing them or treating them as removable.
 
-In vLLM 0.34 CPU attention, `unified_kv_cache_update` supplies a dummy dependency to `unified_attention_with_output`, which writes an output tensor [16]. Preserve both calls, their order, the dependency, the output buffer, and the live runtime context. A layer name may be a hoisted opaque object rather than a string [17].
+In vLLM 0.33 (observed) and 0.34 CPU attention, `unified_kv_cache_update` supplies a dummy dependency to `unified_attention_with_output`, which writes an output tensor [16]. Preserve both calls, their order, the dependency, the output buffer, and the live runtime context. A layer name may be a hoisted opaque object rather than a string [17].
 
 The round trip preserves the captured operations and their tensor and object references; it does not require the plugin to add an MLIR side-effect model, alias analysis, or effect tokens. The initial pass pipeline leaves potentially stateful operations unchanged.
 
@@ -292,7 +292,7 @@ After the initial integration succeeds, expand tests to alternative input branch
 
 - **M0 — pin the component stack.** Identify a compatible PyTorch, IREE compiler/importer and Python combination for M1. Start from the prototype's environment when available; the version tuple is not included in the supplied code. The current repository's base Pixi environment uses Python 3.14 and need not be replaced just to add an optional plugin environment. A vLLM installation is not required for M1.
 - **M1 — basic FX round trip and operators.** Develop the reusable normalization/type adapter, schema-driven reverse translation, no-transform pass hook and standalone PyTorch/Dynamo backend. Pass the compiler-component tests above for ordinary and focused custom operators, symbolic values and output conventions. This milestone does not require the vLLM engine or the reference-model integration test.
-- **M2 — first vLLM integration.** Determine a compatible Linux x86-64 CPU vLLM tuple, then register and execute the existing `python/tests/models/simple_vllm_model.py` fixture through the normal vLLM engine and the plugin. Pass the reference-model acceptance test above, including real attention and prefill/decode comparison. This is the first major end-to-end integration target.
+- **M2 — first vLLM integration.** Using the pinned vLLM 0.33 CPU tuple (validated first on the local osx-arm64 environment; a Linux x86-64 tuple remains to be determined), register and execute the existing `python/tests/models/simple_vllm_model.py` fixture through the normal vLLM engine and the plugin. Pass the reference-model acceptance test above, including real attention and prefill/decode comparison. This is the first major end-to-end integration target.
 - **M3 — Inductor and more models.** Add explicit Inductor delegation and compare its behavior with real vLLM execution. Extend supported operators from actual captured graphs, not model-specific walkers.
 - **M4 — additional devices.** Validate CUDA and other devices with representative models. Effect-aware MLIR optimizations are outside these milestones; future integration depends on the separate side-effect and mutation semantics workstream.
 
