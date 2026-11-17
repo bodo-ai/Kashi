@@ -10,7 +10,8 @@ from kashi.importer import import_fx
     [torch.ops.aten.linear.default, torch._C._nn.linear],
     ids=["aten.linear.default", "torch._C._nn.linear"],
 )
-def test_import_fx_preserves_aten_linear(linear):
+@pytest.mark.parametrize("meta_key", ["val", "example_value"])
+def test_import_fx_preserves_aten_linear(linear, meta_key):
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     weight = graph.placeholder("weight")
@@ -22,9 +23,9 @@ def test_import_fx_preserves_aten_linear(linear):
     example_inputs = [torch.randn(2, 4), torch.randn(3, 4), torch.randn(3)]
 
     for node, value in zip(graph.find_nodes(op="placeholder"), example_inputs):
-        node.meta["val"] = value
+        node.meta[meta_key] = value
 
-    y.meta["val"] = linear(*example_inputs)
+    y.meta[meta_key] = linear(*example_inputs)
 
     result = import_fx(gm, example_inputs)
 

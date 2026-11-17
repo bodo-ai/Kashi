@@ -33,9 +33,12 @@ def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 
 def _fake_meta(node: torch.fx.Node, fake_mode: FakeTensorMode) -> None:
-    """Replace real tensors in ``meta["val"]`` with fake tensors of the same type."""
+    """Set ``meta["val"]`` from Dynamo's ``example_value`` when missing, and
+    replace real tensors with fake tensors of the same type."""
     if "val" not in node.meta:
-        return
+        if "example_value" not in node.meta:
+            return
+        node.meta["val"] = node.meta["example_value"]
     val = node.meta["val"]
     if isinstance(val, (tuple, list)):
         node.meta["val"] = [_to_fake(v, fake_mode) for v in val]
