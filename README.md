@@ -83,11 +83,11 @@ python scripts/runpod_benchmark.py run --profile --output-dir ./results
 
 
 To wait for availability locally, add `--wait-for-capacity MINUTES` to
-`watchdog-check` or `run`. The wait is bounded and occurs before Pod creation;
+`run`. The wait is bounded and occurs before Pod creation;
 the benchmark's own deadline starts afterward. The catalog does not reserve
 capacity, so placement can still fail. No Runpod queued deployment is created.
 
-Both `run` and `watchdog-check` default to MI300X, then MI350X when the first
+The command defaults to MI300X, then MI350X when the first
 is unavailable. Override the order with, for example:
 
 ```sh

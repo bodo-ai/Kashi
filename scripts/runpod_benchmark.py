@@ -60,9 +60,6 @@ def parse_args(argv=None):
     attest = sub.add_parser('attest', help='clear an unresolved record after manual console verification')
     attest.add_argument('run_id')
     attest.add_argument('--name', required=True)
-    check = sub.add_parser('watchdog-check', help='manually create a temporary Pod to verify Pod-scoped self-termination')
-    check.add_argument('--gpu', nargs='+', choices=GPU_OPTIONS, default=list(GPU_OPTIONS), help='GPU types in preference order')
-    check.add_argument('--wait-for-capacity', type=positive, metavar='MINUTES', help='poll locally for capacity before creating a Pod')
     return parser.parse_args(argv)
 
 
@@ -179,12 +176,6 @@ def main(argv=None):
             if args.command == 'recover':
                 print('No unresolved journal records.')
                 return 0
-            if args.command == 'watchdog-check':
-                gpu_id = wait_for_capacity(api, (args.wait_for_capacity or 0) * 60, None, args.gpu)
-                return watchdog_check(args, api, journal, account, gpu_id)
-            marker = args.state_dir / 'watchdog-confirmed.json'
-            if not marker.exists() or json.loads(marker.read_text()).get('account') != account:
-                raise RuntimeError('Pod-scoped self-termination has not been confirmed for this account; run watchdog-check manually first')
             gpu_id = wait_for_capacity(api, (args.wait_for_capacity or 0) * 60, args.data_center, args.gpu)
             return run_benchmark(args, api, journal, account, gpu_id)
     except (Exception, KeyboardInterrupt) as error:
@@ -234,45 +225,6 @@ def cleanup(api, journal, run_id, name, account, pod_id):
     return False
 
 
-def watchdog_check(args, api, journal, account, gpu_id):
-    run_id = secrets.token_hex(16)
-    name = 'runpod-watchdog-' + run_id
-    deadline = time.time() + 300
-    # The scoped credential is supplied by Runpod, never by the controller.
-    code = "import os,time,urllib.request; time.sleep(20); r=urllib.request.Request('https://api.runpod.io/v2/pods/'+os.environ['RUNPOD_POD_ID'],method='DELETE',headers={'Authorization':'Bearer '+os.environ['RUNPOD_API_KEY']}); urllib.request.urlopen(r,timeout=20).read(); time.sleep(60)"
-    pod_id = None
-    success = False
-    observed = False
-    try:
-        print('Creating a billable watchdog test Pod.')
-        pod = create(api, journal, account, name, deadline, pod_body(name, IMAGE, 10, code, {}, gpu_id), run_id)
-        pod_id = pod['id']
-        while time.time() < deadline:
-            time.sleep(5)
-            matches = [p for p in api.list_pods() if p.get('id') == pod_id]
-            if matches:
-                observed = True
-            if observed and not matches:
-                # Independently inspect the deleted Pod; do not treat mere stopped status as deletion.
-                try:
-                    status = api.request('GET', '/pods/' + urllib.parse.quote(pod_id, safe=''))
-                except recovery.APIError as error:
-                    if getattr(error, 'status', None) == 404:
-                        success = True
-                        break
-                    raise
-                if status.get('status') == 'TERMINATED':
-                    success = True
-                    break
-        if success:
-            journal.remove(run_id)
-            save_json(args.state_dir / 'watchdog-confirmed.json', {'account': account, 'pod_id': pod_id, 'confirmed_at': time.time()})
-            print('Pod-scoped self-termination independently confirmed.')
-            return 0
-        raise RuntimeError('Pod-scoped self-termination was not confirmed')
-    finally:
-        if not success:
-            cleanup(api, journal, run_id, name, account, pod_id)
 
 
 def run_benchmark(args, api, journal, account, gpu_id):

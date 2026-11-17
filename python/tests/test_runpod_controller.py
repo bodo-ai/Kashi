@@ -200,7 +200,7 @@ def test_proxy_request_succeeds_when_default_python_agent_is_blocked(monkeypatch
 
 def test_gpu_preference_defaults_and_override():
     assert controller.parse_args(['run']).gpu == ['AMD Instinct MI300X OAM', 'AMD Instinct MI350 OAM']
-    assert controller.parse_args(['watchdog-check', '--gpu', 'AMD Instinct MI350 OAM', 'AMD Instinct MI300X OAM']).gpu == ['AMD Instinct MI350 OAM', 'AMD Instinct MI300X OAM']
+    assert controller.parse_args(['run', '--gpu', 'AMD Instinct MI350 OAM', 'AMD Instinct MI300X OAM']).gpu == ['AMD Instinct MI350 OAM', 'AMD Instinct MI300X OAM']
 
 
 @pytest.mark.parametrize(('first', 'second', 'expected'), [
@@ -232,3 +232,14 @@ def test_unknown_preferred_gpu_capacity_does_not_silently_select_other():
             return {'gpus': [{'id': 'AMD Instinct MI350 OAM', 'availability': 'HIGH'}]}
     with pytest.raises(RuntimeError, match='capacity information is unavailable'):
         controller.wait_for_capacity(API(), 0, None, ['AMD Instinct MI300X OAM', 'AMD Instinct MI350 OAM'])
+
+
+def test_run_does_not_require_watchdog_confirmation_marker(tmp_path, monkeypatch):
+    class API:
+        def __init__(self, key): pass
+        def request(self, method, path, body=None):
+            if path == '/account': return {'id': 'account'}
+            return {'gpus': [{'id': 'AMD Instinct MI300X OAM', 'availability': 'HIGH'}]}
+    monkeypatch.setattr(controller.recovery, 'RunpodAPI', API)
+    monkeypatch.setattr(controller, 'run_benchmark', lambda args, api, journal, account, gpu: 0)
+    assert controller.main(['--api-key', 'key', '--state-dir', str(tmp_path), 'run']) == 0
