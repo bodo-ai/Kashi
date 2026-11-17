@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 import torch
 from iree.compiler import ir
-from iree.compiler.extras.fx_importer import FxImporter
+from iree.compiler.extras.fx_importer import ContextCache, FxImporter, IrType
+from torch._library.fake_class_registry import FakeScriptObject
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
 
@@ -28,8 +29,29 @@ def import_fx(gm: torch.fx.GraphModule, example_inputs) -> ImportedModule:
     (output,) = normalized.graph.find_nodes(op="output")
     out_spec = pytree.tree_flatten(output.args[0])[1]
     importer = FxImporter()
+    _use_opaque_types(importer)
     importer.import_graph_module(normalized)
     return ImportedModule(importer.module, out_spec)
+
+
+class _OpaqueContextCache(ContextCache):
+    """Types hoisted opaque objects (``FakeScriptObject`` metadata, e.g.
+    vLLM's ``LayerName``) as ``!torch.any``; defers everything else."""
+
+    def value_info_to_type(self, val, *, tensor_meta=None, mutable=False):
+        if isinstance(val, FakeScriptObject):
+            return IrType.parse("!torch.any", self._c)
+        return super().value_info_to_type(
+            val, tensor_meta=tensor_meta, mutable=mutable
+        )
+
+
+def _use_opaque_types(importer: FxImporter) -> None:
+    """Adapter: install the opaque-aware cache on this importer only. Uses
+    IREE's private ``_cc``/``_c``/``_py_attr_tracker`` fields."""
+    importer._cc = _OpaqueContextCache(
+        importer._c, py_attr_tracker=importer._py_attr_tracker
+    )
 
 
 def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -71,6 +93,9 @@ def _to_fake(val, fake_mode: FakeTensorMode):
 
 def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
     target = node.target
+    if node.op == "call_function" and isinstance(target, torch._ops.OpOverloadPacket):
+        _resolve_packet(node)
+        return
     if node.op == "call_function" and (
         isinstance(target, torch._ops.OpOverload) or target is operator.getitem
     ):
@@ -104,6 +129,17 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
         raise NotImplementedError(
             f"Unsupported FX node {node.format_node()} ({node.op} {target!r})"
         )
+
+
+def _resolve_packet(node: torch.fx.Node) -> None:
+    packet = node.target
+    overloads = packet.overloads()
+    if len(overloads) != 1:
+        raise NotImplementedError(
+            f"Ambiguous overload packet {packet} (overloads {overloads}): "
+            f"{node.format_node()}"
+        )
+    node.target = getattr(packet, overloads[0])
 
 
 def _rewrite_embedding(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
@@ -141,13 +177,19 @@ def _rewrite_chunk(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
 
 def _fold_size(node: torch.fx.Node) -> None:
     (dims,) = node.args
-    if not all(isinstance(d, int) for d in dims):
+    if not all(isinstance(d, int) or _is_symint(d) for d in dims):
         raise NotImplementedError(
-            f"torch.Size with non-constant dimensions: {node.format_node()}"
+            f"torch.Size with unsupported dimensions: {node.format_node()}"
         )
     for user in list(node.users):
         user.replace_input_with(node, list(dims))
     node.graph.erase_node(node)
+
+
+def _is_symint(value) -> bool:
+    return isinstance(value, torch.fx.Node) and isinstance(
+        value.meta.get("val"), torch.SymInt
+    )
 
 
 def _replace(graph, node, target, args, kwargs) -> None:

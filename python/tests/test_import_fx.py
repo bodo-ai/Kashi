@@ -2,6 +2,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 import operator
+import re
 
 from torch.utils import _pytree as pytree
 
@@ -187,3 +188,77 @@ def test_import_fx_records_out_spec(output):
     result = import_fx(_view_graph(output), [])
 
     assert result.out_spec == pytree.tree_flatten(output(0))[1]
+
+
+# --- Symbolic sizes, custom operators and opaque inputs. --------------------
+
+
+def _captured_ops_model():
+    import kashi_test_ops
+
+    x = torch.randn(3, 4)
+    torch._dynamo.mark_dynamic(x, 0)
+    model = kashi_test_ops.OpsModel(kashi_test_ops.Tag(2.0), kashi_test_ops.Tag(3.0))
+    return kashi_test_ops.capture(model, x)
+
+
+def _main_signature(text):
+    return next(line for line in text.splitlines() if "func.func @main" in line)
+
+
+def test_import_fx_symbolic_size_feeding_empty():
+    gm, example_inputs = _captured_ops_model()
+    assert gm.graph.find_nodes(op="call_function", target=torch.Size)
+
+    text = str(import_fx(gm, example_inputs).module)
+
+    signature = _main_signature(text)
+    assert "!torch.int" in signature
+    assert "!torch.vtensor<[?,4],f32>" in signature
+    sym_arg = signature.split("@main(")[1].split(",")
+    sym_arg = next(a.split(":")[0].strip() for a in sym_arg if "!torch.int" in a)
+    assert re.search(
+        rf"torch\.prim\.ListConstruct {re.escape(sym_arg)}, %int4\b", text
+    )
+    assert re.search(
+        r"torch\.aten\.empty\.memory_format .* -> !torch\.vtensor<\[\?,4\],f32>", text
+    )
+    assert "torch.constant.int 3" not in text
+
+
+def test_import_fx_custom_ops_and_opaque_inputs():
+    gm, example_inputs = _captured_ops_model()
+
+    result = import_fx(gm, example_inputs)
+    text = str(result.module)
+
+    assert result.module.operation.verify()
+    assert _main_signature(text).count("!torch.any") == 2
+    assert 'torch.operator "torch.kashi_test.scale"' in text
+    write = next(l for l in text.splitlines() if '"torch.kashi_test.write"' in l)
+    assert write.rstrip().endswith("-> ()")
+
+
+def test_import_fx_rejects_multi_overload_packet():
+    graph = torch.fx.Graph()
+    a, b = graph.placeholder("a"), graph.placeholder("b")
+    y = graph.call_function(torch.ops.aten.add, (a, b))
+    graph.output(y)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    for node, value in [(a, torch.randn(2)), (b, torch.randn(2)), (y, torch.randn(2))]:
+        node.meta["val"] = value
+
+    with pytest.raises(NotImplementedError, match="Ambiguous overload packet.*aten.add"):
+        import_fx(gm, [])
+
+
+def test_import_fx_opaque_hook_is_not_global():
+    from iree.compiler.extras import fx_importer
+
+    before = fx_importer.ContextCache.value_info_to_type
+    gm, example_inputs = _captured_ops_model()
+    try:
+        import_fx(gm, example_inputs)
+    except NotImplementedError:
+        pass
+    assert fx_importer.ContextCache.value_info_to_type is before
