@@ -302,7 +302,6 @@ Version coupling is a real dependency, not an assumed blocker: the inspected vLL
 
 | Risk | Resolution |
 | --- | --- |
-| The prototype's versions and exact captured graph are unknown here. | Record the working versions and actual graph, then test and lock a reproducible tuple. |
 | Importer APIs are internal, assume stateless FX, and can rewrite graphs or flatten results. | Isolate the importer adapter, use a copied graph, retain necessary metadata, and test the supported constructs and diagnostics. |
 | vLLM trace-once can drop guards. | Test varied prefill and decode sizes, document the guard policy, and offer guarded stock mode. |
 | A future pass or downstream compiler could change operator behavior. | Keep the initial pipeline non-transforming and validate downstream execution; future effect-aware MLIR optimizations depend on the separate workstream. |
