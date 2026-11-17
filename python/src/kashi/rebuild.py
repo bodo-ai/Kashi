@@ -4,6 +4,7 @@ import operator
 
 import torch
 from iree.compiler import ir
+from iree.compiler.extras.fx_importer import TORCH_DTYPE_TO_INT
 from torch.utils import _pytree as pytree
 
 
@@ -22,6 +23,28 @@ def _resolve_aten(op, name: str) -> torch._ops.OpOverload:
 
 def _schema_arguments(overload: torch._ops.OpOverload):
     return overload._schema.arguments
+
+
+# The importer encodes dtypes with this table; decoding with its inverse keeps
+# both directions in step.
+_INT_TO_DTYPE = {v: k for k, v in TORCH_DTYPE_TO_INT.items()}
+
+
+def _decode(argument, value, op):
+    """Decode an operand by its schema type. ``Argument.type`` reports enum
+    types such as ``ScalarType`` as ``int``; ``real_type`` keeps them."""
+    kind = str(argument.real_type)
+    if kind.startswith("Optional[") and kind.endswith("]"):
+        kind = kind[len("Optional[") : -1]
+    if kind == "ScalarType" and isinstance(value, int):
+        if value not in _INT_TO_DTYPE:
+            raise _error(op, f"{argument.name}: unknown ScalarType {value}")
+        return _INT_TO_DTYPE[value]
+    if kind == "Device" and isinstance(value, str):
+        return torch.device(value)
+    if kind in ("Layout", "MemoryFormat") and value is not None:
+        raise _error(op, f"{argument.name}: only None is supported for {kind}")
+    return value
 
 
 # --- Reconstruction. --------------------------------------------------------
@@ -95,6 +118,7 @@ def _aten(graph, op, name, operands):
         )
     args, kwargs = [], {}
     for argument, value in zip(arguments, operands):
+        value = _decode(argument, value, op)
         if argument.kwarg_only:
             kwargs[argument.name] = value
         else:

@@ -219,3 +219,47 @@ func.func @main(%arg0: !torch.vtensor<[2],f32>) -> !torch.int {
 def test_rebuild_rejects_unpack_of_literal_list():
     with pytest.raises(NotImplementedError, match="torch.prim.ListUnpack"):
         rebuild_fx(_parse(UNPACK_LITERAL_LIST))
+
+
+def _empty(dtype="%int5", layout="%none", memory_format="%none"):
+    types = {"%int5": "!torch.int", "%int99": "!torch.int", "%int0": "!torch.int", "%none": "!torch.none"}
+    return f"""
+func.func @main() -> !torch.vtensor<[2,3],f16> {{
+  %int2 = torch.constant.int 2
+  %int3 = torch.constant.int 3
+  %0 = torch.prim.ListConstruct %int2, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
+  %int5 = torch.constant.int 5
+  %int99 = torch.constant.int 99
+  %int0 = torch.constant.int 0
+  %none = torch.constant.none
+  %cpu = torch.constant.device "cpu"
+  %1 = torch.aten.empty.memory_format %0, {dtype}, {layout}, %cpu, %none, {memory_format} : !torch.list<int>, {types[dtype]}, {types[layout]}, !torch.Device, !torch.none, {types[memory_format]} -> !torch.vtensor<[2,3],f16>
+  return %1 : !torch.vtensor<[2,3],f16>
+}}
+"""
+
+
+def test_rebuild_empty_decodes_dtype_and_device():
+    gm = rebuild_fx(_parse(_empty()))
+
+    (node,) = _call_nodes(gm)
+    assert node.target is torch.ops.aten.empty.memory_format
+    assert node.args == ([2, 3],)
+    assert node.kwargs["dtype"] is torch.float16
+    assert node.kwargs["device"] == torch.device("cpu")
+    out = gm()
+    assert out.shape == (2, 3) and out.dtype == torch.float16
+
+
+@pytest.mark.parametrize(
+    "operand, match",
+    [
+        ({"dtype": "%int99"}, "ScalarType"),
+        ({"layout": "%int0"}, "layout"),
+        ({"memory_format": "%int0"}, "memory_format"),
+    ],
+    ids=["unknown-dtype", "layout", "memory_format"],
+)
+def test_rebuild_rejects_bad_enum(operand, match):
+    with pytest.raises(NotImplementedError, match=match):
+        rebuild_fx(_parse(_empty(**operand)))
