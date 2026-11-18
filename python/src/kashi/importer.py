@@ -162,7 +162,25 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
         if isinstance(target, torch._ops.OpOverloadPacket):
             _resolve_packet(node)
             return
-        if isinstance(target, torch._ops.OpOverload) or target is operator.getitem:
+        if isinstance(target, torch._ops.OpOverload):
+            return
+        if target is operator.getitem:
+            source, index = node.args
+            if isinstance(source, torch.fx.Node) and isinstance(
+                source.meta.get("val"), torch.Tensor
+            ):
+                _rewrite_tensor_slice(graph, node, source, index)
+            return
+        if target in (operator.add, operator.mul):
+            _rewrite_tensor_binary(graph, node)
+            return
+        if target is torch.rsqrt:
+            _replace(graph, node, torch.ops.aten.rsqrt.default, node.args, node.kwargs)
+            return
+        if target is torch.nn.functional.silu:
+            if len(node.args) != 1 or node.kwargs not in ({}, {"inplace": False}):
+                raise NotImplementedError(f"Unsupported SiLU: {node.format_node()}")
+            _replace(graph, node, torch.ops.aten.silu.default, node.args, {})
             return
         if target is torch._C._nn.linear:
             _replace(graph, node, torch.ops.aten.linear.default, node.args, node.kwargs)
@@ -194,10 +212,23 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
             _fold_size(node)
             return
     elif node.op == "call_method":
+        if target == "to":
+            dtype = node.args[1] if len(node.args) > 1 else node.kwargs.get("dtype")
+            # Tensor.to has device and tensor overloads too; only a dtype
+            # selects aten.to.dtype without changing the original semantics.
+            if isinstance(dtype, torch.dtype):
+                _replace(graph, node, torch.ops.aten.to.dtype, node.args, node.kwargs)
+                return
         if target == "long":
             if len(node.args) != 1 or node.kwargs:
                 raise NotImplementedError(f"Unsupported Tensor.long: {node.format_node()}")
             _replace(graph, node, torch.ops.aten.to.dtype, (node.args[0], torch.int64), {})
+            return
+        if target == "pow" and len(node.args) == 2 and isinstance(node.args[1], (int, float)):
+            _replace(graph, node, torch.ops.aten.pow.Tensor_Scalar, node.args, node.kwargs)
+            return
+        if target == "mean":
+            _rewrite_mean(graph, node)
             return
         if target == "size":
             _rewrite_size(graph, node)
@@ -205,16 +236,17 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
         if target == "split":
             _rewrite_split(graph, node)
             return
-        if target == "view":
+        if target in ("view", "reshape"):
             if not node.args or node.kwargs:
-                raise NotImplementedError(f"Unsupported Tensor.view: {node.format_node()}")
+                raise NotImplementedError(f"Unsupported Tensor.{target}: {node.format_node()}")
             x, *shape = node.args
             if len(shape) == 1 and _is_shape_list_node(shape[0]):
                 # A runtime shape list is already the complete shape operand.
                 shape = shape[0]
             elif len(shape) == 1 and isinstance(shape[0], (list, tuple)):
                 shape = list(shape[0])
-            _replace(graph, node, torch.ops.aten.view.default, (x, shape), {})
+            op = torch.ops.aten.view.default if target == "view" else torch.ops.aten.reshape.default
+            _replace(graph, node, op, (x, shape), {})
             return
         if target == "chunk":
             _rewrite_chunk(graph, node)
@@ -223,6 +255,45 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
     raise NotImplementedError(
         f"Unsupported FX node {node.format_node()} ({node.op} {target!r})"
     )
+
+
+def _rewrite_tensor_binary(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+    """Select the ATen tensor or scalar overload for tensor-first arithmetic."""
+    left, right = node.args
+    if not isinstance(left, torch.fx.Node) or not isinstance(left.meta.get("val"), torch.Tensor):
+        raise NotImplementedError(f"Unsupported tensor arithmetic: {node.format_node()}")
+    packet = torch.ops.aten.add if node.target is operator.add else torch.ops.aten.mul
+    if isinstance(right, torch.fx.Node) and isinstance(right.meta.get("val"), torch.Tensor):
+        target = packet.Tensor
+    elif isinstance(right, (int, float, complex)):
+        target = packet.Scalar
+    else:
+        raise NotImplementedError(f"Unsupported tensor arithmetic: {node.format_node()}")
+    _replace(graph, node, target, node.args, node.kwargs)
+
+
+def _rewrite_tensor_slice(graph: torch.fx.Graph, node: torch.fx.Node, source, index) -> None:
+    """Lower first- or last-dimension tensor slices to ATen without copying."""
+    if isinstance(index, slice):
+        dim = 0
+    elif isinstance(index, tuple) and len(index) == 2 and index[0] is Ellipsis and isinstance(index[1], slice):
+        dim, index = -1, index[1]
+    else:
+        raise NotImplementedError(f"Unsupported tensor indexing: {node.format_node()}")
+    step = 1 if index.step is None else index.step
+    _replace(graph, node, torch.ops.aten.slice.Tensor, (source, dim, index.start, index.stop, step), {})
+
+
+def _rewrite_mean(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+    """Normalize Tensor.mean's scalar dimension to the ATen dimension-list form."""
+    if len(node.args) > 1 and "dim" in node.kwargs:
+        raise NotImplementedError(f"Unsupported Tensor.mean: {node.format_node()}")
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    if dim is None:
+        raise NotImplementedError(f"Unsupported Tensor.mean: {node.format_node()}")
+    dims = list(dim) if isinstance(dim, (list, tuple)) else [dim]
+    kwargs = {key: value for key, value in node.kwargs.items() if key != "dim"}
+    _replace(graph, node, torch.ops.aten.mean.dim, (node.args[0], dims, *node.args[2:]), kwargs)
 
 
 def _resolve_packet(node: torch.fx.Node) -> None:

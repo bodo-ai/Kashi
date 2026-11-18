@@ -77,6 +77,9 @@ PY
 ```
 
 The backend runs the rebuilt FX graph in PyTorch.
+The importer supports dtype-only `Tensor.to(dtype)` conversions, including the
+casts captured in CPU Qwen3 graphs; device and tensor overloads are not supported.
+CPU RMS normalization and gated-activation operations are also normalized to ATen.
 
 ## Tests
 

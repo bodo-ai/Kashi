@@ -55,6 +55,65 @@ def test_data_attr_and_long_round_trip_detach_and_convert():
     assert actual_long.dtype == torch.int64
 
 
+@pytest.mark.parametrize(
+    "dtype,keyword,copy",
+    [
+        (torch.float32, False, False),
+        (torch.float32, True, True),
+        (torch.float16, False, False),
+    ],
+)
+def test_to_dtype_round_trip(dtype, keyword, copy):
+    """Dtype conversion retains values and requested copy semantics."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    args = (x,) if keyword else (x, dtype)
+    kwargs = {"dtype": dtype} if keyword else {}
+    if copy:
+        kwargs.update(non_blocking=True, copy=True)
+    converted = graph.call_method("to", args, kwargs)
+    graph.output((converted, x))
+    x_value = torch.tensor([1.25, -2.5], dtype=torch.float32)
+    _, rebuilt = _round_trip(graph, x_value)
+
+    result, original_input = rebuilt(x_value)
+    torch.testing.assert_close(result, torch.tensor([1.25, -2.5], dtype=dtype))
+    assert original_input is x_value
+    assert (result.data_ptr() != x_value.data_ptr()) == (copy or dtype != x_value.dtype)
+
+
+def test_cpu_rms_normalization_round_trip():
+    """CPU RMS normalization preserves reduction and broadcast arithmetic."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    squared = graph.call_method("pow", (x, 2))
+    variance = graph.call_method("mean", (squared,), {"dim": -1, "keepdim": True})
+    stabilized = graph.call_function(operator.add, (variance, 1e-6))
+    scale = graph.call_function(torch.rsqrt, (stabilized,))
+    normalized = graph.call_function(operator.mul, (x, scale))
+    graph.output(graph.call_function(operator.mul, (normalized, weight)))
+    inputs = (torch.tensor([[1.0, -2.0], [3.0, 4.0]]), torch.tensor([0.5, 2.0]))
+    original, rebuilt = _round_trip(graph, *inputs)
+
+    torch.testing.assert_close(rebuilt(*inputs), original(*inputs))
+
+
+def test_cpu_gated_activation_round_trip():
+    """CPU gating keeps reshape, trailing slices and SiLU semantics."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    reshaped = graph.call_method("reshape", (x, -1, 4))
+    gate = graph.call_function(operator.getitem, (reshaped, (Ellipsis, slice(None, 2))))
+    value = graph.call_function(operator.getitem, (reshaped, (Ellipsis, slice(2, None))))
+    activated = graph.call_function(torch.nn.functional.silu, (gate,))
+    graph.output(graph.call_function(operator.mul, (activated, value)))
+    x_value = torch.tensor([[-2.0, -0.5, 1.5, 2.0], [0.0, 3.0, -1.0, 4.0]])
+    original, rebuilt = _round_trip(graph, x_value)
+
+    torch.testing.assert_close(rebuilt(x_value), original(x_value))
+
+
 @pytest.mark.parametrize("dim,keyword", [(0, False), (-1, True)])
 def test_size_dim_round_trip(dim, keyword):
     """Dimension-specific size queries use the runtime input shape."""
