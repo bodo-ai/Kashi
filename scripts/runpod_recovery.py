@@ -3,6 +3,10 @@
 Callers must hold ``exclusive_lock`` across journal operations and the entire
 lifetime of a run. In particular, persist ``mark_sent`` before issuing POST.
 """
+# Local crash-recovery path used by runpod_benchmark.py before provisioning:
+# not-sent (no POST) -> may-have-been-sent (search by exact name) -> created
+# (Pod ID recorded). The journal tracks deletion confirmations across restarts;
+# unresolved records block new paid runs, even if they belong to another account.
 
 from __future__ import annotations
 
@@ -32,17 +36,20 @@ class APIError(RecoveryError):
     """An API response could not be used; response bodies are never exposed."""
 
     def __init__(self, message: str, status: int | None = None):
+        """Store a safe error message and the HTTP status, when known."""
         super().__init__(message)
         self.status = status
 
 
 def _mkdir_private(path: Path) -> None:
+    """Create a private state directory without changing existing permissions."""
     # Existing parent directories belong to the operator; never chmod them.
     if not path.exists():
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def _sync_directory(path: Path) -> None:
+    """Sync directory metadata so journal renames survive a crash."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
@@ -77,9 +84,11 @@ class Journal:
     """Atomic, fsynced, owner-only run records. External locking is required."""
 
     def __init__(self, path: str | Path):
+        """Bind the journal to its on-disk path without reading it yet."""
         self.path = Path(path)
 
     def _load(self) -> list[dict]:
+        """Read and validate the journal, treating a missing file as empty."""
         try:
             with self.path.open("r", encoding="utf-8") as source:
                 document = json.load(source)
@@ -120,6 +129,7 @@ class Journal:
         return runs
 
     def _save(self, records: list[dict]) -> None:
+        """Replace the journal atomically and sync the file and parent directory."""
         _mkdir_private(self.path.parent)
         fd, temp_name = tempfile.mkstemp(prefix=".runpod-journal-", dir=self.path.parent)
         try:
@@ -142,15 +152,18 @@ class Journal:
 
     @staticmethod
     def _find(records: list[dict], run_id: str) -> dict:
+        """Return the record for a run ID or raise if it no longer exists."""
         for record in records:
             if record["run_id"] == run_id:
                 return record
         raise RecoveryError("run not found in recovery journal")
 
     def records(self) -> list[dict]:
+        """Return the validated outstanding records from disk."""
         return self._load()
 
     def begin(self, run_id: str, name: str, expires_at: float, account: str) -> dict:
+        """Persist a unique run record in the not-sent state before Pod creation."""
         if not all(isinstance(value, str) and value for value in (run_id, name, account)):
             raise RecoveryError("run identity, name, and account must be nonempty")
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
@@ -171,6 +184,7 @@ class Journal:
         return record.copy()
 
     def mark_sent(self, run_id: str) -> None:
+        """Mark the create as potentially sent before making the API request."""
         records = self._load()
         record = self._find(records, run_id)
         if record["state"] != "not-sent":
@@ -179,6 +193,7 @@ class Journal:
         self._save(records)
 
     def set_pod_id(self, run_id: str, pod_id: str) -> None:
+        """Record the created Pod ID as pending deletion."""
         if not _valid_id(pod_id):
             raise RecoveryError("invalid pod ID")
         records = self._load()
@@ -194,6 +209,7 @@ class Journal:
         self._save(records)
 
     def remove(self, run_id: str) -> None:
+        """Remove a run record from the journal."""
         records = self._load()
         record = self._find(records, run_id)
         records.remove(record)
@@ -209,16 +225,19 @@ class Journal:
         self._save(records)
 
     def _update(self, run_id: str, **fields) -> None:
+        """Persist updated fields for an existing recovery record."""
         records = self._load()
         self._find(records, run_id).update(fields)
         self._save(records)
 
 
 def _valid_id(value: object) -> bool:
+    """Check that an ID is a nonempty string without surrounding whitespace."""
     return isinstance(value, str) and bool(value) and value.strip() == value
 
 
 def _retry_delay(value: str | None, attempt: int) -> float:
+    """Parse Retry-After or fall back to exponential backoff in seconds."""
     if value:
         try:
             seconds = float(value)
@@ -239,6 +258,7 @@ class RunpodAPI:
     def __init__(self, api_key: str, *, base_url: str = "https://api.runpod.io/v2",
                  timeout: float = 20, max_attempts: int = 4,
                  opener=urllib.request.urlopen, sleep=time.sleep):
+        """Configure authenticated REST access, timeouts, and retry limits."""
         if not api_key or max_attempts < 1 or timeout <= 0:
             raise ValueError("API key, positive timeout and attempts are required")
         self._api_key = api_key
@@ -249,6 +269,7 @@ class RunpodAPI:
         self._sleep = sleep
 
     def request(self, method: str, path: str, body: dict | None = None) -> object:
+        """Send a REST request and decode its JSON, retrying only safe methods."""
         method = method.upper()
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("API paths must be relative to the configured endpoint")
@@ -257,6 +278,8 @@ class RunpodAPI:
         if data is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.base_url + path, data=data, headers=headers, method=method)
+        # Never retry a create: the first POST may have succeeded despite a
+        # lost response. Reconcile against the journaled name instead.
         safe_to_retry = method in ("GET", "DELETE")
         for attempt in range(self.max_attempts):
             delay = 2 ** attempt
@@ -285,6 +308,7 @@ class RunpodAPI:
         raise APIError("Runpod API attempts exhausted")
 
     def list_pods(self) -> list[dict]:
+        """Return a validated Pod list only after fetching every page."""
         pods = []
         cursor = None
         seen = set()
@@ -308,6 +332,7 @@ class RunpodAPI:
             seen.add(cursor)
 
     def delete_pod(self, pod_id: str) -> bool:
+        """Return True on deletion and False if a 404 leaves it unconfirmed."""
         if not _valid_id(pod_id):
             raise RecoveryError("invalid pod ID")
         try:
@@ -336,6 +361,9 @@ def reconcile(journal: Journal, api: RunpodAPI, account: str) -> list[dict]:
     eligible = [record for record in records if record["account"] == account]
     if not eligible:
         return records
+    # A complete listing discovers exact-name matches, including Pods whose
+    # create response was lost. If listing fails, still try known IDs below,
+    # but retain the record because there could be undiscovered matches.
     listing_error = None
     try:
         pods = api.list_pods()
@@ -371,6 +399,8 @@ def reconcile(journal: Journal, api: RunpodAPI, account: str) -> list[dict]:
                 continue
             pending.remove(pod_id)
             deleted.add(pod_id)
+            # Persist each success so a later recovery doesn't mistake a 404
+            # for an unconfirmed deletion of an already-confirmed ID.
             journal._update(run_id, pending_pod_ids=sorted(pending), deleted_pod_ids=sorted(deleted))
         if pending or listing_error:
             journal._update(run_id, last_error="; ".join(errors) or "termination remains unconfirmed")

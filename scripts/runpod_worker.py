@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Standalone Runpod benchmark worker, executed inside the selected image."""
+# Pod entrypoint supplied by runpod_benchmark.py. vLLM stays on loopback;
+# only the bearer-authenticated status and artifact endpoints face the controller.
+# Run order: arm the watchdog, start vLLM, warm up, measure, optionally profile,
+# and package results or diagnostics. The controller handles normal Pod deletion.
+
 import gzip
 import hashlib
 import hmac
@@ -27,12 +32,15 @@ UNAVAILABLE = "unavailable"
 
 
 def utc_now():
+    """Return an ISO 8601 timestamp in UTC for logs and the manifest."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def speculative_deltas(before, after):
+    """Compute token deltas and acceptance rate from two metrics snapshots."""
     names = ("vllm:spec_decode_num_accepted_tokens_total", "vllm:spec_decode_num_draft_tokens_total")
     def counters(text):
+        """Sum finite Prometheus samples across labels for each token counter."""
         values = {}
         for line in text.splitlines():
             match = re.match(r'^([^\s{]+)(?:\{[^}]*\})?\s+([^\s]+)', line)
@@ -63,6 +71,7 @@ def speculative_deltas(before, after):
 
 
 def trace_has_gpu_activity(path):
+    """Check a compressed profiler trace for a positive-duration GPU kernel."""
     try:
         with gzip.open(path, 'rt', encoding='utf-8') as stream:
             trace = json.load(stream)
@@ -76,6 +85,7 @@ def trace_has_gpu_activity(path):
 
 
 def version_at_least(version, minimum):
+    """Check a version against a stable minimum, excluding prereleases at it."""
     # Reject prereleases at the minimum as they do not satisfy >= stable.
     match = re.match(r'^(\d+)\.(\d+)(?:\.(\d+))?([^+]*)', version)
     if not match:
@@ -86,6 +96,7 @@ def version_at_least(version, minimum):
 
 class Worker:
     def __init__(self, config, secret, pod_id, api_key, directory):
+        """Initialize the worker's credentials, output paths, and run manifest."""
         self.config = config
         self.secret = secret
         self.pod_id = pod_id
@@ -118,6 +129,7 @@ class Worker:
         }
 
     def clean(self, value):
+        """Convert a value to text and redact any configured secrets."""
         text = str(value)
         for secret in self.redactions:
             if secret:
@@ -125,6 +137,7 @@ class Worker:
         return text
 
     def set_state(self, state, error=None):
+        """Publish a phase and optional redacted error to status readers."""
         with self.lock:
             self.state = state
             if error is not None:
@@ -132,6 +145,7 @@ class Worker:
         self.log(f'{state}: {self.clean(error) if error is not None else ""}')
 
     def log(self, message):
+        """Append a timestamped, redacted log entry on a best-effort basis."""
         try:
             with (self.directory / 'worker.log').open('a', encoding='utf-8') as stream:
                 stream.write(f'{utc_now()} {self.clean(message)}\n')
@@ -139,12 +153,14 @@ class Worker:
             pass
 
     def remaining(self):
+        """Return seconds left on the shared deadline or raise after expiry."""
         remaining = float(self.config['deadline']) - time.time()
         if remaining <= 0:
             raise TimeoutError('overall deadline expired')
         return remaining
 
     def validate(self):
+        """Check run settings and required credential presence before startup."""
         if not self.secret or not self.pod_id or not self.api_key:
             raise RuntimeError('missing BENCH_SECRET, RUNPOD_POD_ID or Pod-scoped RUNPOD_API_KEY; watchdog unavailable')
         deadline = self.config.get('deadline')
@@ -164,6 +180,7 @@ class Worker:
         self.remaining()
 
     def watchdog(self):
+        """Attempt to terminate the Pod at the deadline independently of the controller."""
         self.watchdog_started.set()
         delay = float(self.config['deadline']) - time.time()
         if delay > 0:
@@ -196,6 +213,7 @@ class Worker:
             time.sleep(5)
 
     def check_compatibility(self):
+        """Verify package minimums and the expected ROCm GPU; record what was detected."""
         versions = self.manifest['versions']
         for name in ('vllm', 'torch', 'transformers'):
             try:
@@ -222,6 +240,7 @@ class Worker:
             self.manifest['image']['digest'] = image.rsplit('@', 1)[1]
 
     def serve_command(self):
+        """Build the loopback vLLM server command and optional profiler configuration."""
         cmd = ['vllm', 'serve', MODEL, '--host', '127.0.0.1', '--port', '8000',
                '--tensor-parallel-size', '1', '--enable-auto-tool-choice',
                '--tool-call-parser', 'qwen3_coder', '--reasoning-parser', 'qwen3',
@@ -234,6 +253,7 @@ class Worker:
         return cmd
 
     def benchmark_command(self, count, filename):
+        """Build one benchmark phase command, capping workload size for profiling."""
         c = self.config
         profile_workload = filename == 'profile-benchmark.json'
         input_len = min(c['input_len'], 128) if profile_workload else c['input_len']
@@ -249,6 +269,7 @@ class Worker:
                 '--result-filename', filename, '--disable-tqdm']
 
     def child_env(self):
+        """Build the vLLM subprocess environment without worker control credentials."""
         env = os.environ.copy()
         for name in ('BENCH_CONFIG', 'BENCH_SECRET', 'RUNPOD_API_KEY', 'RUNPOD_POD_ID'):
             env.pop(name, None)
@@ -258,11 +279,13 @@ class Worker:
         return env
 
     def request(self, path, method='GET', timeout=10):
+        """Call the loopback vLLM API with a timeout bounded by the run deadline."""
         request = Request('http://127.0.0.1:8000' + path, method=method)
         with urlopen(request, timeout=min(timeout, self.remaining())) as response:
             return response.read()
 
     def wait_ready(self):
+        """Wait for the requested model to appear, or fail on exit or timeout."""
         while True:
             self.remaining()
             if self.server_process.poll() is not None:
@@ -276,6 +299,7 @@ class Worker:
             time.sleep(min(2, self.remaining()))
 
     def execute_benchmark(self, count, filename, logname):
+        """Run one benchmark phase, save its log, and validate the request counts."""
         command = self.benchmark_command(count, filename)
         with (self.directory / logname).open('ab') as log:
             try:
@@ -308,6 +332,7 @@ class Worker:
 
 
     def record_benchmark(self, result):
+        """Copy measured throughput, request counts, and latencies into the manifest."""
         self.manifest['benchmark'] = {key: result.get(key, UNAVAILABLE) for key in
             ('duration', 'completed', 'failed', 'total_input_tokens', 'total_output_tokens',
              'request_throughput', 'output_throughput')}
@@ -317,6 +342,7 @@ class Worker:
                 self.manifest['benchmark'][key] = result.get(key, UNAVAILABLE)
 
     def record_revision(self):
+        """Record the cached model snapshot revision when it can be identified."""
         try:
             from huggingface_hub import try_to_load_from_cache
             path = try_to_load_from_cache(MODEL, 'config.json')
@@ -330,6 +356,7 @@ class Worker:
             pass
 
     def profile(self):
+        """Run a separate bounded profiling pass and require a trace with GPU kernels."""
         (self.directory / 'profile').mkdir(exist_ok=True)
         count = min(2, self.config['prompts'])
         self.manifest['profile'] = {'workload': 'separate profiled pass', 'prompts': count,
@@ -350,9 +377,12 @@ class Worker:
         self.manifest['profile']['gpu_activity_verified'] = True
 
     def run(self):
+        """Serve the model, warm up, measure, optionally profile, and package outputs."""
         status = 'failed'
         try:
             self.validate()
+            # Arm self-deletion before model loading. It remains armed while
+            # the controller downloads the artifact, in case the controller dies.
             thread = threading.Thread(target=self.watchdog, daemon=True, name='deadline-watchdog')
             thread.start()
             if not self.watchdog_started.wait(timeout=5) or not thread.is_alive():
@@ -369,6 +399,8 @@ class Worker:
                 self.set_state('warmup')
                 self.execute_benchmark(self.config['warmups'], 'warmup.json', 'warmup.log')
                 self.set_state('benchmark')
+                # vLLM counters are cumulative. Bracket only the measured pass
+                # so warmup and the optional profiled pass don't skew the deltas.
                 before = self.request('/metrics').decode('utf-8', 'replace')
                 (self.directory / 'metrics-before.prom').write_text(before)
                 try:
@@ -399,6 +431,7 @@ class Worker:
                 self.set_state('failed', f'artifact creation failed: {self.clean(exc)}')
 
     def finalize(self, status):
+        """Package safe results or diagnostics and publish the archive metadata."""
         self.manifest.update(status=status, ended_at=utc_now(), error=self.clean(self.error) if self.error else None)
         self.log(f'finalizing {status}')
         # Include only explicit output names, never caches, weights or arbitrary paths.
@@ -459,6 +492,8 @@ class Worker:
         if status == 'completed' and time.time() >= float(self.config['deadline']):
             raise TimeoutError('overall deadline expired while creating artifact')
         tmp.replace(self.artifact_path)
+        # Publish the terminal state and download metadata together, only after
+        # the complete archive is in place for the HTTP handler.
         with self.lock:
             self.artifact_size = self.artifact_path.stat().st_size
             self.artifact_sha256 = digest.hexdigest()
@@ -466,11 +501,14 @@ class Worker:
 
 
 def make_server(worker, host='0.0.0.0', port=8765):
+    """Create the bearer-authenticated status and artifact server."""
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
+            """Suppress the HTTP server's default request logging."""
             pass
 
         def reply(self, status, body, content_type='application/json'):
+            """Write a complete response with a content length and no caching."""
             self.send_response(status)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(body)))
@@ -479,6 +517,7 @@ def make_server(worker, host='0.0.0.0', port=8765):
             self.wfile.write(body)
 
         def do_GET(self):
+            """Serve authenticated status or a bounded byte range of the archive."""
             authorization = self.headers.get('Authorization', '')
             if not worker.secret or not hmac.compare_digest(authorization.encode(), ('Bearer ' + worker.secret).encode()):
                 self.reply(401, b'{"error":"unauthorized"}')
@@ -514,6 +553,7 @@ def make_server(worker, host='0.0.0.0', port=8765):
                 self.reply(404, b'{"error":"not found"}')
 
         def reject_method(self):
+            """Reject write methods without exposing endpoint details to unauthorized callers."""
             authorization = self.headers.get('Authorization', '')
             if not worker.secret or not hmac.compare_digest(authorization.encode(), ('Bearer ' + worker.secret).encode()):
                 self.reply(401, b'{"error":"unauthorized"}')
@@ -525,6 +565,7 @@ def make_server(worker, host='0.0.0.0', port=8765):
 
 
 def main():
+    """Start the benchmark thread and serve controller requests in the foreground."""
     try:
         config = json.loads(os.environ.get('BENCH_CONFIG', '{}'))
     except ValueError:

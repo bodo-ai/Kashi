@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Run the specified vLLM benchmark on a temporary Runpod GPU Pod."""
+# Local controller: reconcile old Pods, select a GPU, and provision one Pod.
+# The Pod runs runpod_worker.py; we poll its status, retrieve its archive, then
+# delete the Pod. runpod_recovery.py keeps cleanup recoverable across crashes.
+
 import argparse
 import base64
 import hashlib
@@ -23,6 +27,7 @@ STATE = Path.home() / '.local' / 'state' / 'runpod-mi300x-benchmark'
 
 
 def positive(value):
+    """Convert a CLI argument to an integer greater than zero."""
     n = int(value)
     if n <= 0:
         raise argparse.ArgumentTypeError('must be positive')
@@ -30,6 +35,7 @@ def positive(value):
 
 
 def nonnegative(value):
+    """Convert a CLI argument to an integer greater than or equal to zero."""
     n = int(value)
     if n < 0:
         raise argparse.ArgumentTypeError('must be nonnegative')
@@ -37,6 +43,7 @@ def nonnegative(value):
 
 
 def parse_args(argv=None):
+    """Parse shared options and the run, recover, or attest subcommand."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--api-key', default=os.environ.get('RUNPOD_API_KEY'))
     parser.add_argument('--state-dir', type=Path, default=STATE)
@@ -64,6 +71,7 @@ def parse_args(argv=None):
 
 
 def download_artifact(get_chunk, size, digest, target):
+    """Fetch an archive in chunks and publish it only if its SHA-256 matches."""
     if not isinstance(size, int) or size <= 0 or len(digest) != 64:
         raise ValueError('invalid artifact metadata')
     target = Path(target)
@@ -90,6 +98,7 @@ def download_artifact(get_chunk, size, digest, target):
 
 
 def worker_request(pod_id, secret, path, deadline):
+    """Read an authenticated worker response through the Runpod HTTPS proxy."""
     remaining = deadline - time.time()
     if remaining <= 0:
         raise TimeoutError('overall deadline reached')
@@ -100,6 +109,7 @@ def worker_request(pod_id, secret, path, deadline):
 
 
 def save_json(path, value):
+    """Write the JSON sidecar atomically with owner-only permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + '.tmp')
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -117,10 +127,12 @@ def save_json(path, value):
 
 
 def report_unresolved(records):
+    """Identify Pods with unconfirmed cleanup and tell the operator how to proceed."""
     for r in records:
         print(f"Unconfirmed cleanup: name={r.get('name')} id={r.get('pod_id') or 'unknown'} account={r.get('account')} elapsed={max(0, int(time.time() - r.get('started_at', time.time())))}s error={r.get('last_error') or 'outcome unconfirmed'}. Terminate this exact Pod in https://www.runpod.io/console/pods; run recover, or attest after verifying termination.", file=sys.stderr)
 
 def pod_body(name, image, disk, code, env, gpu_id, data_center=None):
+    """Build the single-GPU Pod request with the worker as its entrypoint."""
     body = {'name': name, 'image': image, 'gpu': {'id': gpu_id, 'count': 1}, 'disk': disk,
             'entrypoint': ['python3', '-u', '-c'], 'cmd': [code], 'ports': ['8765/http'], 'env': env}
     if data_center:
@@ -129,6 +141,7 @@ def pod_body(name, image, disk, code, env, gpu_id, data_center=None):
 
 
 def wait_for_capacity(api, seconds, data_center, gpu_options):
+    """Return the first GPU with capacity in preference order, or time out."""
     deadline = time.monotonic() + seconds
     while True:
         catalog = api.request('GET', '/catalog/gpus?include=AVAILABILITY&product=POD&count=1')
@@ -157,12 +170,15 @@ def wait_for_capacity(api, seconds, data_center, gpu_options):
 
 
 def main(argv=None):
+    """Dispatch the CLI command under the exclusive lock for the state directory."""
     args = parse_args(argv)
     if not args.api_key:
         print('RUNPOD_API_KEY or --api-key is required', file=sys.stderr)
         return 1
     api = recovery.RunpodAPI(args.api_key)
     try:
+        # Hold the same lock through reconciliation, provisioning, and teardown
+        # so a second local invocation can't delete an active run's Pod.
         with recovery.exclusive_lock(args.state_dir / 'lock'):
             journal = recovery.Journal(args.state_dir / 'journal.json')
             account = api.request('GET', '/account')['id']
@@ -184,7 +200,10 @@ def main(argv=None):
 
 
 def create(api, journal, account, name, deadline, body, run_id):
+    """Journal one create attempt and persist the returned Pod ID before use."""
     journal.begin(run_id, name, deadline, account)
+    # Persist uncertainty before POST: a lost response doesn't mean no Pod
+    # was created. Recovery can look up the exact journaled name later.
     journal.mark_sent(run_id)
     try:
         pod = api.request('POST', '/pods', body)
@@ -211,6 +230,7 @@ def create(api, journal, account, name, deadline, body, run_id):
 
 
 def cleanup(api, journal, run_id, name, account, pod_id):
+    """Delete the known Pod and clear its journal record only on confirmation."""
     if not pod_id:
         report_unresolved(journal.records())
         return False
@@ -228,6 +248,10 @@ def cleanup(api, journal, run_id, name, account, pod_id):
 
 
 def run_benchmark(args, api, journal, account, gpu_id):
+    """Provision a Pod, retrieve the worker archive, and attempt Pod deletion.
+
+    Return zero only when the benchmark, download, and cleanup all succeed.
+    """
     run_id = secrets.token_hex(16)
     name = 'runpod-benchmark-' + run_id
     deadline = time.time() + args.deadline * 60
@@ -236,6 +260,8 @@ def run_benchmark(args, api, journal, account, gpu_id):
               'warmups': args.warmups, 'input_len': args.input_len, 'output_len': args.output_len,
               'concurrency': args.concurrency, 'seed': args.seed, 'profile': args.profile,
               'data_center': args.data_center, 'gpu': gpu_id}
+    # Run the local worker source as the image's Python entrypoint; no custom
+    # image is needed. The per-run secret authenticates the worker HTTP proxy.
     worker = (Path(__file__).resolve().parent / 'runpod_worker.py').read_bytes()
     code = "import base64;exec(compile(base64.b64decode('" + base64.b64encode(worker).decode() + "'),'<worker>','exec'))"
     env = {'BENCH_SECRET': secret, 'BENCH_CONFIG': json.dumps(config)}
@@ -257,6 +283,8 @@ def run_benchmark(args, api, journal, account, gpu_id):
         print(f'Pod {pod_id}; hourly rate: {rate if rate is not None else "unavailable"}.')
         previous = None
         state = None
+        # Runpod reports Pod liveness; the worker reports benchmark progress
+        # and when artifact metadata is ready. The proxy may lag Pod startup.
         while time.time() < deadline:
             info = api.request('GET', '/pods/' + urllib.parse.quote(pod_id, safe=''))
             if info.get('status') in ('ERROR', 'EXITED', 'TERMINATED'):
@@ -275,6 +303,8 @@ def run_benchmark(args, api, journal, account, gpu_id):
             time.sleep(min(5, max(0, deadline - time.time())))
         else:
             raise TimeoutError('overall deadline reached')
+        # Fetch diagnostics even for worker failures, if the archive is ready
+        # and time remains. download_artifact verifies SHA-256 before publishing.
         if status.get('artifact_size') and status.get('artifact_sha256'):
             print('Downloading artifact...')
             partial = state != 'done'
@@ -288,6 +318,8 @@ def run_benchmark(args, api, journal, account, gpu_id):
             raise RuntimeError('worker did not produce an artifact')
         success = True
     finally:
+        # Delete by ID when possible. If the ID is unknown or deletion is
+        # unconfirmed, leave the journal record for recovery.
         print('Cleaning up Pod...', flush=True)
         cleanup_ok = cleanup(api, journal, run_id, name, account, pod_id)
         sidecar = args.output_dir / (name + '.json')
