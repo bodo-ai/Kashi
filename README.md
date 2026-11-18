@@ -81,6 +81,40 @@ The importer supports dtype-only `Tensor.to(dtype)` conversions, including the
 casts captured in CPU Qwen3 graphs; device and tensor overloads are not supported.
 CPU RMS normalization and gated-activation operations are also normalized to ATen.
 
+## Experimental IREE/PTX graph
+
+`kashi.iree_backend.compile_iree_fx` explicitly opts an FX graph into the IREE
+pipeline. It partitions around custom operators, compiles ordinary segments to
+CUDA PTX, and returns a single FX graph containing opaque kernel calls. The
+default `compile_fx` backend remains executable and does not invoke IREE.
+
+For example, inspect the IREE graph during a normal `torch.compile` run:
+
+```python
+import torch
+from kashi.backend import compile_fx
+from kashi.iree_backend import compile_iree_fx
+
+def inspect_iree(gm, example_inputs):
+    result = compile_iree_fx(gm, output_dir="/tmp/kashi-iree", cuda_target="sm_80")
+    print(result.graph.graph)
+    print(result.kernels_ptx)
+    return compile_fx(gm, example_inputs)
+
+torch.compile(lambda x: torch.ops.aten.relu.default(x), backend=inspect_iree)(torch.ones(8))
+```
+
+Each call creates a unique artifact directory containing the partitioned and
+driver MLIR, IREE phase dumps, compiler log, raw PTX files and `kernels.ptx`.
+If `cuda_target` is omitted, `IREE_CUDA_TARGET` or the current CUDA device is
+used. Compiler and unsupported-operation errors propagate; there is no silent
+fallback. The returned graph is for inspection and further transformations:
+its opaque kernel calls cannot execute until kernel launching is implemented.
+
+The existing round-trip and vLLM tests continue to validate executable PyTorch
+semantics. The IREE tests separately compile real kernels and check the returned
+graph's custom-op boundaries, kernel operands and output wiring.
+
 ## Tests
 
 The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.
