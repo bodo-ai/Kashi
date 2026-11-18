@@ -262,3 +262,71 @@ def test_import_fx_opaque_hook_is_not_global():
     except NotImplementedError:
         pass
     assert fx_importer.ContextCache.value_info_to_type is before
+
+
+# --- Functional form of destination-passing ops. -----------------------------
+
+
+@pytest.fixture
+def functional_write(monkeypatch):
+    import kashi_test_ops
+
+    kashi_test_ops.functional_entries(monkeypatch)
+    return kashi_test_ops
+
+
+def _capture(ops, name):
+    inputs = (torch.randn(3, 4),)
+    if name == "InputBufferModel":
+        inputs += (torch.empty(3, 4),)
+    return ops.capture(getattr(ops, name)(ops.Tag(3.0)), *inputs)[0]
+
+
+def _ssa_operands(line):
+    return re.search(r"\((.*?)\)\s*:", line).group(1).split(", ")
+
+
+def test_import_fx_functionalizes_write(functional_write):
+    gm, _ = _captured_ops_model()
+    result = import_fx(gm)
+    text = str(result.module)
+
+    assert result.module.operation.verify()
+    assert '"torch.kashi_test.write"' not in text
+    line = next(l for l in text.splitlines() if '"torch.kashi.write_functional"' in l)
+    assert line.rstrip().endswith("-> !torch.vtensor<[?,4],f32>")
+    result_name = line.split("=")[0].strip()
+    assert re.search(rf"torch\.aten\.view {re.escape(result_name)},", text)
+    # The input graph is untouched.
+    assert gm.graph.find_nodes(op="call_function", target=torch.ops.kashi_test.write)
+
+
+def test_import_fx_functionalizes_each_call(functional_write):
+    result = import_fx(_capture(functional_write, "TwoWritesModel"))
+    text = str(result.module)
+
+    assert result.module.operation.verify()
+    first, second = (
+        l for l in text.splitlines() if '"torch.kashi.write_functional"' in l
+    )
+    first_name = first.split("=")[0].strip()
+    second_name = second.split("=")[0].strip()
+    operands = _ssa_operands(second)
+    assert operands[0] == operands[-1] == first_name
+    (ret,) = (l for l in text.splitlines() if l.strip().startswith("return"))
+    assert ret.split()[1] == second_name
+
+
+@pytest.mark.parametrize(
+    "model, match",
+    [
+        ("InputBufferModel", "graph input"),
+        ("AliasedBufferModel", "aliases"),
+        ("MismatchedBufferModel", "shape"),
+        ("StridedBufferModel", "contiguous"),
+        ("ScaledWriteModel", "block_scale"),
+    ],
+)
+def test_import_fx_functionalize_rejects(functional_write, model, match):
+    with pytest.raises(NotImplementedError, match=match):
+        import_fx(_capture(functional_write, model))

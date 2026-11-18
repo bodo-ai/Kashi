@@ -10,6 +10,8 @@ from torch._library.fake_class_registry import FakeScriptObject
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
 
+from kashi.functional import FunctionalForm, dummy_op, functional_form
+
 
 @dataclass(frozen=True)
 class ImportedModule:
@@ -96,8 +98,13 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
     if node.op == "call_function":
         if isinstance(target, torch._ops.OpOverloadPacket):
             _resolve_packet(node)
+            target = node.target
+        if isinstance(target, torch._ops.OpOverload):
+            form = functional_form(target)
+            if form is not None:
+                _functionalize(graph, node, form)
             return
-        if isinstance(target, torch._ops.OpOverload) or target is operator.getitem:
+        if target is operator.getitem:
             return
         if target is torch._C._nn.linear:
             _replace(
@@ -148,6 +155,116 @@ def _resolve_packet(node: torch.fx.Node) -> None:
             f"{node.format_node()}"
         )
     node.target = getattr(packet, overloads[0])
+
+
+def _functionalize(
+    graph: torch.fx.Graph, node: torch.fx.Node, form: FunctionalForm
+) -> None:
+    """Replace a destination-passing call with its functional dummy, whose
+    result later uses of the output buffer read instead. Rejects calls whose
+    write could be observed through anything other than that result."""
+    target = node.target
+    bound = _bind(target, node)
+    for argument in target._schema.arguments:
+        if (
+            argument.name != form.output
+            and argument.alias_info is not None
+            and argument.alias_info.is_write
+            and bound[argument.name] is not None
+        ):
+            raise NotImplementedError(
+                f"Cannot functionalize: mutated argument {argument.name} is not "
+                f"None: {node.format_node()}"
+            )
+    if node.users:
+        raise NotImplementedError(
+            f"Cannot functionalize a call with users: {node.format_node()}"
+        )
+
+    output = bound[form.output]
+    out_val = output.meta.get("val")
+    like_val = _meta_val(bound[form.like])
+    if not isinstance(out_val, torch.Tensor) or not out_val.is_contiguous():
+        raise NotImplementedError(
+            f"Cannot functionalize: {form.output} is not a contiguous tensor: "
+            f"{node.format_node()}"
+        )
+    if (
+        not isinstance(like_val, torch.Tensor)
+        or out_val.shape != like_val.shape
+        or out_val.dtype != like_val.dtype
+    ):
+        raise NotImplementedError(
+            f"Cannot functionalize: {form.output} differs from {form.like} in "
+            f"shape or dtype: {node.format_node()}"
+        )
+
+    base = output
+    while base.op == "call_function" and base.target is torch.ops.aten.view.default:
+        base = base.args[0]
+    if base.op == "placeholder":
+        raise NotImplementedError(
+            f"Cannot functionalize: {form.output} is a view of graph input "
+            f"{base.name}: {node.format_node()}"
+        )
+    order = {n: i for i, n in enumerate(graph.nodes)}
+    at = order[node]
+    for alias in _derived_before(base, node, order):
+        if alias is output:
+            continue
+        if any(order[user] > at for user in alias.users):
+            raise NotImplementedError(
+                f"Cannot functionalize: {alias.name} aliases {form.output} and "
+                f"is used after the write: {node.format_node()}"
+            )
+
+    dummy = dummy_op(target, form)
+    args, kwargs = [], {}
+    for argument in dummy._schema.arguments:
+        if argument.kwarg_only:
+            kwargs[argument.name] = bound[argument.name]
+        else:
+            args.append(bound[argument.name])
+    with graph.inserting_before(node):
+        new = graph.call_function(dummy, tuple(args), kwargs)
+    new.meta = dict(output.meta)
+    for user in list(output.users):
+        if user is not node and order[user] > at:
+            user.replace_input_with(output, new)
+    graph.erase_node(node)
+
+
+def _bind(target: torch._ops.OpOverload, node: torch.fx.Node) -> dict:
+    """Argument name -> value for ``node``'s call, with defaults filled in."""
+    bound = {}
+    positional = list(node.args)
+    for argument in target._schema.arguments:
+        if not argument.kwarg_only and positional:
+            bound[argument.name] = positional.pop(0)
+        elif argument.name in node.kwargs:
+            bound[argument.name] = node.kwargs[argument.name]
+        elif argument.has_default_value():
+            bound[argument.name] = argument.default_value
+        else:
+            raise NotImplementedError(
+                f"Missing argument {argument.name}: {node.format_node()}"
+            )
+    return bound
+
+
+def _meta_val(value):
+    return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
+
+
+def _derived_before(base: torch.fx.Node, call: torch.fx.Node, order) -> set:
+    """``base`` and every node computed from it before ``call``."""
+    found, stack = {base}, [base]
+    while stack:
+        for user in stack.pop().users:
+            if user is not call and order[user] < order[call] and user not in found:
+                found.add(user)
+                stack.append(user)
+    return found
 
 
 def _rewrite_embedding(graph: torch.fx.Graph, node: torch.fx.Node) -> None:

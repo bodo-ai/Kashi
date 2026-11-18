@@ -34,6 +34,7 @@ _TAG = get_opaque_type_name(Tag)
 
 LIB.define(f"scale(Tensor x, {_TAG} tag) -> Tensor")
 LIB.define(f"write(Tensor x, Tensor(a!) out, {_TAG} tag, *, Tensor dep) -> ()")
+LIB.define("write_scaled(Tensor x, Tensor(a!) out, Tensor(b!)? block_scale, *, Tensor dep) -> ()")
 
 
 def _scale(x, tag):
@@ -44,10 +45,34 @@ def _write(x, out, tag, *, dep):
     out.copy_(x + tag.factor)
 
 
+def _write_scaled(x, out, block_scale, *, dep):
+    out.copy_(x)
+
+
 LIB.impl("scale", _scale, "CompositeExplicitAutograd")
 LIB.impl("write", _write, "CompositeExplicitAutograd")
+LIB.impl("write_scaled", _write_scaled, "CompositeExplicitAutograd")
 torch.library.register_fake("kashi_test::scale", lambda x, tag: torch.empty_like(x), lib=LIB)
 torch.library.register_fake("kashi_test::write", lambda x, out, tag, *, dep: None, lib=LIB)
+torch.library.register_fake(
+    "kashi_test::write_scaled", lambda x, out, block_scale, *, dep: None, lib=LIB
+)
+
+
+def functional_entries(monkeypatch):
+    """Treat ``write`` and ``write_scaled`` like ``unified_attention_with_output``."""
+    from kashi import functional
+
+    monkeypatch.setitem(
+        functional._FUNCTIONAL_OPS,
+        "kashi_test::write",
+        functional.FunctionalForm("write_functional", output="out", like="x"),
+    )
+    monkeypatch.setitem(
+        functional._FUNCTIONAL_OPS,
+        "kashi_test::write_scaled",
+        functional.FunctionalForm("write_scaled_functional", output="out", like="x"),
+    )
 
 
 class OpsModel(nn.Module):
@@ -61,6 +86,62 @@ class OpsModel(nn.Module):
         out = torch.empty(torch.Size([x.shape[0], 4]))
         torch.ops.kashi_test.write(x, out, self.b, dep=d)
         return out.view(-1), d
+
+
+# --- Models exercising the functional rewrite of ``write``. ----------------
+
+W = torch.ops.kashi_test.write
+
+
+class _Tagged(nn.Module):
+    def __init__(self, tag: Tag):
+        super().__init__()
+        self.tag = tag
+
+
+class InputBufferModel(_Tagged):
+    def forward(self, x, out):
+        W(x, out, self.tag, dep=x)
+        return out.view(-1)
+
+
+class AliasedBufferModel(_Tagged):
+    def forward(self, x):
+        base = torch.empty(2, 6)
+        out = base.view(3, 4)
+        W(x, out, self.tag, dep=x)
+        return base
+
+
+class MismatchedBufferModel(_Tagged):
+    def forward(self, x):
+        out = torch.empty(2, 3, 4)  # x broadcasts into it
+        W(x, out, self.tag, dep=x)
+        return out
+
+
+class StridedBufferModel(_Tagged):
+    def forward(self, x):
+        out = torch.ops.aten.t.default(torch.empty(4, 3))
+        W(x, out, self.tag, dep=x)
+        return out
+
+
+class ScaledWriteModel(_Tagged):
+    def forward(self, x):
+        out = torch.empty(3, 4)
+        s = torch.empty(1, 1)
+        torch.ops.kashi_test.write_scaled(x, out, s, dep=x)
+        return out
+
+
+class TwoWritesModel(_Tagged):
+    def forward(self, x):
+        a = torch.empty(3, 4)
+        W(x, a, self.tag, dep=x)
+        b = torch.empty(3, 4)
+        W(a, b, self.tag, dep=a)
+        return b
 
 
 def capture(model, *inputs):
