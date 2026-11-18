@@ -276,9 +276,10 @@ def functional_write(monkeypatch):
 
 
 def _capture(ops, name):
+    extra = {"InputBufferModel": (3, 4), "ChunkInputBufferModel": (6, 4)}
     inputs = (torch.randn(3, 4),)
-    if name == "InputBufferModel":
-        inputs += (torch.empty(3, 4),)
+    if name in extra:
+        inputs += (torch.empty(*extra[name]),)
     return ops.capture(getattr(ops, name)(ops.Tag(3.0)), *inputs)[0]
 
 
@@ -325,8 +326,23 @@ def test_import_fx_functionalizes_each_call(functional_write):
         ("MismatchedBufferModel", "shape"),
         ("StridedBufferModel", "contiguous"),
         ("ScaledWriteModel", "block_scale"),
+        ("ChunkInputBufferModel", "not a fresh buffer"),
+        ("SlicedBaseModel", "not a fresh buffer"),
     ],
 )
 def test_import_fx_functionalize_rejects(functional_write, model, match):
     with pytest.raises(NotImplementedError, match=match):
         import_fx(_capture(functional_write, model))
+
+
+def test_import_fx_functionalizes_output_passed_as_another_argument(functional_write):
+    result = import_fx(_capture(functional_write, "OutputAsDepModel"))
+    text = str(result.module)
+
+    assert result.module.operation.verify()
+    (line,) = (l for l in text.splitlines() if '"torch.kashi.write_functional"' in l)
+    empty = next(l for l in text.splitlines() if "torch.aten.empty.memory_format" in l)
+    # dep reads the buffer before the write; the result is what is returned.
+    assert _ssa_operands(line)[-1] == empty.split("=")[0].strip()
+    (ret,) = (l for l in text.splitlines() if l.strip().startswith("return"))
+    assert ret.split()[1] == line.split("=")[0].strip()

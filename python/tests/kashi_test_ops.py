@@ -144,6 +144,28 @@ class TwoWritesModel(_Tagged):
         return b
 
 
+class ChunkInputBufferModel(_Tagged):
+    def forward(self, x, buf):
+        out = buf.chunk(2)[0]
+        W(x, out, self.tag, dep=x)
+        return out
+
+
+class SlicedBaseModel(_Tagged):
+    def forward(self, x):
+        base = torch.empty(6, 4)
+        out = torch.ops.aten.slice.Tensor(base, 0, 0, 3)
+        W(x, out, self.tag, dep=x)
+        return base
+
+
+class OutputAsDepModel(_Tagged):
+    def forward(self, x):
+        out = torch.empty(3, 4)
+        W(x, out, self.tag, dep=out)
+        return out
+
+
 def capture(model, *inputs):
     """Compile ``model`` once with a recording backend; return ``(gm, example_inputs)``."""
     torch._dynamo.reset()

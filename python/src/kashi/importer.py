@@ -207,6 +207,12 @@ def _functionalize(
             f"Cannot functionalize: {form.output} is a view of graph input "
             f"{base.name}: {node.format_node()}"
         )
+    if base.target is not torch.ops.aten.empty.memory_format:
+        raise NotImplementedError(
+            f"Cannot functionalize: {form.output} is not a fresh buffer (an "
+            f"empty tensor or views of one), it comes from {base.name}: "
+            f"{node.format_node()}"
+        )
     order = {n: i for i, n in enumerate(graph.nodes)}
     at = order[node]
     for alias in _derived_before(base, node, order):
@@ -225,12 +231,12 @@ def _functionalize(
             kwargs[argument.name] = bound[argument.name]
         else:
             args.append(bound[argument.name])
+    later = [u for u in output.users if u is not node and order[u] > at]
     with graph.inserting_before(node):
         new = graph.call_function(dummy, tuple(args), kwargs)
     new.meta = dict(output.meta)
-    for user in list(output.users):
-        if user is not node and order[user] > at:
-            user.replace_input_with(output, new)
+    for user in later:
+        user.replace_input_with(output, new)
     graph.erase_node(node)
 
 

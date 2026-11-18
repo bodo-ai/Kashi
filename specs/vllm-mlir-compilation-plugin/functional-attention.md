@@ -49,6 +49,7 @@ Opaque arguments appear as `PyObject` in a schema and cannot be parsed back, so 
    - any other mutated argument is not `None`;
    - the output's fake value is not contiguous, or differs from the like argument's fake value in shape or dtype. Strides of the like argument are not compared: in the vLLM graph `query` is a strided view of a `chunk`;
    - the call has users;
+   - the output buffer is not fresh: following `view`s back from it must reach an `aten.empty` (a graph input, `chunk`/`getitem`, `slice` or any other producer is rejected);
    - any node that aliases the output buffer, other than the output node itself, is used after the call. "Aliases" means the buffer's base and views of it, found by walking `view`/`aten.view` producers and their users.
 2. Replace the call with the dummy op, passing every argument except the output. Copy fake metadata from the output node.
 3. Redirect uses of the output node that come after the call to the new node. Uses before the call are unchanged. The now-dead `empty`/`view` stay in place: no DCE, per the existing spec.
