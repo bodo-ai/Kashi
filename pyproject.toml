@@ -36,6 +36,7 @@ ninja = "*"
 python-build = "*"
 pip = "*"
 pytest = "*"
+pytest-cov = ">=7.1"
 catch2 = ">=3,<4"
 nanobind = ">=2"
 
@@ -47,9 +48,23 @@ tabulate = "*"
 
 [tool.pixi.tasks]
 test-python = "python -m pytest"
+coverage-python = "python -m pytest --cov=kashi --cov-branch --cov-report=term-missing --cov-report=xml:build/coverage/python.xml --cov-report=markdown:build/coverage/python.md"
 test-cpp = "python scripts/test_cpp.py"
 test-mutation = "python scripts/test_mutation.py"
 
+[tool.coverage.run]
+data_file = "build/coverage/.coverage"
+
+[tool.pixi.feature.cpp-coverage]
+platforms = ["linux-64-cpu"]
+
+[tool.pixi.feature.cpp-coverage.dependencies]
+clangxx = "18.*"
+compiler-rt = "18.*"
+llvm-tools = "18.*"
+
+[tool.pixi.feature.cpp-coverage.tasks]
+coverage-cpp = "python scripts/test_cpp.py --coverage"
 
 [tool.pixi.pypi-options]
 extra-index-urls = ["https://wheels.vllm.ai/rocm/0.33.0/rocm100"]
@@ -84,3 +99,5 @@ torchaudio = { version = "==2.11.0+rocm10.0.0", index = "https://wheels.vllm.ai/
 triton = { version = "==3.8.0+git669b31ac", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
 vllm = { version = "==0.33.0+rocm100", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
 
+[tool.pixi.environments]
+cpp-coverage = ["cpp-coverage"]
