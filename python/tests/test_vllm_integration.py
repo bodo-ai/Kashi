@@ -98,6 +98,7 @@ def model_dir(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(json.dumps(CONFIG))
     vllm_backend_spy.CALLS.clear()
     vllm_backend_spy.TOKEN_COUNTS.clear()
+    vllm_backend_spy.MODULES.clear()
     return tmp_path
 
 
@@ -135,6 +136,11 @@ def test_vllm_matches_uncompiled_vllm(model_dir):
     # ...and the rebuilt callable actually ran for batched prefill (5 + 9
     # tokens) and for decode (one token per prompt).
     assert {14, 2} <= set(vllm_backend_spy.TOKEN_COUNTS)
+
+    # The imported MLIR represents attention functionally.
+    (text,) = vllm_backend_spy.MODULES
+    assert 'torch.operator "torch.kashi.unified_attention"' in text
+    assert "unified_attention_with_output" not in text
 
     vllm_ops = torch.ops.vllm
     assert _vllm_targets(gm) == [

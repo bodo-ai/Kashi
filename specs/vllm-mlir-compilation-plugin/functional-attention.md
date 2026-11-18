@@ -1,6 +1,6 @@
 # Functional Attention in Imported MLIR
 
-**Status:** Proposed; pending human approval
+**Status:** Approved
 **Builds on:** [vLLM Integration](vllm-integration.md) (lifts its "nothing models the write" non-goal for attention only)
 
 ## Intent
