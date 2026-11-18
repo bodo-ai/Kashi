@@ -71,39 +71,47 @@ def _to_fake(val, fake_mode: FakeTensorMode):
 
 def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
     target = node.target
-    if node.op == "call_function" and (
-        isinstance(target, torch._ops.OpOverload) or target is operator.getitem
-    ):
-        return
+    if node.op == "call_function":
+        if isinstance(target, torch._ops.OpOverload) or target is operator.getitem:
+            return
+        if target is torch._C._nn.linear:
+            _replace(
+                graph, node, torch.ops.aten.linear.default, node.args, node.kwargs
+            )
+            return
+        if target is torch.nn.functional.embedding:
+            _rewrite_embedding(graph, node)
+            return
+        if target is torch.chunk:
+            _rewrite_chunk(graph, node)
+            return
+        if target is torch.empty:
+            size = node.args[0] if len(node.args) == 1 else node.args
+            _replace(
+                graph,
+                node,
+                torch.ops.aten.empty.memory_format,
+                (list(size),),
+                node.kwargs,
+            )
+            return
+        if target is torch.Size:
+            _fold_size(node)
+            return
+    elif node.op == "call_method":
+        if target == "view":
+            x, *shape = node.args
+            if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+                shape = shape[0]
+            _replace(graph, node, torch.ops.aten.view.default, (x, list(shape)), {})
+            return
+        if target == "chunk":
+            _rewrite_chunk(graph, node)
+            return
 
-    if node.op == "call_function" and target is torch._C._nn.linear:
-        _replace(graph, node, torch.ops.aten.linear.default, node.args, node.kwargs)
-    elif node.op == "call_function" and target is torch.nn.functional.embedding:
-        _rewrite_embedding(graph, node)
-    elif node.op == "call_method" and target == "view":
-        x, *shape = node.args
-        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
-            shape = shape[0]
-        _replace(graph, node, torch.ops.aten.view.default, (x, list(shape)), {})
-    elif (node.op == "call_function" and target is torch.chunk) or (
-        node.op == "call_method" and target == "chunk"
-    ):
-        _rewrite_chunk(graph, node)
-    elif node.op == "call_function" and target is torch.empty:
-        size = node.args[0] if len(node.args) == 1 else node.args
-        _replace(
-            graph,
-            node,
-            torch.ops.aten.empty.memory_format,
-            (list(size),),
-            node.kwargs,
-        )
-    elif node.op == "call_function" and target is torch.Size:
-        _fold_size(node)
-    else:
-        raise NotImplementedError(
-            f"Unsupported FX node {node.format_node()} ({node.op} {target!r})"
-        )
+    raise NotImplementedError(
+        f"Unsupported FX node {node.format_node()} ({node.op} {target!r})"
+    )
 
 
 def _rewrite_embedding(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
@@ -150,7 +158,7 @@ def _fold_size(node: torch.fx.Node) -> None:
     node.graph.erase_node(node)
 
 
-def _replace(graph, node, target, args, kwargs) -> None:
+def _replace(graph: torch.fx.Graph, node: torch.fx.Node, target, args, kwargs) -> None:
     with graph.inserting_before(node):
         new = graph.call_function(target, tuple(args), dict(kwargs))
     new.meta = node.meta
