@@ -21,6 +21,21 @@ The rebuild uses an isolated Python build environment.
 
 Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available. PyTorch and LLVM/MLIR are not needed for this skeleton; their integration is future work.
 
+## Formatting and linting
+
+Run all check-only tasks with `pixi run --locked lint`. The Linux CI job
+runs the same command on pushes and pull requests.
+
+| Language | Rewrite formatting | Check formatting | Lint |
+| --- | --- | --- | --- |
+| Python (`python/`, `scripts/`) | `pixi run --locked format-python` | `pixi run --locked check-format-python` | `pixi run --locked lint-python` |
+| C++ (`cpp/`) | `pixi run --locked format-cpp` | `pixi run --locked check-format-cpp` | `pixi run --locked lint-cpp` |
+
+Ruff handles Python formatting and linting. C++ uses clang-format with
+LLVM style and clang-tidy on the project targets in `build/lint-cpp/`.
+Clang-tidy checks headers included by those targets and treats reported
+warnings as errors.
+
 ## Tests
 
 The locked Pixi environment supplies pytest, Catch2 v3, CMake, Ninja,

@@ -2,10 +2,9 @@
 """Configure, build, and run the project's native Catch2 tests."""
 
 import json
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = ROOT / "build" / "test-cpp"
@@ -27,8 +26,10 @@ def main() -> int:
         subprocess.run(
             [
                 "cmake",
-                "-S", str(ROOT),
-                "-B", str(BUILD_DIR),
+                "-S",
+                str(ROOT),
+                "-B",
+                str(BUILD_DIR),
                 "-DKASHI_BUILD_TESTS=ON",
                 "-DKASHI_MUTATION=OFF",
                 "-DCMAKE_BUILD_TYPE=Debug",
@@ -56,7 +57,10 @@ def main() -> int:
                 for path in TEST_DIR.rglob("*")
             )
             if has_sources:
-                print("error: native test sources exist but CTest discovered no tests", file=sys.stderr)
+                print(
+                    "error: native test sources exist but CTest discovered no tests",
+                    file=sys.stderr,
+                )
                 return 1
             print("no native tests yet")
             return 0

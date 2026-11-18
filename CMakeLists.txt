@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(kashi LANGUAGES CXX)
 option(KASHI_BUILD_TESTS "Build the native Catch2 tests" OFF)
 option(KASHI_MUTATION "Instrument project native code for Mull" OFF)
+option(KASHI_LINT "Run clang-tidy on project C++ sources" OFF)
 set(KASHI_MULL_PLUGIN "" CACHE FILEPATH "Mull LLVM frontend plugin")
 
 if(KASHI_MUTATION)
@@ -18,6 +19,10 @@ if(KASHI_MUTATION)
   endif()
 endif()
 
+if(KASHI_LINT)
+  find_program(KASHI_CLANG_TIDY NAMES clang-tidy REQUIRED)
+endif()
+
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(nanobind CONFIG REQUIRED)
 
@@ -29,6 +34,9 @@ file(GLOB_RECURSE KASHI_LIB_SOURCES CONFIGURE_DEPENDS
 if(KASHI_LIB_SOURCES)
   add_library(kashi_core STATIC ${KASHI_LIB_SOURCES})
   set_target_properties(kashi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(KASHI_LINT)
+    set_property(TARGET kashi_core PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
+  endif()
   target_include_directories(kashi_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include")
   if(KASHI_MUTATION)
     target_compile_options(kashi_core PRIVATE
@@ -41,6 +49,9 @@ endif()
 
 nanobind_add_module(_native cpp/bindings/module.cpp)
 target_link_libraries(_native PRIVATE kashi_core)
+if(KASHI_LINT)
+  set_property(TARGET _native PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
+endif()
 install(TARGETS _native LIBRARY DESTINATION kashi RUNTIME DESTINATION kashi)
 
 if(KASHI_BUILD_TESTS)
@@ -56,6 +67,9 @@ if(KASHI_BUILD_TESTS)
   if(KASHI_TEST_SOURCES)
     add_executable(kashi_native_tests ${KASHI_TEST_SOURCES})
     target_link_libraries(kashi_native_tests PRIVATE kashi_core Catch2::Catch2WithMain)
+    if(KASHI_LINT)
+      set_property(TARGET kashi_native_tests PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
+    endif()
     if(KASHI_MUTATION)
       # The Mull policy excludes test sources while permitting inline project headers.
       target_compile_options(kashi_native_tests PRIVATE
