@@ -236,8 +236,8 @@ def _list_unpack(graph, op, operands):
 
     Becomes:
         chunks = torch.ops.aten.chunk.default(x, n, dim)
-        a = operator.getitem(chunks, 0)
-        b = operator.getitem(chunks, 1)
+        getitem = operator.getitem(chunks, 0)
+        getitem_1 = operator.getitem(chunks, 1)
     """
     (src,) = operands
     if not isinstance(src, torch.fx.Node):
