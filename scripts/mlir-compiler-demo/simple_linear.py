@@ -8,18 +8,26 @@ from torch_mlir.ir import Module, IntegerAttr, StringAttr
 
 
 class MyModel(nn.Module):
+    """Two-layer linear network with an intermediate reshape."""
     def __init__(self):
+        """Create linear layers sized for the demo's input and reshaped features."""
         super().__init__()
         self.linear1 = nn.Linear(4, 3)
         self.linear2 = nn.Linear(6, 1)
 
     def forward(self, x):
+        """Apply the first projection, flatten features, then project output."""
         x = self.linear1(x)
         x = x.view(1, -1)
         return self.linear2(x)
 
 
 def mlir_to_fx(module: Module) -> fx.GraphModule:
+    """Reconstruct an FX graph from the demo's Torch-dialect MLIR subset.
+
+    The importer handles only integer constants, constructed lists, the
+    supported ATen calls, and the function return; other operations fail.
+    """
     graph = fx.Graph()
 
     # Find the main MLIR function.
@@ -88,9 +96,10 @@ def mlir_to_fx(module: Module) -> fx.GraphModule:
 
 
 def normalize_fx(gm: fx.GraphModule):
-    """ 
-    Convert FX graph into format expected by Torch MLIR.
-    Torch MLIR expects FX graphs to use ATen operations.
+    """Convert Dynamo callables to the ATen forms expected by Torch MLIR.
+
+    Also copy ``example_value`` metadata to ``val``, which the importer uses
+    for fake-value information.
     """
     for node in gm.graph.nodes:
         if node.op == "call_function":
@@ -121,6 +130,7 @@ def normalize_fx(gm: fx.GraphModule):
 
 
 def my_backend(gm: fx.GraphModule, example_inputs):
+    """Round-trip Dynamo FX through Torch MLIR and return reconstructed FX."""
     print("\nOriginal Dynamo FX:")
     gm.graph.print_tabular()
 

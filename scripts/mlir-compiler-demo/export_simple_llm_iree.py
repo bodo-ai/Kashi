@@ -60,12 +60,19 @@ VOCAB_SIZE = 50272
 
 
 class SimpleCausalAttention(nn.Module):
-    """Stand-in for vllm.model_executor.layers.attention.Attention.
+    """Plain-torch causal self-attention for one un-cached token sequence.
 
-    Input/outputs are [num_tokens, hidden] like vLLM's Attention (q, k, v each
-    [T, num_heads * head_size]). vLLM does the same internal view to
-    [T, num_heads, head_size]. A single sequence of T tokens with a causal
-    mask and no KV cache (prefill only), MHA (num_kv_heads == num_heads).
+    Args:
+        num_heads: Number of query/key/value heads.
+        head_size: Width of each head; input width is ``num_heads * head_size``.
+        scale: Multiplier applied to query-key scores before softmax.
+        impl: ``"eager"`` for explicit matmul/mask/softmax, or ``"sdpa"``
+            for PyTorch's scaled-dot-product attention operator.
+
+    Inputs and output have shape ``[T, num_heads * head_size]``. Internally,
+    tensors become ``[T, H, D]`` and then ``[1, H, T, D]``; the result is
+    transposed back and flattened. This models causal prefill without a KV
+    cache and assumes MHA (all heads are KV heads), not vLLM's paged cache.
     """
 
     def __init__(self, num_heads: int, head_size: int, scale: float, impl: str):
@@ -76,6 +83,7 @@ class SimpleCausalAttention(nn.Module):
         self.impl = impl
 
     def forward(self, q, k, v):
+        """Attend over a sequence; q, k, and v each have shape ``[T, H*D]``."""
         T = q.shape[0]
         # [T, H*D] -> [1, H, T, D]
         def split(t):
@@ -102,10 +110,15 @@ class SimpleCausalAttention(nn.Module):
 
 
 class MyModel(nn.Module):
-    """Same layers / attribute names as simple_llm.MyModel (so parameter names
-    match: model.embed_tokens.weight, model.qkv_proj.weight, ...)."""
+    """Embedding, fused QKV projection, causal attention, and output projection.
+
+    The fused projection is split along its feature axis into three ``[T, H*D]``
+    tensors; attention restores that flattened layout for ``o_proj``. Layer
+    names match ``simple_llm.MyModel`` for parameter-name comparisons.
+    """
 
     def __init__(self, attn_impl: str):
+        """Construct OPT-125m-shaped layers using eager or SDPA attention."""
         super().__init__()
         hidden_size = HIDDEN_SIZE
         head_size = hidden_size // NUM_HEADS
@@ -121,6 +134,7 @@ class MyModel(nn.Module):
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, input_ids):
+        """Embed flat token IDs ``[T]`` to hidden states ``[T, HIDDEN_SIZE]``."""
         x = self.embed_tokens(input_ids)
         q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
         x = self.attn(q, k, v)
@@ -129,7 +143,13 @@ class MyModel(nn.Module):
 
 
 class MyModelForCausalLM(nn.Module):
+    """Model body and optional vocabulary logits projection."""
     def __init__(self, attn_impl: str):
+        """Create the model body and vocabulary projection.
+
+        Args:
+            attn_impl: Attention implementation used by the model body.
+        """
         super().__init__()
         self.model = MyModel(attn_impl)
         self.lm_head = nn.Linear(HIDDEN_SIZE, VOCAB_SIZE, bias=False)
@@ -137,12 +157,20 @@ class MyModelForCausalLM(nn.Module):
 
 # Expose a simple tensor-in/tensor-out interface.
 class SimpleLLMForward(torch.nn.Module):
+    """Tensor-in/tensor-out adapter selecting hidden states or vocabulary logits.
+
+    Args:
+        model: Model whose parameters are exposed to the exported program.
+        with_lm_head: Whether to include the vocabulary projection in the graph.
+    """
     def __init__(self, model: MyModelForCausalLM, with_lm_head: bool):
+        """Select hidden-state or logits output for the exported interface."""
         super().__init__()
         self.model = model
         self.with_lm_head = with_lm_head
 
     def forward(self, input_ids):
+        """Return per-token hidden states, or logits when the head is enabled."""
         hidden = self.model.model(input_ids)
         if self.with_lm_head:
             return self.model.lm_head(hidden)
@@ -150,6 +178,7 @@ class SimpleLLMForward(torch.nn.Module):
 
 
 def main():
+    """Build the example graph, export it with IREE-Turbine, and save MLIR."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=128,
                         help="num_tokens (default 128 = simple_llm.py's max_model_len)")

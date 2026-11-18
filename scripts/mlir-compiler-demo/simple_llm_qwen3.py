@@ -11,6 +11,11 @@ from vllm import LLM, SamplingParams
 
 
 def create_llm(backend: str = "mlir_roundtrip_backend") -> LLM:
+    """Create a bounded Qwen3 instance using the selected compilation backend.
+
+    Dummy weights and fixed seeds make this a repeatable compiler-parity check,
+    rather than a comparison of downloaded model weights or stochastic outputs.
+    """
     return LLM(
         model="Qwen/Qwen3-0.6B",
         load_format="dummy",
@@ -26,6 +31,11 @@ def create_llm(backend: str = "mlir_roundtrip_backend") -> LLM:
 
 
 def run_generation(backend: str) -> dict[str, list[int] | list[float]]:
+    """Generate a short deterministic sample and extract each chosen token's score.
+
+    vLLM stores log-probabilities by token ID; requiring the generated ID in each
+    entry ensures the returned scores correspond to the emitted sequence.
+    """
     qwen3 = create_llm(backend)
     outputs = qwen3.generate(
         ["Hello, my name is"],
@@ -36,6 +46,7 @@ def run_generation(backend: str) -> dict[str, list[int] | list[float]]:
             logprobs=5,
         ),
     )
+    # Check alignment before pairing each generated token with its own score.
     completion = outputs[0].outputs[0]
     if completion.logprobs is None:
         raise RuntimeError("vLLM did not return token log-probabilities")
@@ -59,6 +70,7 @@ def run_generation(backend: str) -> dict[str, list[int] | list[float]]:
 
 
 def main(argv=None):
+    """Run generation for a selected backend, optionally emitting parity JSON."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--backend",

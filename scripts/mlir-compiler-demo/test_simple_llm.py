@@ -1,7 +1,12 @@
 import simple_llm
+import contextlib
 import importlib.util
+import io
 import operator
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
@@ -22,6 +27,8 @@ from torch_mlir.fx import stateless_fx_import
 
 
 class _ValueRecorder(fx.Interpreter):
+    """Record concrete and example values for FX normalization metadata."""
+
     def run_node(self, node):
         value = super().run_node(node)
         node.meta["val"] = value
@@ -30,6 +37,7 @@ class _ValueRecorder(fx.Interpreter):
 
 
 def _round_trip(gm):
+    """Import an FX graph to MLIR and reconstruct its FX representation."""
     context = ir.Context()
     torch_d.register_dialect(context)
     importer = VllmFxImporter(context=context)
@@ -42,6 +50,7 @@ def _round_trip(gm):
 
 
 def _tensor_method_graph():
+    """Build tensor-method operations that normalization must canonicalize."""
     graph = fx.Graph()
     x = graph.placeholder("x")
     data_value = graph.call_function(
@@ -57,9 +66,58 @@ def _tensor_method_graph():
     return fx.GraphModule(nn.Module(), graph)
 
 
+def _custom_op_graph():
+    """Build vLLM custom-op calls, marking only the cache update as value-producing."""
+    graph = fx.Graph()
+    result = graph.placeholder("result")
+    inputs = graph.placeholder("inputs")
+    weight = graph.placeholder("weight")
+    positions = graph.placeholder("positions")
+    cos_sin_cache = graph.placeholder("cos_sin_cache")
+    query = graph.placeholder("query")
+    key = graph.placeholder("key")
+    value = graph.placeholder("value")
+    output = graph.placeholder("output")
+
+    custom_op_packets = (
+        torch.ops._C.rms_norm,
+        torch.ops._C.fused_add_rms_norm,
+        torch.ops._C.rotary_embedding,
+        torch.ops._C.silu_and_mul,
+        torch.ops.vllm.unified_attention_with_output,
+        torch.ops.vllm.unified_kv_cache_update,
+    )
+    graph.call_function(custom_op_packets[0], (result, inputs, weight, 1e-6))
+    graph.call_function(custom_op_packets[1], (result, inputs, weight, 1e-6))
+    graph.call_function(
+        custom_op_packets[2], (positions, query, key, 1, cos_sin_cache, False)
+    )
+    graph.call_function(custom_op_packets[3], (result, inputs))
+    graph.call_function(custom_op_packets[4], (query, key, value, output, "layer"))
+    updated_key = graph.call_function(custom_op_packets[5], (key, value, "layer"))
+    graph.output((result, updated_key))
+    gm = fx.GraphModule(nn.Module(), graph)
+
+    mode = FakeTensorMode()
+    example = mode.from_tensor(torch.empty((1, 4)))
+    # Side-effect-only operators have no fake result; cache update feeds the output.
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            node.meta["val"] = example
+            node.meta["example_value"] = example
+        elif node.op == "call_function":
+            node.meta["val"] = example if node.target is custom_op_packets[5] else None
+            node.meta["example_value"] = node.meta["val"]
+    return gm, custom_op_packets
+
+
+
+
 
 
 class Qwen3FxNormalizationTest(unittest.TestCase):
+    """Check FX normalization, MLIR round-trips, and Qwen3 backend wiring."""
+
     def test_normalize_qwen3_fx_ops(self):
         graph = fx.Graph()
         x = graph.placeholder("x")
@@ -166,52 +224,8 @@ class Qwen3FxNormalizationTest(unittest.TestCase):
         self.assertTrue(torch.equal(actual[4], expected[4]))
 
     def test_qwen3_custom_ops_round_trip(self):
-        graph = fx.Graph()
-        result = graph.placeholder("result")
-        inputs = graph.placeholder("inputs")
-        weight = graph.placeholder("weight")
-        positions = graph.placeholder("positions")
-        cos_sin_cache = graph.placeholder("cos_sin_cache")
-        query = graph.placeholder("query")
-        key = graph.placeholder("key")
-        value = graph.placeholder("value")
-        output = graph.placeholder("output")
-
-        custom_op_packets = (
-            torch.ops._C.rms_norm,
-            torch.ops._C.fused_add_rms_norm,
-            torch.ops._C.rotary_embedding,
-            torch.ops._C.silu_and_mul,
-            torch.ops.vllm.unified_attention_with_output,
-            torch.ops.vllm.unified_kv_cache_update,
-        )
+        gm, custom_op_packets = _custom_op_graph()
         custom_ops = tuple(packet.default for packet in custom_op_packets)
-        graph.call_function(custom_op_packets[0], (result, inputs, weight, 1e-6))
-        graph.call_function(custom_op_packets[1], (result, inputs, weight, 1e-6))
-        graph.call_function(
-            custom_op_packets[2], (positions, query, key, 1, cos_sin_cache, False)
-        )
-        graph.call_function(custom_op_packets[3], (result, inputs))
-        graph.call_function(
-            custom_op_packets[4], (query, key, value, output, "layer")
-        )
-        updated_key = graph.call_function(
-            custom_op_packets[5], (key, value, "layer")
-        )
-        graph.output((result, updated_key))
-        gm = fx.GraphModule(nn.Module(), graph)
-
-        mode = FakeTensorMode()
-        example = mode.from_tensor(torch.empty((1, 4)))
-        for node in gm.graph.nodes:
-            if node.op == "placeholder":
-                node.meta["val"] = example
-                node.meta["example_value"] = example
-            elif node.op == "call_function":
-                node.meta["val"] = (
-                    example if node.target is custom_op_packets[5] else None
-                )
-                node.meta["example_value"] = node.meta["val"]
 
         normalize_fx(gm)
         normalized_targets = {
@@ -243,6 +257,30 @@ class Qwen3FxNormalizationTest(unittest.TestCase):
         self.assertIn(reconstructed_nodes[custom_ops[-1]], output_node.all_input_nodes)
         for side_effect_op in custom_ops[:-1]:
             self.assertFalse(reconstructed_nodes[side_effect_op].users)
+
+    def test_backend_dump_failure_does_not_break_round_trip(self):
+        gm, _ = _custom_op_graph()
+        environment = {
+            "IREE_PHASE_DUMP_DIR": "",
+            "IREE_COMPILE": "/nonexistent/iree-compile",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            environment["IREE_PHASE_DUMP_DIR"] = directory
+            with patch.dict(os.environ, environment), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                forward = simple_llm.mlir_roundtrip_backend(gm, [])
+
+            self.assertTrue(callable(forward))
+            dump = Path(directory) / "0"
+            for name in (
+                "partitioned.mlir",
+                "boundaries.txt",
+                "segments.txt",
+                "partition_stats.json",
+            ):
+                self.assertTrue((dump / name).exists(), name)
+            self.assertIn("torch._C.rms_norm", (dump / "boundaries.txt").read_text())
             
     def test_qwen3_demo_uses_dummy_weights(self):
         self.assertIsNotNone(importlib.util.find_spec("simple_llm_qwen3"))

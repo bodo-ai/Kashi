@@ -90,10 +90,19 @@ VOCAB_SIZE = 50272
 
 
 class MyModel(nn.Module):
-    """Same layers / attribute names as simple_llm.MyModel (so parameter names
-    match: model.embed_tokens.weight, model.qkv_proj.weight, ...)."""
+    """OPT-125m-shaped body using vLLM attention and matching simple_llm names.
+
+    The fused QKV projection is chunked across its last dimension into three
+    ``[T, H*D]`` tensors. The real vLLM layer is retained as an opaque attention
+    operator in the export; its runtime cache/context is not provided here.
+    """
 
     def __init__(self, prefix: str = ""):
+        """Construct the body and register attention under its stable layer prefix.
+
+        Args:
+            prefix: Parent layer name used by vLLM's attention context.
+        """
         super().__init__()
         hidden_size = HIDDEN_SIZE
         head_size = hidden_size // NUM_HEADS
@@ -111,6 +120,7 @@ class MyModel(nn.Module):
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, input_ids):
+        """Map flat token IDs ``[T]`` through the body to hidden states ``[T, HIDDEN_SIZE]``."""
         x = self.embed_tokens(input_ids)
         q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
         x = self.attn(q, k, v)
@@ -119,7 +129,13 @@ class MyModel(nn.Module):
 
 
 class MyModelForCausalLM(nn.Module):
+    """Model body and optional vocabulary logits projection."""
     def __init__(self, prefix: str = ""):
+        """Build the body and logits projection.
+
+        Args:
+            prefix: Prefix propagated to the vLLM attention layer name.
+        """
         super().__init__()
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = MyModel(prefix=model_prefix)
@@ -128,12 +144,20 @@ class MyModelForCausalLM(nn.Module):
 
 # Expose a simple tensor-in/tensor-out interface.
 class SimpleLLMForward(torch.nn.Module):
+    """Tensor-in/tensor-out export adapter for hidden states or vocabulary logits.
+
+    Args:
+        model: Model whose parameters are externalized for export.
+        with_lm_head: Whether to include the vocabulary projection in the graph.
+    """
     def __init__(self, model: MyModelForCausalLM, with_lm_head: bool):
+        """Select the graph output by enabling or omitting the logits projection."""
         super().__init__()
         self.model = model
         self.with_lm_head = with_lm_head
 
     def forward(self, input_ids):
+        """Return per-token hidden states, or logits when the head is enabled."""
         hidden = self.model.model(input_ids)
         if self.with_lm_head:
             return self.model.lm_head(hidden)
@@ -141,6 +165,7 @@ class SimpleLLMForward(torch.nn.Module):
 
 
 def main():
+    """Construct vLLM attention under its required config and save exported MLIR."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=128,
                         help="num_tokens (default 128 = simple_llm.py's max_model_len)")

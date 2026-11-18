@@ -9,6 +9,10 @@ RESULT_MARKER = "QWEN3_PARITY_RESULT="
 
 
 def compare_outputs(reference: dict, candidate: dict) -> None:
+    """Require matching generated tokens and close selected-token log-probs.
+
+    Comparing both catches backend discrepancies that token IDs alone can hide.
+    """
     reference_ids = reference.get("token_ids")
     candidate_ids = candidate.get("token_ids")
     if not isinstance(reference_ids, list) or not isinstance(candidate_ids, list):
@@ -29,6 +33,8 @@ def compare_outputs(reference: dict, candidate: dict) -> None:
     ):
         raise AssertionError("Selected-token log-probabilities are misaligned with token IDs")
 
+    # Validate log-probabilities as well as tokens: parity includes model scores,
+    # and finite values avoid treating NaNs or infinities as successful matches.
     for index, (reference_value, candidate_value) in enumerate(
         zip(reference_logprobs, candidate_logprobs)
     ):
@@ -56,6 +62,7 @@ def compare_outputs(reference: dict, candidate: dict) -> None:
 
 
 def run_backend(backend: str) -> dict:
+    """Run the worker for one compiler backend and decode its marked result."""
     worker = Path(__file__).with_name("simple_llm_qwen3.py")
     completed = subprocess.run(
         [
@@ -85,6 +92,7 @@ def run_backend(backend: str) -> dict:
 
 
 def main():
+    """Compare normalized-FX and MLIR-roundtrip generation results."""
     normalized = run_backend("normalized_fx_backend")
     round_trip = run_backend("mlir_roundtrip_backend")
     compare_outputs(normalized, round_trip)

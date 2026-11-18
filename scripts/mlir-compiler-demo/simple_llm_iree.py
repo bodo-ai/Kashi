@@ -31,9 +31,25 @@ from vllm.config import VllmConfig
 
 
 class VllmContextCache(ContextCache):
+    """Adapt vLLM-specific fake values to Torch-dialect types for IREE's
+    packaged FX importer.
+
+    Fake script objects and tuples of fake tensors need explicit representations
+    because the packaged importer cannot infer their types.
+    """
     def value_info_to_type(
         self, val, *, tensor_meta=None, mutable=False
     ):
+        """Map vLLM-specific values, delegating ordinary types to the base cache.
+
+        Args:
+            val: Concrete or fake example value from Dynamo.
+            tensor_meta: Optional tensor metadata forwarded to the base cache.
+            mutable: Whether the imported value may be mutated.
+
+        Returns:
+            The corresponding Torch-dialect type.
+        """
         if isinstance(val, FakeScriptObject):
             return Type.parse(
                 "!torch.any",
@@ -57,6 +73,7 @@ class VllmContextCache(ContextCache):
 
 
 class VllmFxImporter(FxImporter):
+    """Use vLLM-aware type mappings with IREE's packaged FX importer."""
     def __init__(self, **kwargs):
 
         super().__init__(**kwargs)
@@ -74,9 +91,10 @@ INT_TO_TORCH_DTYPE = {
 
 
 def reconstruct_args(target, operands, values):
-    """ 
-    Torch MLIR uses positional args, but in the reverse direction, 
-    some functions might have keyword-only arguments (see aten.empty as an example). 
+    """Restore schema-ordered MLIR operands as Python args and kwargs.
+
+    Some ATen parameters are keyword-only in Python, and ScalarType dtype
+    operands are encoded as integer enum values in Torch-dialect MLIR.
     """
     schema_args = target._schema.arguments
 
@@ -105,7 +123,12 @@ def reconstruct_args(target, operands, values):
 
 
 def mlir_to_fx(module_op) -> fx.GraphModule:
-    """Reconstruct Dynamo FX from IREE-packaged Torch-dialect MLIR."""
+    """Reconstruct FX from the supported subset of Torch-dialect MLIR.
+
+    This expects one ``main`` function; unsupported operations and multi-result
+    custom operators raise instead of being silently dropped. Custom vLLM
+    operators remain opaque FX calls, preserving their runtime behavior.
+    """
     graph = fx.Graph()
 
     # FxImporter.module_op is a builtin.module Operation, not a Module wrapper.
@@ -126,6 +149,8 @@ def mlir_to_fx(module_op) -> fx.GraphModule:
     }
 
     torch_ops = {
+        # Reconstruction intentionally covers only the ATen operators used
+        # by this demo's normalized graph.
         "torch.aten.linear": torch.ops.aten.linear.default,
         "torch.aten.view": torch.ops.aten.view.default,
         "torch.aten.embedding": torch.ops.aten.embedding.default,
@@ -226,16 +251,20 @@ def mlir_to_fx(module_op) -> fx.GraphModule:
 
 
 def normalize_fx(gm: fx.GraphModule):
-    """Normalize Dynamo callables to ATen for IREE's packaged FX importer."""
+    """Normalize Dynamo callables to ATen forms accepted by IREE's importer.
 
+    Supported method calls become ATen function calls; ``example_value`` is
+    copied to ``val`` because the importer consumes that fake-value metadata.
+    """
     for node in gm.graph.nodes:
         if node.op == "call_function":
             if node.target is torch._C._nn.linear:
                 node.target = torch.ops.aten.linear.default
 
             elif node.target is torch.nn.functional.embedding:
-                # NOTE: aten.embedding expects arguments in a different order than F.embedding
-                # TODO: support other arguments e.g. padding_idx
+                # F.embedding uses (indices, weight), while ATen uses
+                # (weight, indices, padding_idx, scale_grad_by_freq, sparse).
+                # Supply the default options used by this demo.
                 input_ids, weight = node.args[:2]
                 node.target = torch.ops.aten.embedding.default
                 node.args = (weight, input_ids, -1, False, False)
@@ -288,7 +317,11 @@ def normalize_fx(gm: fx.GraphModule):
 
 
 def normalize_torch_size(gm):
-    """ Remove torch.Size constructor from the graph and replace all uses with a tuple/list """
+    """Replace ``torch.Size`` nodes with their underlying shape sequence.
+
+    Rewrite each user before erasing the constructor, as the importer expects
+    ordinary tuple/list shape values.
+    """
     graph = gm.graph
 
     for node in list(graph.nodes):
@@ -320,6 +353,11 @@ def normalize_torch_size(gm):
 
 @register_backend(name="mlir_roundtrip_backend")
 def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
+    """Import normalized FX to MLIR, reconstruct FX, and return its forward.
+
+    IREE provides the packaged Torch FX importer here; this does not invoke
+    IREE optimization or native code generation.
+    """
     print("\nOriginal Dynamo FX:")
     gm.graph.print_tabular()
     # Normalize raw Dynamo callables into ATen overloads for the importer.
@@ -347,7 +385,16 @@ def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
 
 @support_torch_compile
 class MyModel(nn.Module):
+    """Implement the demo transformer block using vLLM's attention layer.
+
+    The packaged IREE importer handles this block's FX graph; vLLM still owns
+    model execution and KV-cache plumbing.
+    """
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+        """Initialize embedding, attention, and projection layers.
+
+        ``prefix`` scopes this model's attention-layer name within vLLM.
+        """
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -377,6 +424,7 @@ class MyModel(nn.Module):
         )
 
     def embed_input_ids(self, input_ids):
+        """Embed token IDs with the model's token embedding table."""
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -385,6 +433,16 @@ class MyModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ):
+        """Compute attention-projected hidden states for token inputs.
+
+        Args:
+            input_ids: Token IDs, unless `inputs_embeds` is supplied.
+            positions: Required by vLLM's model interface; unused by this demo.
+            inputs_embeds: Optional embeddings that bypass token lookup.
+
+        Returns:
+            Hidden states after QKV projection, attention, and output projection.
+        """
         if inputs_embeds is not None:
             x = inputs_embeds
         else:
@@ -399,7 +457,9 @@ class MyModel(nn.Module):
 
 
 class MyModelForCausalLM(nn.Module):
+    """vLLM causal-LM wrapper exposing the model and logits projection."""
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+        """Construct the transformer body and vocabulary projection."""
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -416,6 +476,7 @@ class MyModelForCausalLM(nn.Module):
         )
 
     def embed_input_ids(self, input_ids):
+        """Delegate token embedding to the wrapped transformer model."""
         return self.model.embed_input_ids(input_ids)
 
     def forward(
@@ -425,6 +486,11 @@ class MyModelForCausalLM(nn.Module):
         intermediate_tensors=None,
         inputs_embeds: torch.Tensor | None = None,
     ):
+        """Forward model inputs to the transformer body.
+
+        ``intermediate_tensors`` is accepted for vLLM interface compatibility
+        but unused by this demo.
+        """
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -432,10 +498,12 @@ class MyModelForCausalLM(nn.Module):
         )
 
     def compute_logits(self, hidden_states):
+        """Project hidden states to vocabulary logits."""
         return self.lm_head(hidden_states)
 
 
 def main():
+    """Register the vLLM model and run a short generation example."""
     ModelRegistry.register_model(
         "MyModelForCausalLM", MyModelForCausalLM
     )
