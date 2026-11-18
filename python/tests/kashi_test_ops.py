@@ -7,7 +7,7 @@ a keyword-only dependency tensor, like ``unified_attention_with_output``.
 
 import torch
 from torch import nn
-from torch._library.opaque_object import get_opaque_type_name, register_custom_class
+from torch._library.opaque_object import get_opaque_type_name, register_opaque_type
 from torch._opaque_base import OpaqueBase
 
 
@@ -25,7 +25,7 @@ class Tag(OpaqueBase):
         return (f"Tag({self.factor!r})", {"Tag": Tag})
 
 
-register_custom_class(Tag, typ="constant", hoist=True)
+register_opaque_type(Tag, typ="value", hoist=True)
 
 # ``torch.library.custom_op`` rejects kwarg-only tensors, so define schemas
 # directly, as vLLM does.
