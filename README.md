@@ -51,6 +51,33 @@ LLVM style and clang-tidy on the project targets in `build/lint-cpp/`.
 Clang-tidy checks headers included by those targets and treats reported
 warnings as errors.
 
+## Qwen3 with vLLM
+
+Use the FX-to-MLIR-to-FX backend with vLLM's Qwen3 models. This example uses
+dummy weights.
+
+```sh
+VLLM_USE_AOT_COMPILE=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 pixi run python - <<'PY'
+from vllm import LLM, SamplingParams
+from vllm.config import CompilationConfig, CompilationMode
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    load_format="dummy",
+    seed=42,
+    max_model_len=128,
+    kv_cache_memory_bytes=256 * 1024 * 1024,
+    compilation_config=CompilationConfig(
+        mode=CompilationMode.DYNAMO_TRACE_ONCE,
+        backend="kashi.backend.compile_fx",
+    ),
+)
+print(llm.generate(["Hello, my name is"], SamplingParams(max_tokens=4, temperature=0))[0].outputs[0].text)
+PY
+```
+
+The backend runs the rebuilt FX graph in PyTorch.
+
 ## Tests
 
 The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.

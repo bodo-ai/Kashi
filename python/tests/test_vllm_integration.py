@@ -54,6 +54,8 @@ def _generate(model_dir, compilation_config):
         load_format="dummy",
         dtype="float32",
         max_model_len=128,
+        kv_cache_memory_bytes=64 * 1024 * 1024,
+        gpu_memory_utilization=0.5,
         seed=0,
         compilation_config=compilation_config,
         # The startup warmup compiles a random sampler that can abort in Triton
