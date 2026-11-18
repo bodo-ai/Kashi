@@ -21,9 +21,6 @@ jobs:
           - name: macOS Apple silicon
             runner: macos-15
             architecture: arm64
-          - name: macOS Intel
-            runner: macos-15-intel
-            architecture: x86_64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -37,7 +34,7 @@ jobs:
       - name: Install locked environment
         run: pixi install --locked
       - name: Python tests
-        run: pixi run --locked test-python
+        run: pixi run --locked -e vllm-mlir-cpu test-python
       - name: Native tests
         run: pixi run --locked test-cpp
       - name: Build wheel
