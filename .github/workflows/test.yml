@@ -17,7 +17,7 @@ jobs:
           persist-credentials: false
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
-          pixi-version: v0.80.0
+          pixi-version: v0.82.0
           run-install: false
       - name: Check Python and C++
         run: pixi run --locked lint
@@ -43,12 +43,12 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
-          pixi-version: v0.80.0
+          pixi-version: v0.82.0
           run-install: false
       - name: Install locked environment
         run: pixi install --locked
       - name: Python tests
-        run: pixi run --locked -e vllm-mlir-cpu test-python
+        run: pixi run --locked test-python
       - name: Native tests
         run: pixi run --locked test-cpp
       - name: Build wheel

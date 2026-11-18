@@ -41,7 +41,7 @@ jobs:
           ) 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
-          pixi-version: v0.80.0
+          pixi-version: v0.82.0
           run-install: false
       - name: Install locked environment
         run: pixi install --locked

@@ -56,6 +56,9 @@ def _generate(model_dir, compilation_config):
         max_model_len=128,
         seed=0,
         compilation_config=compilation_config,
+        # The startup warmup compiles a random sampler that can abort in Triton
+        # on Linux CPU. This test exercises greedy decoding, not sampler warmup.
+        kernel_config={"enable_jit_warmup": False},
     )
     try:
         llm.apply_model(_fill_weights)
