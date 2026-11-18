@@ -7,6 +7,8 @@ from iree.compiler import ir
 from iree.compiler.extras.fx_importer import TORCH_DTYPE_TO_INT
 from torch.utils import _pytree as pytree
 
+from kashi.functional import functional_original
+
 
 # --- Adapter: private PyTorch APIs used for schema-driven binding. ----------
 
@@ -92,7 +94,11 @@ def rebuild_fx(
             results = _call(graph, op, name, operands, max_results=1, min_results=1)
         elif name == "torch.operator":
             qualified = ir.StringAttr(op.attributes["name"]).value
-            results = _call(graph, op, qualified, operands, max_results=1)
+            original = _functional_original(qualified)
+            if original is not None:
+                results = _expand_functional(graph, op, *original, operands)
+            else:
+                results = _call(graph, op, qualified, operands, max_results=1)
         else:
             raise _error(op, "unsupported operation")
         for result, value in zip(op.results, results, strict=True):
@@ -130,12 +136,23 @@ def _call(graph, op, name, operands, *, max_results, min_results=0):
     """Emit a call to the dispatcher operator ``name``, binding operands by
     schema. An operator with no results is still emitted, exactly once."""
     target = _resolve(op, name)
+    num_results = _check_results(op, min_results, max_results)
+    node = graph.call_function(target, *_bind(op, target, operands))
+    return [node] if num_results else []
+
+
+def _check_results(op, min_results, max_results) -> int:
     num_results = len(op.results)
     if not min_results <= num_results <= max_results:
         expected = (
             f"{max_results}" if min_results == max_results else f"at most {max_results}"
         )
         raise _error(op, f"expected {expected} result, found {num_results}")
+    return num_results
+
+
+def _bind(op, target, operands):
+    """Bind MLIR operands to ``target``'s schema as ``(args, kwargs)``."""
     arguments = _schema_arguments(target)
     if len(operands) != len(arguments):
         raise _error(
@@ -148,8 +165,41 @@ def _call(graph, op, name, operands, *, max_results, min_results=0):
             kwargs[argument.name] = value
         else:
             args.append(value)
-    node = graph.call_function(target, tuple(args), kwargs)
-    return [node] if num_results else []
+    return tuple(args), kwargs
+
+
+def _functional_original(qualified: str):
+    """``(original op name, form)`` when ``qualified`` names a kashi
+    functional dummy, else ``None``."""
+    if not qualified.startswith("torch.kashi."):
+        return None
+    dummy = qualified.removeprefix("torch.kashi.")
+    if dummy.endswith(".default"):
+        dummy = dummy.removesuffix(".default")
+    return functional_original(dummy)
+
+
+def _expand_functional(graph, op, original, form, operands):
+    """Expand a functional dummy into a fresh contiguous buffer written by
+    the original destination-passing op; the buffer is the result."""
+    target = _resolve(op, "torch." + original.replace("::", "."))
+    _check_results(op, 1, 1)
+    names = [a.name for a in _schema_arguments(target)]
+    dummy_names = [n for n in names if n != form.output]
+    if len(operands) != len(dummy_names):
+        raise _error(
+            op, f"expected {len(dummy_names)} operands, found {len(operands)}"
+        )
+    like = operands[dummy_names.index(form.like)]
+    buffer = graph.call_function(
+        torch.ops.aten.empty_like.default,
+        (like,),
+        {"memory_format": torch.contiguous_format},
+    )
+    full = list(operands)
+    full.insert(names.index(form.output), buffer)
+    graph.call_function(target, *_bind(op, target, full))
+    return [buffer]
 
 
 def _output(op, operands, out_spec):

@@ -381,3 +381,70 @@ func.func @main(%arg0: !torch.vtensor<[2],f32>, %arg1: !torch.any) -> !torch.vte
 def test_rebuild_rejects_unresolvable_operator(test_ops, name, match):
     with pytest.raises(NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"):
         rebuild_fx(_with_operator(name))
+
+
+# --- Functional dummies expand to destination-passing ops. ------------------
+
+FUNCTIONAL = """
+func.func @main(%arg0: !torch.vtensor<[?,4],f32>, %arg1: !torch.any) -> !torch.vtensor<[?,4],f32> {
+  %0 = torch.operator "torch.kashi.write_functional"(%arg0, %arg1, %arg0) : (!torch.vtensor<[?,4],f32>, !torch.any, !torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32>
+  return %0 : !torch.vtensor<[?,4],f32>
+}
+"""
+
+
+@pytest.fixture
+def functional_write(monkeypatch):
+    import kashi_test_ops
+
+    kashi_test_ops.functional_entries(monkeypatch)
+    return kashi_test_ops
+
+
+def test_rebuild_expands_functional_dummy(functional_write):
+    gm = rebuild_fx(_parse(FUNCTIONAL))
+
+    x, tag = gm.graph.find_nodes(op="placeholder")
+    empty, write = _call_nodes(gm)
+    assert (empty.target, empty.args, empty.kwargs) == (
+        torch.ops.aten.empty_like.default,
+        (x,),
+        {"memory_format": torch.contiguous_format},
+    )
+    assert (write.target, write.args, write.kwargs) == (
+        torch.ops.kashi_test.write.default,
+        (x, empty, tag),
+        {"dep": x},
+    )
+    (output,) = gm.graph.find_nodes(op="output")
+    assert output.args[0] is empty
+    x_val = torch.randn(3, 4)
+    torch.testing.assert_close(gm(x_val, functional_write.Tag(3.0)), x_val + 3.0)
+
+
+def test_rebuild_functional_dummy_rejects_unregistered_original(
+    functional_write, monkeypatch
+):
+    from kashi import functional
+
+    monkeypatch.setitem(
+        functional._FUNCTIONAL_OPS,
+        "kashi_test::missing",
+        functional.FunctionalForm("missing_functional", output="out", like="x"),
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match=r"Unsupported MLIR op torch\.operator.*no torch\.ops\.kashi_test\.missing\.default",
+    ):
+        rebuild_fx(_with_operator("torch.kashi.missing_functional"))
+
+
+def test_rebuild_functional_dummy_requires_one_result(functional_write):
+    src = FUNCTIONAL.replace(
+        "%0 = torch.operator", "torch.operator"
+    ).replace(
+        "!torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32>\n  return %0",
+        "!torch.vtensor<[?,4],f32>) -> ()\n  return %arg0",
+    )
+    with pytest.raises(NotImplementedError, match="expected 1 result, found 0"):
+        rebuild_fx(_parse(src))
