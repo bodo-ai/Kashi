@@ -11,18 +11,21 @@ from torch.utils import _pytree as pytree
 # --- Adapter: private PyTorch APIs used for schema-driven binding. ----------
 
 
-def _resolve_aten(op, name: str) -> torch._ops.OpOverload:
-    """``torch.aten.<name>[.<overload>]`` -> ``torch.ops.aten.<name>.<overload>``."""
-    base, _, overload = name.removeprefix("torch.aten.").partition(".")
+def _resolve(op, name: str) -> torch._ops.OpOverload:
+    """``torch.<ns>.<name>[.<overload>]`` -> ``torch.ops.<ns>.<name>.<overload>``."""
+    if not name.startswith("torch."):
+        raise _error(op, f"malformed operator name {name!r}")
+    namespace, _, rest = name.removeprefix("torch.").partition(".")
+    base, _, overload = rest.partition(".")
     overload = overload or "default"
-    packet = getattr(torch.ops.aten, base, None)
-    # The namespace object has its own attributes (e.g. ``name``); only an
-    # OpOverloadPacket is an operator.
+    # torch.ops creates namespaces on demand, and a namespace object has its
+    # own attributes (e.g. ``name``); only an OpOverloadPacket is an operator.
+    packet = getattr(getattr(torch.ops, namespace), base, None)
     if (
         not isinstance(packet, torch._ops.OpOverloadPacket)
         or overload not in packet.overloads()
     ):
-        raise _error(op, f"no torch.ops.aten.{base}.{overload}")
+        raise _error(op, f"no torch.ops.{namespace}.{base}.{overload}")
     return getattr(packet, overload)
 
 
@@ -69,10 +72,11 @@ def rebuild_fx(
     values = {}
 
     for i, arg in enumerate(block.arguments):
-        if not str(arg.type).startswith("!torch.vtensor"):
+        if not _supported_argument_type(str(arg.type)):
             raise NotImplementedError(
                 f"Unsupported block argument %arg{i} of type {arg.type}: "
-                "only !torch.vtensor arguments are supported"
+                "only !torch.vtensor, !torch.int and !torch.any arguments "
+                "are supported"
             )
         values[arg] = graph.placeholder(f"arg{i}")
 
@@ -85,7 +89,10 @@ def rebuild_fx(
         if name in _STRUCTURAL:
             results = _STRUCTURAL[name](graph, op, operands)
         elif name.startswith("torch.aten."):
-            results = [_aten(graph, op, name, operands)]
+            results = _call(graph, op, name, operands, max_results=1, min_results=1)
+        elif name == "torch.operator":
+            qualified = ir.StringAttr(op.attributes["name"]).value
+            results = _call(graph, op, qualified, operands, max_results=1)
         else:
             raise _error(op, "unsupported operation")
         for result, value in zip(op.results, results, strict=True):
@@ -112,10 +119,23 @@ def _main_block(module: ir.Module) -> ir.Block:
     return blocks[0]
 
 
-def _aten(graph, op, name, operands):
-    target = _resolve_aten(op, name)
-    if len(op.results) != 1:
-        raise _error(op, f"expected 1 result, found {len(op.results)}")
+def _supported_argument_type(type_str: str) -> bool:
+    return type_str.startswith("!torch.vtensor") or type_str in (
+        "!torch.int",
+        "!torch.any",
+    )
+
+
+def _call(graph, op, name, operands, *, max_results, min_results=0):
+    """Emit a call to the dispatcher operator ``name``, binding operands by
+    schema. An operator with no results is still emitted, exactly once."""
+    target = _resolve(op, name)
+    num_results = len(op.results)
+    if not min_results <= num_results <= max_results:
+        expected = (
+            f"{max_results}" if min_results == max_results else f"at most {max_results}"
+        )
+        raise _error(op, f"expected {expected} result, found {num_results}")
     arguments = _schema_arguments(target)
     if len(operands) != len(arguments):
         raise _error(
@@ -128,7 +148,8 @@ def _aten(graph, op, name, operands):
             kwargs[argument.name] = value
         else:
             args.append(value)
-    return graph.call_function(target, tuple(args), kwargs)
+    node = graph.call_function(target, tuple(args), kwargs)
+    return [node] if num_results else []
 
 
 def _output(op, operands, out_spec):
