@@ -30,16 +30,16 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.11.3
         id: pixi
         with:
-          pixi-version: v0.80.0
+          pixi-version: v0.82.0
           run-install: false
       - name: Install locked environment
         run: pixi install --locked
       - name: Python tests
         if: runner.os != 'Linux'
-        run: pixi run --locked -e vllm-mlir-cpu test-python
+        run: pixi run --locked test-python
       - name: Python tests with coverage
         if: runner.os == 'Linux'
-        run: pixi run --locked -e vllm-mlir-cpu coverage-python
+        run: pixi run --locked coverage-python
       - name: Native tests
         if: runner.os != 'Linux'
         run: pixi run --locked test-cpp

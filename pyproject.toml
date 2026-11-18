@@ -19,16 +19,17 @@ addopts = ["--import-mode=importlib"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
+requires-pixi = ">=0.82.0"
 platforms = [
-  "linux-64",
-  "osx-arm64",
-  "osx-64",
-  { name = "osx-arm64-vllm", platform = "osx-arm64", macos = "14.0" },
-  { name = "linux-64-vllm", platform = "linux-64", glibc = "2.39" },
+  { name = "linux-64-cuda", platform = "linux-64", cuda = { driver = "13.0", arch = "7.5" }, glibc = "2.39" },
+  { name = "linux-64-rocm", platform = "linux-64", amdgpu = true, glibc = "2.39" },
+  { name = "linux-64-cpu", platform = "linux-64", glibc = "2.39" },
+  { name = "osx-arm64-cpu", platform = "osx-arm64", macos = "14.0" },
 ]
 
 [tool.pixi.dependencies]
-python = "3.14.*"
+python = "3.12.*"
+setuptools = "==78.1.1"
 cxx-compiler = "*"
 cmake = ">=3.20"
 ninja = "*"
@@ -41,6 +42,9 @@ nanobind = ">=2"
 
 [tool.pixi.pypi-dependencies]
 kashi = { path = ".", editable = true }
+iree-base-compiler = "==3.14.0"
+iree-base-runtime = "==3.14.0"
+tabulate = "*"
 
 [tool.pixi.tasks]
 test-python = "python -m pytest"
@@ -52,7 +56,7 @@ test-mutation = "python scripts/test_mutation.py"
 data_file = "build/coverage/.coverage"
 
 [tool.pixi.feature.cpp-coverage]
-platforms = ["linux-64"]
+platforms = ["linux-64-cpu"]
 
 [tool.pixi.feature.cpp-coverage.dependencies]
 clangxx = "18.*"
@@ -62,25 +66,38 @@ llvm-tools = "18.*"
 [tool.pixi.feature.cpp-coverage.tasks]
 coverage-cpp = "python scripts/test_cpp.py --coverage"
 
-[tool.pixi.feature.vllm-cpu]
-platforms = ["osx-arm64-vllm", "linux-64-vllm"]
+[tool.pixi.pypi-options]
+extra-index-urls = ["https://wheels.vllm.ai/rocm/0.33.0/rocm100"]
 
-[tool.pixi.feature.vllm-cpu.pypi-dependencies]
-iree-base-compiler = "==3.14.0"
-iree-base-runtime = "==3.14.0"
-tabulate = "*"
 
-[tool.pixi.feature.vllm-cpu.target.osx-arm64-vllm.pypi-dependencies]
-torch = "==2.14.0"
+[tool.pixi.target.osx-arm64-cpu.pypi-dependencies]
+torch = { version = "==2.14.0", index = "https://pypi.org/simple" }
+torchvision = { version = "==0.29.2", index = "https://pypi.org/simple" }
+torchaudio = { version = "==2.11.1", index = "https://pypi.org/simple" }
 vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl" }
 
-[tool.pixi.feature.vllm-cpu.target.linux-64-vllm.pypi-dependencies]
+[tool.pixi.target.linux-64-cpu.activation.env]
+TRITON_DEFAULT_BACKEND = "cpu"
+
+[tool.pixi.target.linux-64-cpu.pypi-dependencies]
 torch = { version = "==2.14.0+cpu", index = "https://download.pytorch.org/whl/cpu" }
-# Required for vllm cpu wheel
 torchvision = { version = "==0.29.2+cpu", index = "https://download.pytorch.org/whl/cpu" }
 torchaudio = { version = "==2.11.1+cpu", index = "https://download.pytorch.org/whl/cpu" }
 vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0%2Bcpu-cp38-abi3-manylinux_2_39_x86_64.whl" }
 
+[tool.pixi.target.linux-64-cuda.pypi-dependencies]
+torch = { version = "==2.14.0+cu130", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.29.0+cu130", index = "https://download.pytorch.org/whl/cu130" }
+torchaudio = { version = "==2.11.0+cu130", index = "https://download.pytorch.org/whl/cu130" }
+triton = { version = "==3.8.0", index = "https://pypi.org/simple" }
+vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0-cp38-abi3-manylinux_2_28_x86_64.whl" }
+
+[tool.pixi.target.linux-64-rocm.pypi-dependencies]
+torch = { version = "==2.13.0+rocm10.0.0", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
+torchvision = { version = "==0.28.0+rocm10.0.0", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
+torchaudio = { version = "==2.11.0+rocm10.0.0", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
+triton = { version = "==3.8.0+git669b31ac", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
+vllm = { version = "==0.33.0+rocm100", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
+
 [tool.pixi.environments]
-vllm-mlir-cpu = ["vllm-cpu"]
 cpp-coverage = ["cpp-coverage"]
