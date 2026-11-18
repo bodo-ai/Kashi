@@ -29,10 +29,6 @@ def _resolve(op, name: str) -> torch._ops.OpOverload:
     return getattr(packet, overload)
 
 
-def _schema_arguments(overload: torch._ops.OpOverload):
-    return overload._schema.arguments
-
-
 # The importer encodes dtypes with this table; decoding with its inverse keeps
 # both directions in step.
 _INT_TO_DTYPE = {v: k for k, v in TORCH_DTYPE_TO_INT.items()}
@@ -136,7 +132,7 @@ def _call(graph, op, name, operands, *, max_results, min_results=0):
             f"{max_results}" if min_results == max_results else f"at most {max_results}"
         )
         raise _error(op, f"expected {expected} result, found {num_results}")
-    arguments = _schema_arguments(target)
+    arguments = target._schema.arguments
     if len(operands) != len(arguments):
         raise _error(
             op, f"expected {len(arguments)} operands, found {len(operands)}"

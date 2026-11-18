@@ -9,7 +9,7 @@ import operator
 from torch.utils import _pytree as pytree
 
 from kashi.importer import import_fx
-from kashi.rebuild import rebuild_fx
+from kashi.mlir_to_fx import rebuild_fx
 
 
 class _RecordVals(torch.fx.Interpreter):

@@ -6,7 +6,7 @@ import operator
 from iree.compiler import ir
 from torch.utils import _pytree as pytree
 
-from kashi.rebuild import rebuild_fx
+from kashi.mlir_to_fx import rebuild_fx
 
 
 def _parse(body: str) -> ir.Module:

@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from kashi.importer import import_fx
-from kashi.rebuild import rebuild_fx
+from kashi.mlir_to_fx import rebuild_fx
 
 
 def compile_fx(
