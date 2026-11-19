@@ -171,8 +171,11 @@ def _list_unpack(graph, op, operands):
     (src,) = operands
     if not isinstance(src, torch.fx.Node):
         raise _error(op, "only the result of an operation can be unpacked")
+    # Import specializes ListUnpack to the example length. Do not index unused
+    # elements: a later execution may produce a shorter dynamic split list.
     return [
-        graph.call_function(operator.getitem, (src, i)) for i in range(len(op.results))
+        graph.call_function(operator.getitem, (src, i)) if any(result.uses) else None
+        for i, result in enumerate(op.results)
     ]
 
 
@@ -182,6 +185,7 @@ _STRUCTURAL = {
     "torch.constant.float": _constant(ir.FloatAttr),
     "torch.constant.bool": _constant(ir.BoolAttr),
     "torch.constant.device": _constant(ir.StringAttr),
+    "torch.constant.str": _constant(ir.StringAttr),
     "torch.constant.none": lambda graph, op, operands: [None],
     "torch.prim.ListConstruct": lambda graph, op, operands: [list(operands)],
 }

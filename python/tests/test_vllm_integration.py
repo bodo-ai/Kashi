@@ -1,7 +1,6 @@
 """End-to-end: SimpleVllm through the real vLLM engine with and without the
 FX -> MLIR -> FX backend, using identical seeded weights."""
 
-import gc
 import json
 import sys
 from pathlib import Path
@@ -12,6 +11,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 import vllm_backend_spy
+from vllm_test_utils import assert_outputs_match, generate, vllm_test_environment
 
 # Weights are filled after load: vLLM's dummy weights (+-1e-3) make every
 # logprob identical in float32, so a comparison could not detect broken attention.
@@ -37,71 +37,24 @@ PROMPTS = [
 ]
 
 
-def _fill_weights(model):
-    generator = torch.Generator().manual_seed(WEIGHT_SEED)
-    with torch.no_grad():
-        for _, param in sorted(model.named_parameters()):
-            param.copy_(torch.randn(param.shape, generator=generator) * WEIGHT_SCALE)
-
-
-def _generate(model_dir, compilation_config):
-    from vllm import LLM, SamplingParams
-    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
-
-    llm = LLM(
-        model=str(model_dir),
-        skip_tokenizer_init=True,
-        load_format="dummy",
-        dtype="float32",
-        max_model_len=128,
-        seed=0,
-        compilation_config=compilation_config,
-        # The startup warmup compiles a random sampler that can abort in Triton
-        # on Linux CPU. This test exercises greedy decoding, not sampler warmup.
-        kernel_config={"enable_jit_warmup": False},
-    )
-    try:
-        llm.apply_model(_fill_weights)
-        outputs = llm.generate(
-            PROMPTS, SamplingParams(max_tokens=4, temperature=0, logprobs=5)
-        )
-        return [o.outputs[0] for o in outputs]
-    finally:
-        del llm
-        gc.collect()
-        cleanup_dist_env_and_memory()
-
-
 @pytest.fixture
 def model_dir(tmp_path, monkeypatch):
-    for name, value in {
-        "VLLM_USE_AOT_COMPILE": "0",  # needs a serializable backend result
-        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",  # keep the spy in-process
-        "VLLM_CPU_KVCACHE_SPACE": "1",
-        "VLLM_DISABLE_COMPILE_CACHE": "1",  # a cached graph would skip the backend
-    }.items():
-        monkeypatch.setenv(name, value)
-    # vLLM's sampler compiles a logprob helper with Inductor on CPU; Inductor's
-    # precompiled-header build fails with this macOS clang. Unrelated to kashi.
-    import torch._inductor.config
+    """Register the local model and provide its isolated vLLM configuration."""
+    with vllm_test_environment(monkeypatch, cpu_cache_space="1"):
+        sys.path.insert(0, str(Path(__file__).parent / "models"))
+        try:
+            from simple_vllm_model import SimpleVllmForCausalLM
+        finally:
+            sys.path.pop(0)
+        from vllm import ModelRegistry
 
-    monkeypatch.setattr(torch._inductor.config, "cpp_cache_precompile_headers", False)
-
-    sys.path.insert(0, str(Path(__file__).parent / "models"))
-    try:
-        from simple_vllm_model import SimpleVllmForCausalLM
-    finally:
-        sys.path.pop(0)
-    from vllm import ModelRegistry
-
-    ModelRegistry.register_model("SimpleVllmForCausalLM", SimpleVllmForCausalLM)
-    (tmp_path / "config.json").write_text(json.dumps(CONFIG))
-    vllm_backend_spy.CALLS.clear()
-    vllm_backend_spy.TOKEN_COUNTS.clear()
-    return tmp_path
+        ModelRegistry.register_model("SimpleVllmForCausalLM", SimpleVllmForCausalLM)
+        (tmp_path / "config.json").write_text(json.dumps(CONFIG))
+        yield tmp_path
 
 
 def _vllm_targets(gm):
+    """Return the vLLM attention targets in an FX graph."""
     ops = torch.ops.vllm
     attention = {
         ops.unified_kv_cache_update,
@@ -119,14 +72,28 @@ def _vllm_targets(gm):
 def test_vllm_matches_uncompiled_vllm(model_dir):
     from vllm.config import CompilationConfig, CompilationMode
 
-    compiled = _generate(
+    options = {
+        "weight_seed": WEIGHT_SEED,
+        "weight_scale": WEIGHT_SCALE,
+        "engine_options": {
+            "max_model_len": 128,
+            "gpu_memory_utilization": 0.5,
+            "seed": 0,
+        },
+        "sampling_options": {"max_tokens": 4, "temperature": 0, "logprobs": 5},
+    }
+    compiled = generate(
         model_dir,
         CompilationConfig(
             mode=CompilationMode.DYNAMO_TRACE_ONCE,
             backend="vllm_backend_spy.spy_compile_fx",
         ),
+        PROMPTS,
+        **options,
     )
-    reference = _generate(model_dir, CompilationConfig(mode=CompilationMode.NONE))
+    reference = generate(
+        model_dir, CompilationConfig(mode=CompilationMode.NONE), PROMPTS, **options
+    )
 
     # One capture serves batched prefill and decode, and is really rebuilt.
     assert len(vllm_backend_spy.CALLS) == 1
@@ -146,14 +113,8 @@ def test_vllm_matches_uncompiled_vllm(model_dir):
         vllm_ops.unified_attention_with_output.default,
     ]
 
-    for got, want in zip(compiled, reference, strict=True):
-        assert list(got.token_ids) == list(want.token_ids)
-        for token, got_step, want_step in zip(
-            want.token_ids, got.logprobs, want.logprobs, strict=True
-        ):
-            torch.testing.assert_close(
-                torch.tensor(got_step[token].logprob),
-                torch.tensor(want_step[token].logprob),
-            )
-            top = sorted((lp.logprob for lp in want_step.values()), reverse=True)
-            assert top[0] - top[1] > 1e-4, "near tie: comparison cannot discriminate"
+    assert_outputs_match(
+        compiled,
+        reference,
+        near_tie_message="near tie: comparison cannot discriminate",
+    )
