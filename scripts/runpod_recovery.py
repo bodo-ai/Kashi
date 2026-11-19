@@ -116,14 +116,10 @@ class Journal:
                 raise RecoveryError("invalid journal pod ID")
             for field in ("pending_pod_ids", "deleted_pod_ids"):
                 value = record.get(field, [])
-                if not isinstance(value, list) or not all(
-                    _valid_id(item) for item in value
-                ):
+                if not isinstance(value, list) or not all(_valid_id(item) for item in value):
                     raise RecoveryError("invalid journal pod ID list")
             if record["state"] == "not-sent" and (
-                record.get("pod_id")
-                or record.get("pending_pod_ids")
-                or record.get("deleted_pod_ids")
+                record.get("pod_id") or record.get("pending_pod_ids") or record.get("deleted_pod_ids")
             ):
                 raise RecoveryError("not-sent run has recorded pod IDs")
             if record["state"] == "created" and not record.get("pod_id"):
@@ -135,16 +131,12 @@ class Journal:
     def _save(self, records: list[dict]) -> None:
         """Replace the journal atomically and sync the file and parent directory."""
         _mkdir_private(self.path.parent)
-        fd, temp_name = tempfile.mkstemp(
-            prefix=".runpod-journal-", dir=self.path.parent
-        )
+        fd, temp_name = tempfile.mkstemp(prefix=".runpod-journal-", dir=self.path.parent)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as output:
                 fd = -1
-                json.dump(
-                    {"version": 1, "runs": records}, output, separators=(",", ":")
-                )
+                json.dump({"version": 1, "runs": records}, output, separators=(",", ":"))
                 output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
@@ -172,30 +164,20 @@ class Journal:
 
     def begin(self, run_id: str, name: str, expires_at: float, account: str) -> dict:
         """Persist a unique run record in the not-sent state before Pod creation."""
-        if not all(
-            isinstance(value, str) and value for value in (run_id, name, account)
-        ):
+        if not all(isinstance(value, str) and value for value in (run_id, name, account)):
             raise RecoveryError("run identity, name, and account must be nonempty")
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
             raise RecoveryError("expiration must be an absolute epoch time")
         if not 0 < expires_at < float("inf"):
             raise RecoveryError("expiration must be a finite positive epoch time")
         records = self._load()
-        if any(
-            record["run_id"] == run_id or record["name"] == name for record in records
-        ):
+        if any(record["run_id"] == run_id or record["name"] == name for record in records):
             raise RecoveryError("run ID and pod name must be unique")
         record = {
-            "run_id": run_id,
-            "name": name,
-            "account": account,
-            "expires_at": expires_at,
-            "started_at": time.time(),
-            "state": "not-sent",
-            "pod_id": None,
-            "last_error": None,
-            "pending_pod_ids": [],
-            "deleted_pod_ids": [],
+            "run_id": run_id, "name": name, "account": account,
+            "expires_at": expires_at, "started_at": time.time(),
+            "state": "not-sent", "pod_id": None, "last_error": None,
+            "pending_pod_ids": [], "deleted_pod_ids": [],
         }
         records.append(record)
         self._save(records)
@@ -267,22 +249,15 @@ def _retry_delay(value: str | None, attempt: int) -> float:
                 return max(0.0, date.timestamp() - time.time())
             except (TypeError, ValueError, OverflowError):
                 pass
-    return float(2**attempt)
+    return float(2 ** attempt)
 
 
 class RunpodAPI:
     """Minimal REST client with bounded safe retries and no POST retries."""
 
-    def __init__(
-        self,
-        api_key: str,
-        *,
-        base_url: str = "https://api.runpod.io/v2",
-        timeout: float = 20,
-        max_attempts: int = 4,
-        opener=urllib.request.urlopen,
-        sleep=time.sleep,
-    ):
+    def __init__(self, api_key: str, *, base_url: str = "https://api.runpod.io/v2",
+                 timeout: float = 20, max_attempts: int = 4,
+                 opener=urllib.request.urlopen, sleep=time.sleep):
         """Configure authenticated REST access, timeouts, and retry limits."""
         if not api_key or max_attempts < 1 or timeout <= 0:
             raise ValueError("API key, positive timeout and attempts are required")
@@ -298,23 +273,16 @@ class RunpodAPI:
         method = method.upper()
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("API paths must be relative to the configured endpoint")
-        data = (
-            None if body is None else json.dumps(body, separators=(",", ":")).encode()
-        )
-        headers = {
-            "Authorization": "Bearer " + self._api_key,
-            "Accept": "application/json",
-        }
+        data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+        headers = {"Authorization": "Bearer " + self._api_key, "Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(
-            self.base_url + path, data=data, headers=headers, method=method
-        )
+        request = urllib.request.Request(self.base_url + path, data=data, headers=headers, method=method)
         # Never retry a create: the first POST may have succeeded despite a
         # lost response. Reconcile against the journaled name instead.
         safe_to_retry = method in ("GET", "DELETE")
         for attempt in range(self.max_attempts):
-            delay = 2**attempt
+            delay = 2 ** attempt
             try:
                 with self._opener(request, timeout=self.timeout) as response:
                     payload = response.read()
@@ -328,14 +296,8 @@ class RunpodAPI:
                 status = exc.code
                 retry = safe_to_retry and (status == 429 or 500 <= status <= 599)
                 if not retry or attempt + 1 == self.max_attempts:
-                    raise APIError(
-                        f"Runpod API returned HTTP {status}", status=status
-                    ) from None
-                delay = (
-                    _retry_delay(exc.headers.get("Retry-After"), attempt)
-                    if status == 429
-                    else delay
-                )
+                    raise APIError(f"Runpod API returned HTTP {status}", status=status) from None
+                delay = _retry_delay(exc.headers.get("Retry-After"), attempt) if status == 429 else delay
             except (urllib.error.URLError, TimeoutError, OSError):
                 if not safe_to_retry or attempt + 1 == self.max_attempts:
                     raise APIError("Runpod API network request failed") from None
@@ -351,25 +313,15 @@ class RunpodAPI:
         cursor = None
         seen = set()
         while True:
-            path = (
-                "/pods"
-                if cursor is None
-                else "/pods?" + urllib.parse.urlencode({"cursor": cursor})
-            )
+            path = "/pods" if cursor is None else "/pods?" + urllib.parse.urlencode({"cursor": cursor})
             page = self.request("GET", path)
             if not isinstance(page, dict) or not isinstance(page.get("pods"), list):
                 raise APIError("invalid Runpod pod list")
             pagination = page.get("pagination")
-            if not isinstance(pagination, dict) or not isinstance(
-                pagination.get("hasNextPage"), bool
-            ):
+            if not isinstance(pagination, dict) or not isinstance(pagination.get("hasNextPage"), bool):
                 raise APIError("missing Runpod pagination metadata")
             for pod in page["pods"]:
-                if (
-                    not isinstance(pod, dict)
-                    or not _valid_id(pod.get("id"))
-                    or not isinstance(pod.get("name"), str)
-                ):
+                if not isinstance(pod, dict) or not _valid_id(pod.get("id")) or not isinstance(pod.get("name"), str):
                     raise APIError("invalid pod identity in Runpod list")
                 pods.append(pod)
             if not pagination["hasNextPage"]:
@@ -430,14 +382,10 @@ def reconcile(journal: Journal, api: RunpodAPI, account: str) -> list[dict]:
         # Record every target before deletion so a crash cannot lose a match.
         fields = {"pending_pod_ids": sorted(pending)}
         if matches and not record.get("pod_id"):
-            fields.update(pod_id=min(matches), state="created")
+            fields.update(pod_id=sorted(matches)[0], state="created")
         journal._update(run_id, **fields)
         if not pending and not deleted:
-            journal._update(
-                run_id,
-                last_error=listing_error
-                or "create outcome remains ambiguous; no matching pod visible",
-            )
+            journal._update(run_id, last_error=listing_error or "create outcome remains ambiguous; no matching pod visible")
             continue
         errors = [listing_error] if listing_error else []
         for pod_id in sorted(pending.copy()):
@@ -447,22 +395,15 @@ def reconcile(journal: Journal, api: RunpodAPI, account: str) -> list[dict]:
                 errors.append(f"termination of {pod_id} failed: {exc}")
                 continue
             if not confirmed:
-                errors.append(
-                    f"termination of {pod_id} unconfirmed (404 or inaccessible)"
-                )
+                errors.append(f"termination of {pod_id} unconfirmed (404 or inaccessible)")
                 continue
             pending.remove(pod_id)
             deleted.add(pod_id)
             # Persist each success so a later recovery doesn't mistake a 404
             # for an unconfirmed deletion of an already-confirmed ID.
-            journal._update(
-                run_id, pending_pod_ids=sorted(pending), deleted_pod_ids=sorted(deleted)
-            )
+            journal._update(run_id, pending_pod_ids=sorted(pending), deleted_pod_ids=sorted(deleted))
         if pending or listing_error:
-            journal._update(
-                run_id,
-                last_error="; ".join(errors) or "termination remains unconfirmed",
-            )
+            journal._update(run_id, last_error="; ".join(errors) or "termination remains unconfirmed")
         else:
             journal.remove(run_id)
     return journal.records()
