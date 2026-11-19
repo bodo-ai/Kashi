@@ -5,11 +5,10 @@ import sys
 import pytest
 
 torch = pytest.importorskip("torch")
-from torch._subclasses.fake_tensor import FakeTensorMode
 from iree.compiler import ir
+from kashi.mlir_to_fx import rebuild_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
-
-from kashi.rebuild import rebuild_fx
 
 # This operator marks a real mutable boundary without depending on vLLM's GPU
 # extensions; its input and destination must remain correctly ordered in FX.
@@ -31,7 +30,9 @@ def _graph_with_mutating_boundary():
     x = graph.placeholder("x")
     out = graph.placeholder("out")
     relu = graph.call_function(torch.ops.aten.relu.default, (x,))
-    write = graph.call_function(torch.ops.kashi_iree_integration.write.default, (out, relu))
+    write = graph.call_function(
+        torch.ops.kashi_iree_integration.write.default, (out, relu)
+    )
     neg = graph.call_function(torch.ops.aten.neg.default, (out,))
     graph.output({"result": (neg,)})
     with FakeTensorMode() as mode:
@@ -51,19 +52,27 @@ def _depends_on(node, source):
     )
 
 
-@pytest.mark.skipif(sys.platform == "darwin", reason="CUDA/PTX integration is not exercised on macOS")
+@pytest.mark.skipif(
+    sys.platform == "darwin", reason="CUDA/PTX integration is not exercised on macOS"
+)
 def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
     """Real CUDA compilation produces kernel calls around the mutating operator."""
     from kashi.iree_backend import compile_iree_fx
     from kashi.iree_reassembly import IreeKernel
 
-    compiled = compile_iree_fx(_graph_with_mutating_boundary(), output_dir=tmp_path, cuda_target="sm_80")
+    compiled = compile_iree_fx(
+        _graph_with_mutating_boundary(), output_dir=tmp_path, cuda_target="sm_80"
+    )
     assert compiled.ptx_files
     assert any(".entry" in path.read_text() for path in compiled.ptx_files)
     assert compiled.flow_ir.exists()
     calls = [node for node in compiled.graph.graph.nodes if node.op == "call_function"]
     kernels = [node for node in calls if isinstance(node.target, IreeKernel)]
-    (write,) = [node for node in calls if node.target is torch.ops.kashi_iree_integration.write.default]
+    (write,) = [
+        node
+        for node in calls
+        if node.target is torch.ops.kashi_iree_integration.write.default
+    ]
     before = [node for node in kernels if calls.index(node) < calls.index(write)]
     after = [node for node in kernels if calls.index(node) > calls.index(write)]
     assert any(_depends_on(write.args[1], node) for node in before)
@@ -72,7 +81,9 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
         name = f"module_{node.target.executable}_cuda_nvptx_fb.ptx"
         ptx = next(path for path in compiled.ptx_files if path.name == name)
         assert f".entry {node.target.export.replace('$', '_')}" in ptx.read_text()
-    output = next(node for node in compiled.graph.graph.nodes if node.op == "output").args[0]
+    output = next(
+        node for node in compiled.graph.graph.nodes if node.op == "output"
+    ).args[0]
     assert isinstance(output, dict) and isinstance(output["result"], tuple)
     with pytest.raises(NotImplementedError, match="opaque"):
         compiled.graph(torch.ones(4, 8), torch.empty(4, 8))

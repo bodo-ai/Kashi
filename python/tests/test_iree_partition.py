@@ -2,9 +2,7 @@
 
 import pytest
 from iree.compiler import ir
-
 from kashi.iree_partition import partition_at_custom_ops
-
 
 TENSOR = "!torch.vtensor<[4],f32>"
 
@@ -87,9 +85,24 @@ module {
     result = partition_at_custom_ops(source)
     assert result.module.operation.verify() and result.driver.operation.verify()
     ops = [op for op in _ops(_main(result.driver)) if op.name != "func.return"]
-    assert [op.name for op in ops] == ["func.call", "torch.operator", "torch.operator", "func.call", "torch.operator"]
-    assert [ir.StringAttr(ops[i].attributes["name"]).value for i in (1, 2, 4)] == ["torch.test.first", "torch.test.second", "torch.test.third"]
-    assert ops[1].operands[0] == ops[2].operands[0] == ops[3].operands[0] == ops[0].results[0]
+    assert [op.name for op in ops] == [
+        "func.call",
+        "torch.operator",
+        "torch.operator",
+        "func.call",
+        "torch.operator",
+    ]
+    assert [ir.StringAttr(ops[i].attributes["name"]).value for i in (1, 2, 4)] == [
+        "torch.test.first",
+        "torch.test.second",
+        "torch.test.third",
+    ]
+    assert (
+        ops[1].operands[0]
+        == ops[2].operands[0]
+        == ops[3].operands[0]
+        == ops[0].results[0]
+    )
     assert ops[4].operands[0] == ops[3].results[0]
 
 
@@ -201,10 +214,12 @@ def test_cpu_device_is_reported_without_rewriting():
 
 def test_multiple_source_devices_are_rejected():
     """A single device field cannot faithfully describe a mixed-device graph."""
-    source = _parse(MUTATION.replace(
-        '%device = torch.constant.device "cuda:0"',
-        '%device = torch.constant.device "cuda:0"\n    %cpu = torch.constant.device "cpu"',
-    ))
+    source = _parse(
+        MUTATION.replace(
+            '%device = torch.constant.device "cuda:0"',
+            '%device = torch.constant.device "cuda:0"\n    %cpu = torch.constant.device "cpu"',
+        )
+    )
     with pytest.raises(NotImplementedError, match="multiple source devices"):
         partition_at_custom_ops(source)
 

@@ -9,8 +9,7 @@ pytest.importorskip("iree.compiler")
 
 from kashi.iree_reassembly import IreeKernel, flow_segment_handlers
 
-
-SHAPES = r'''
+SHAPES = r"""
 module {
   util.func public @segment_0$async(%arg0: !hal.buffer_view, %wait: !hal.fence, %signal: !hal.fence) -> (!hal.buffer_view, !hal.buffer_view) {
     %d = hal.buffer_view.dim<%arg0 : !hal.buffer_view>[0] : index
@@ -25,7 +24,7 @@ module {
     util.return %x, %y : !hal.buffer_view, !hal.buffer_view
   }
 }
-'''
+"""
 
 
 def test_dynamic_shape_reshape_empty_and_barrier():
@@ -43,7 +42,7 @@ def test_dynamic_shape_reshape_empty_and_barrier():
     assert empty.dtype == torch.float32 and empty.device.type == "cpu"
 
 
-DISPATCH = r'''
+DISPATCH = r"""
 module {
   util.func public @segment_1$async(%a: tensor<4xf32>, %b: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
     %w = arith.constant 4 : index
@@ -51,7 +50,7 @@ module {
     util.return %r#0, %r#1 : tensor<4xf32>, tensor<4xf32>
   }
 }
-'''
+"""
 
 
 def test_dispatch_workload_metadata_multiresult_and_stable_kernel():
@@ -84,12 +83,12 @@ def test_tied_dispatch_is_rejected():
 
 def test_unsupported_operation_is_named():
     """Unknown flow operations must not disappear during reconstruction."""
-    text = r'''module {
+    text = r"""module {
       util.func public @segment_2$async(%a: index) -> index {
         %r = arith.addi %a, %a : index
         util.return %r : index
       }
-    }'''
+    }"""
     handler = flow_segment_handlers(text, device=None)["segment_2"]
     graph = torch.fx.Graph()
     with pytest.raises(NotImplementedError, match="arith.addi"):
