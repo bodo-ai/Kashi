@@ -36,6 +36,21 @@ All variants use vLLM 0.33.0 and IREE compiler/runtime 3.14.0. Python 3.12 and t
 
 Use `pixi info` to inspect the selected platform. To select a specific compatible variant, pass `--platform`, for example `pixi run --locked --platform linux-64-cpu test-python`.
 
+## Formatting and linting
+
+Run all check-only tasks with `pixi run --locked lint`. The Linux CI job
+runs the same command on pushes and pull requests.
+
+| Language | Rewrite formatting | Check formatting | Lint |
+| --- | --- | --- | --- |
+| Python (`python/`, `scripts/`) | `pixi run --locked format-python` | `pixi run --locked check-format-python` | `pixi run --locked lint-python` |
+| C++ (`cpp/`) | `pixi run --locked format-cpp` | `pixi run --locked check-format-cpp` | `pixi run --locked lint-cpp` |
+
+Ruff handles Python formatting and linting. C++ uses clang-format with
+LLVM style and clang-tidy on the project targets in `build/lint-cpp/`.
+Clang-tidy checks headers included by those targets and treats reported
+warnings as errors.
+
 ## Tests
 
 The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.

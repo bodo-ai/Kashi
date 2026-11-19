@@ -20,5 +20,7 @@ def compile_fx(
     ``forward``. Errors propagate; there is no fallback to ``gm``."""
     imported = import_fx(gm)
     if not imported.module.operation.verify():
-        raise RuntimeError(f"Verification failed for imported module:\n{imported.module}")
+        raise RuntimeError(
+            f"Verification failed for imported module:\n{imported.module}"
+        )
     return rebuild_fx(imported.module, imported.out_spec).forward

@@ -17,6 +17,12 @@ testpaths = ["python/tests"]
 pythonpath = ["python/tests"]
 addopts = ["--import-mode=importlib"]
 
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 requires-pixi = ">=0.82.0"
@@ -39,6 +45,9 @@ pytest = "*"
 pytest-cov = ">=7.1"
 catch2 = ">=3,<4"
 nanobind = ">=2"
+ruff = "*"
+clang-tools = "21.*"
+clangxx = "21.*"
 
 [tool.pixi.pypi-dependencies]
 kashi = { path = ".", editable = true }
@@ -51,6 +60,21 @@ test-python = "python -m pytest"
 coverage-python = "python -m pytest --cov=kashi --cov-branch --cov-report=term-missing --cov-report=xml:build/coverage/python.xml --cov-report=markdown:build/coverage/python.md"
 test-cpp = "python scripts/test_cpp.py"
 test-mutation = "python scripts/test_mutation.py"
+format-python = "ruff format python scripts"
+check-format-python = "ruff format --check python scripts"
+lint-python = "ruff check python scripts"
+format-cpp = '''bash -c 'find cpp -type f \( -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" -o -name "*.h" -o -name "*.hh" -o -name "*.hpp" -o -name "*.hxx" \) -exec clang-format -i {} +' '''
+check-format-cpp = '''bash -c 'find cpp -type f \( -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" -o -name "*.h" -o -name "*.hh" -o -name "*.hpp" -o -name "*.hxx" \) -exec clang-format --dry-run --Werror {} +' '''
+lint-cpp = '''
+bash -c 'set -e
+nanobind_dir=$(python -m nanobind --cmake_dir)
+cmake -S . -B build/lint-cpp -G Ninja \
+    -DCMAKE_CXX_COMPILER=clang++ -DKASHI_BUILD_TESTS=ON -DKASHI_LINT=ON \
+    -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+    -Dnanobind_DIR="$nanobind_dir" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
+cmake --build build/lint-cpp --clean-first'
+'''
+lint = { depends-on = ["check-format-python", "lint-python", "check-format-cpp", "lint-cpp"] }
 
 [tool.coverage.run]
 data_file = "build/coverage/.coverage"
@@ -59,9 +83,8 @@ data_file = "build/coverage/.coverage"
 platforms = ["linux-64-cpu"]
 
 [tool.pixi.feature.cpp-coverage.dependencies]
-clangxx = "18.*"
-compiler-rt = "18.*"
-llvm-tools = "18.*"
+compiler-rt = "21.*"
+llvm-tools = "21.*"
 
 [tool.pixi.feature.cpp-coverage.tasks]
 coverage-cpp = "python scripts/test_cpp.py --coverage"

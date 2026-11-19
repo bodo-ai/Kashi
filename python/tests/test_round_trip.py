@@ -2,15 +2,15 @@
 original computes, with the same output structure."""
 
 import pytest
+
 torch = pytest.importorskip("torch")
 
 import operator
 
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.utils import _pytree as pytree
-
 from kashi.importer import import_fx
 from kashi.rebuild import rebuild_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils import _pytree as pytree
 
 
 class _RecordVals(torch.fx.Interpreter):
@@ -69,7 +69,9 @@ def _functional_embedding():
 
 def _aten_view():
     def build(g):
-        return g.call_function(torch.ops.aten.view.default, (g.placeholder("x"), [3, 2]))
+        return g.call_function(
+            torch.ops.aten.view.default, (g.placeholder("x"), [3, 2])
+        )
 
     return _graph_module(build, [torch.randn(2, 3)])
 
@@ -104,7 +106,9 @@ def _size_feeding_empty():
     def build(g):
         size = g.call_function(torch.Size, ([2, 3],))
         return g.call_function(
-            torch.empty, (size,), {"dtype": torch.float32, "device": torch.device("cpu")}
+            torch.empty,
+            (size,),
+            {"dtype": torch.float32, "device": torch.device("cpu")},
         )
 
     return _graph_module(build, [])

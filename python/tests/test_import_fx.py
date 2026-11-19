@@ -1,13 +1,14 @@
 import pytest
+
 torch = pytest.importorskip("torch")
 
 import operator
 import re
 
+from kashi.importer import import_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
 
-from kashi.importer import import_fx
 
 @pytest.mark.parametrize(
     "linear",
@@ -225,9 +226,7 @@ def test_import_fx_symbolic_size_feeding_empty():
     assert "!torch.vtensor<[?,4],f32>" in signature
     sym_arg = signature.split("@main(")[1].split(",")
     sym_arg = next(a.split(":")[0].strip() for a in sym_arg if "!torch.int" in a)
-    assert re.search(
-        rf"torch\.prim\.ListConstruct {re.escape(sym_arg)}, %int4\b", text
-    )
+    assert re.search(rf"torch\.prim\.ListConstruct {re.escape(sym_arg)}, %int4\b", text)
     assert re.search(
         r"torch\.aten\.empty\.memory_format .* -> !torch\.vtensor<\[\?,4\],f32>", text
     )
@@ -254,10 +253,16 @@ def test_import_fx_rejects_multi_overload_packet():
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
     with FakeTensorMode():
-        for node, value in [(a, torch.randn(2)), (b, torch.randn(2)), (y, torch.randn(2))]:
+        for node, value in [
+            (a, torch.randn(2)),
+            (b, torch.randn(2)),
+            (y, torch.randn(2)),
+        ]:
             node.meta["val"] = value
 
-    with pytest.raises(NotImplementedError, match="Ambiguous overload packet.*aten.add"):
+    with pytest.raises(
+        NotImplementedError, match="Ambiguous overload packet.*aten.add"
+    ):
         import_fx(gm)
 
 

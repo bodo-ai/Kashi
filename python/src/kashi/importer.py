@@ -7,7 +7,6 @@ import torch
 from iree.compiler import ir
 from iree.compiler.extras.fx_importer import ContextCache, FxImporter, IrType
 from torch._library.fake_class_registry import FakeScriptObject
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
 
 
@@ -45,9 +44,7 @@ class _OpaqueContextCache(ContextCache):
     def value_info_to_type(self, val, *, tensor_meta=None, mutable=False):
         if isinstance(val, FakeScriptObject):
             return IrType.parse("!torch.any", self._c)
-        return super().value_info_to_type(
-            val, tensor_meta=tensor_meta, mutable=mutable
-        )
+        return super().value_info_to_type(val, tensor_meta=tensor_meta, mutable=mutable)
 
 
 def _use_opaque_types(importer: FxImporter) -> None:
@@ -106,9 +103,7 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
         if isinstance(target, torch._ops.OpOverload) or target is operator.getitem:
             return
         if target is torch._C._nn.linear:
-            _replace(
-                graph, node, torch.ops.aten.linear.default, node.args, node.kwargs
-            )
+            _replace(graph, node, torch.ops.aten.linear.default, node.args, node.kwargs)
             return
         if target is torch.nn.functional.embedding:
             _rewrite_embedding(graph, node)
@@ -227,8 +222,7 @@ def _is_symint(value) -> bool:
 
 
 def _replace(graph: torch.fx.Graph, node: torch.fx.Node, target, args, kwargs) -> None:
-    """Replace an FX node with a call_function node targeting an ATen operator.
-    """
+    """Replace an FX node with a call_function node targeting an ATen operator."""
     with graph.inserting_before(node):
         # FxImporter does not support call_method nodes.
         new = graph.call_function(target, tuple(args), dict(kwargs))
