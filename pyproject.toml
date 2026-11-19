@@ -48,6 +48,7 @@ nanobind = ">=2"
 ruff = "*"
 clang-tools = "21.*"
 clangxx = "21.*"
+pre-commit = ">=4.7.0,<5"
 
 [tool.pixi.pypi-dependencies]
 kashi = { path = ".", editable = true }
