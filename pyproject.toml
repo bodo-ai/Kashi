@@ -18,7 +18,6 @@ pythonpath = ["python/tests"]
 addopts = ["--import-mode=importlib", "--strict-markers"]
 markers = [
   "integration: runs a real vLLM engine end to end (deselect with -m 'not integration')",
-  "slow: runs subprocesses or otherwise takes seconds (deselect with -m 'not slow')",
 ]
 
 [tool.ruff]
