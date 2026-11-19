@@ -10,12 +10,16 @@ TOKEN_COUNTS = []
 
 def spy_compile_fx(gm, example_inputs):
     fn = compile_fx(gm, example_inputs)
+    # Models can have multiple symbolic integer inputs (tokens and positions).
+    # Count the actual input IDs instead of guessing which integer is the batch.
+    placeholders = list(gm.graph.find_nodes(op="placeholder"))
+    (input_index,) = [
+        i for i, node in enumerate(placeholders) if "input_ids" in node.name.lower()
+    ]
     CALLS.append((gm, fn))
 
     def run(*args):
-        # The captured graph's only int input is the symbolic token count.
-        (count,) = [a for a in args if type(a) is int]
-        TOKEN_COUNTS.append(count)
+        TOKEN_COUNTS.append(args[input_index].shape[0])
         return fn(*args)
 
     return run
