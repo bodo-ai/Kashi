@@ -11,8 +11,11 @@ from vllm_test_utils import (
     QWEN_PROMPTS,
     assert_outputs_match,
     generate_qwen,
-    model_dir, #noqa
+    model_dir,
 )
+
+# Pytest discovers the imported fixture by name; expose that use to Ruff.
+__all__ = ["model_dir"]
 
 
 def test_qwen3_generation_matches_uncompiled_vllm(model_dir):
