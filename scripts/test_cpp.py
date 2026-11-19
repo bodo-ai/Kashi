@@ -58,6 +58,11 @@ def report_coverage(profile_dir: Path, build_dir: Path) -> None:
     print(summary, end="")
     (REPORT_DIR / "cpp.txt").write_text(summary)
     (REPORT_DIR / "cpp.json").write_text(exported)
+    (REPORT_DIR / "cpp.lcov").write_bytes(
+        subprocess.check_output(
+            ["llvm-cov", "export", "--format=lcov", *args], cwd=ROOT
+        )
+    )
 
 
 def main() -> int:
@@ -72,7 +77,7 @@ def main() -> int:
         build_env = None
         if coverage:
             REPORT_DIR.mkdir(parents=True, exist_ok=True)
-            for name in ("cpp.txt", "cpp.json"):
+            for name in ("cpp.txt", "cpp.json", "cpp.lcov"):
                 (REPORT_DIR / name).unlink(missing_ok=True)
             cmake_args = [
                 "-G",

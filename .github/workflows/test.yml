@@ -38,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
           persist-credentials: false
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
@@ -81,6 +82,12 @@ jobs:
               if not path.is_relative_to(environment):
                   raise RuntimeError(f"{module.__name__} was not imported from the wheel environment")
           PY
+      - name: Require more than 90% changed-line coverage
+        if: runner.os == 'Linux' && github.event_name == 'pull_request'
+        shell: bash
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/check_diff_coverage.py "$DIFF_BASE" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Summarize coverage
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.pixi.outcome == 'success' }}
         run: |
@@ -114,4 +121,5 @@ jobs:
             build/coverage/python.xml
             build/coverage/cpp.txt
             build/coverage/cpp.json
+            build/coverage/cpp.lcov
           if-no-files-found: warn
