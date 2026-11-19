@@ -36,6 +36,51 @@ All variants use vLLM 0.33.0 and IREE compiler/runtime 3.14.0. Python 3.12 and t
 
 Use `pixi info` to inspect the selected platform. To select a specific compatible variant, pass `--platform`, for example `pixi run --locked --platform linux-64-cpu test-python`.
 
+## Formatting and linting
+
+Run all check-only tasks with `pixi run --locked lint`. The Linux CI job
+runs the same command on pushes and pull requests.
+
+| Language | Rewrite formatting | Check formatting | Lint |
+| --- | --- | --- | --- |
+| Python (`python/`, `scripts/`) | `pixi run --locked format-python` | `pixi run --locked check-format-python` | `pixi run --locked lint-python` |
+| C++ (`cpp/`) | `pixi run --locked format-cpp` | `pixi run --locked check-format-cpp` | `pixi run --locked lint-cpp` |
+
+Ruff handles Python formatting and linting. C++ uses clang-format with
+LLVM style and clang-tidy on the project targets in `build/lint-cpp/`.
+Clang-tidy checks headers included by those targets and treats reported
+warnings as errors.
+
+## Qwen3 with vLLM
+
+Use the FX-to-MLIR-to-FX backend with vLLM's Qwen3 models. This example uses
+dummy weights.
+
+```sh
+VLLM_USE_AOT_COMPILE=0 VLLM_ENABLE_V1_MULTIPROCESSING=0 pixi run python - <<'PY'
+from vllm import LLM, SamplingParams
+from vllm.config import CompilationConfig, CompilationMode
+
+llm = LLM(
+    model="Qwen/Qwen3-0.6B",
+    load_format="dummy",
+    seed=42,
+    max_model_len=128,
+    kv_cache_memory_bytes=256 * 1024 * 1024,
+    compilation_config=CompilationConfig(
+        mode=CompilationMode.DYNAMO_TRACE_ONCE,
+        backend="kashi.backend.compile_fx",
+    ),
+)
+print(llm.generate(["Hello, my name is"], SamplingParams(max_tokens=4, temperature=0))[0].outputs[0].text)
+PY
+```
+
+The backend runs the rebuilt FX graph in PyTorch.
+The importer supports dtype-only `Tensor.to(dtype)` conversions, including the
+casts captured in CPU Qwen3 graphs; device and tensor overloads are not supported.
+CPU RMS normalization and gated-activation operations are also normalized to ATen.
+
 ## Tests
 
 The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.
@@ -101,6 +146,52 @@ Mutation testing requires Clang 19 and Mull 0.36.0 with its LLVM 19 frontend
 plugin; see `.github/workflows/mutation.yml` for the pinned Linux installation.
 Use the scheduled or manually dispatched Linux workflow when the toolchain is
 unavailable locally.
+
+## Runpod MI300X benchmark
+
+`scripts/runpod_benchmark.py` runs the workload described in
+[`specs/runpod-mi300x-vllm-benchmark.md`](specs/runpod-mi300x-vllm-benchmark.md).
+It uses Python 3.10 or newer and does not require a local GPU or Docker.
+It creates billable Pods; neither the deadline nor the cost estimate is a
+hard spending cap. Consider a dedicated prepaid account with auto-pay disabled
+and limited credits. The optional `HF_TOKEN` is sent in the Pod environment,
+which is visible to users with account or API access.
+
+```sh
+export RUNPOD_API_KEY=...
+python scripts/runpod_benchmark.py run --output-dir ./results
+python scripts/runpod_benchmark.py run --profile --output-dir ./results
+```
+
+
+To wait for availability locally, add `--wait-for-capacity MINUTES` to
+`run`. The wait is bounded and occurs before Pod creation;
+the benchmark's own deadline starts afterward. The catalog does not reserve
+capacity, so placement can still fail. No Runpod queued deployment is created.
+
+The command defaults to MI300X, then MI350X when the first
+is unavailable. Override the order with, for example:
+
+```sh
+python scripts/runpod_benchmark.py run --gpu 'AMD Instinct MI350 OAM' 'AMD Instinct MI300X OAM'
+```
+
+Selection uses a catalog snapshot and does not reserve a GPU. A rejected or
+ambiguous create is not retried on another GPU. Prices may differ by GPU.
+
+On interruption or host loss, run `python scripts/runpod_benchmark.py recover`
+before another paid run. The controller also reconciles its durable local
+journal automatically at startup. If cleanup cannot be confirmed, inspect
+and terminate the exact Pod in the [Runpod console](https://www.runpod.io/console/pods).
+After independently verifying termination, clear an unresolved entry with
+`python scripts/runpod_benchmark.py attest RUN_ID --name EXACT_POD_NAME`.
+The watchdog cannot stop a Pod whose container never starts or whose API is
+unreachable; such a Pod may continue billing until manually terminated.
+
+The output directory contains a `.tar.gz` artifact and a JSON cleanup sidecar.
+Inspect the manifest and benchmark JSON with `tar -xzf FILE.tar.gz` and a JSON
+viewer. Open compressed profiling traces directly in [Perfetto](https://ui.perfetto.dev/).
+Files marked `partial` are diagnostics, not successful benchmark results.
 
 ## Layout
 

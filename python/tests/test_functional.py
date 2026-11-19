@@ -1,9 +1,9 @@
 import pytest
+
 torch = pytest.importorskip("torch")
 
-from torch._subclasses.fake_tensor import FakeTensorMode
-
 from kashi import functional
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 WRITE = functional.FunctionalForm("write_functional", output="out", like="x")
 

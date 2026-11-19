@@ -61,9 +61,7 @@ def dummy_op(op: torch._ops.OpOverload, form: FunctionalForm) -> torch._ops.OpOv
     Tensor. It has a fake implementation only."""
     if not hasattr(torch.ops.kashi, form.dummy):
         _LIB.define(_dummy_schema(op, form))
-        torch.library.register_fake(
-            f"kashi::{form.dummy}", _fake_impl(form), lib=_LIB
-        )
+        torch.library.register_fake(f"kashi::{form.dummy}", _fake_impl(form), lib=_LIB)
     return getattr(torch.ops.kashi, form.dummy).default
 
 

@@ -34,7 +34,9 @@ _TAG = get_opaque_type_name(Tag)
 
 LIB.define(f"scale(Tensor x, {_TAG} tag) -> Tensor")
 LIB.define(f"write(Tensor x, Tensor(a!) out, {_TAG} tag, *, Tensor dep) -> ()")
-LIB.define("write_scaled(Tensor x, Tensor(a!) out, Tensor(b!)? block_scale, *, Tensor dep) -> ()")
+LIB.define(
+    "write_scaled(Tensor x, Tensor(a!) out, Tensor(b!)? block_scale, *, Tensor dep) -> ()"
+)
 
 
 def _scale(x, tag):
@@ -52,8 +54,12 @@ def _write_scaled(x, out, block_scale, *, dep):
 LIB.impl("scale", _scale, "CompositeExplicitAutograd")
 LIB.impl("write", _write, "CompositeExplicitAutograd")
 LIB.impl("write_scaled", _write_scaled, "CompositeExplicitAutograd")
-torch.library.register_fake("kashi_test::scale", lambda x, tag: torch.empty_like(x), lib=LIB)
-torch.library.register_fake("kashi_test::write", lambda x, out, tag, *, dep: None, lib=LIB)
+torch.library.register_fake(
+    "kashi_test::scale", lambda x, tag: torch.empty_like(x), lib=LIB
+)
+torch.library.register_fake(
+    "kashi_test::write", lambda x, out, tag, *, dep: None, lib=LIB
+)
 torch.library.register_fake(
     "kashi_test::write_scaled", lambda x, out, block_scale, *, dep: None, lib=LIB
 )

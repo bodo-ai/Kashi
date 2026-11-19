@@ -1,12 +1,12 @@
 import pytest
+
 torch = pytest.importorskip("torch")
 
 import operator
 
 from iree.compiler import ir
+from kashi.mlir_to_fx import rebuild_fx
 from torch.utils import _pytree as pytree
-
-from kashi.rebuild import rebuild_fx
 
 
 def _parse(body: str) -> ir.Module:
@@ -206,6 +206,23 @@ def test_rebuild_chunk():
     torch.testing.assert_close((a, b), x.chunk(2, dim=-1))
 
 
+def test_rebuild_ignores_unused_split_results_for_shorter_input():
+    """Unused unpacked split elements must not index beyond a shorter result."""
+    # FX import specializes ListUnpack to the example's chunk count, but
+    # a dynamic input can have fewer chunks while the first is still valid.
+    module = _parse("""
+func.func @main(%arg0: !torch.vtensor<[1,?],f32>) -> !torch.vtensor<[1,?],f32> {
+  %size = torch.constant.int 2
+  %dim = torch.constant.int 1
+  %chunks = torch.aten.split.Tensor %arg0, %size, %dim : !torch.vtensor<[1,?],f32>, !torch.int, !torch.int -> !torch.list<vtensor>
+  %first, %unused = torch.prim.ListUnpack %chunks : !torch.list<vtensor> -> !torch.vtensor<[1,?],f32>, !torch.vtensor<[1,?],f32>
+  return %first : !torch.vtensor<[1,?],f32>
+}
+""")
+    x = torch.tensor([[3.0]])
+    torch.testing.assert_close(rebuild_fx(module)(x), x.split(2, dim=1)[0])
+
+
 UNPACK_LITERAL_LIST = """
 func.func @main(%arg0: !torch.vtensor<[2],f32>) -> !torch.int {
   %int1 = torch.constant.int 1
@@ -222,7 +239,12 @@ def test_rebuild_rejects_unpack_of_literal_list():
 
 
 def _empty(dtype="%int5", layout="%none", memory_format="%none"):
-    types = {"%int5": "!torch.int", "%int99": "!torch.int", "%int0": "!torch.int", "%none": "!torch.none"}
+    types = {
+        "%int5": "!torch.int",
+        "%int99": "!torch.int",
+        "%int0": "!torch.int",
+        "%none": "!torch.none",
+    }
     return f"""
 func.func @main() -> !torch.vtensor<[2,3],f16> {{
   %int2 = torch.constant.int 2
@@ -360,6 +382,22 @@ def test_rebuild_zero_result_operator_runs_once(test_ops):
     torch.testing.assert_close(d, x * 2.0)
 
 
+def test_rebuild_custom_operator_with_string_argument():
+    """Rebuilt custom operators receive their original string constants."""
+    # Qwen3 custom ops can carry layer names as string constants.
+    module = _parse("""
+func.func @main(%arg0: !torch.vtensor<[3],f32>) -> !torch.vtensor<[3],f32> {
+  %mode = torch.constant.str "tanh"
+  %0 = torch.operator "torch.aten.gelu"(%arg0, %mode) : (!torch.vtensor<[3],f32>, !torch.str) -> !torch.vtensor<[3],f32>
+  return %0 : !torch.vtensor<[3],f32>
+}
+""")
+    x = torch.tensor([-1.0, 0.5, 2.0])
+    torch.testing.assert_close(
+        rebuild_fx(module)(x), torch.nn.functional.gelu(x, approximate="tanh")
+    )
+
+
 def _with_operator(name):
     return _parse(f"""
 func.func @main(%arg0: !torch.vtensor<[2],f32>, %arg1: !torch.any) -> !torch.vtensor<[2],f32> {{
@@ -379,7 +417,9 @@ func.func @main(%arg0: !torch.vtensor<[2],f32>, %arg1: !torch.any) -> !torch.vte
     ids=["unknown-op", "unknown-namespace", "unknown-overload"],
 )
 def test_rebuild_rejects_unresolvable_operator(test_ops, name, match):
-    with pytest.raises(NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"):
+    with pytest.raises(
+        NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"
+    ):
         rebuild_fx(_with_operator(name))
 
 
@@ -440,9 +480,7 @@ def test_rebuild_functional_dummy_rejects_unregistered_original(
 
 
 def test_rebuild_functional_dummy_requires_one_result(functional_write):
-    src = FUNCTIONAL.replace(
-        "%0 = torch.operator", "torch.operator"
-    ).replace(
+    src = FUNCTIONAL.replace("%0 = torch.operator", "torch.operator").replace(
         "!torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32>\n  return %0",
         "!torch.vtensor<[?,4],f32>) -> ()\n  return %arg0",
     )

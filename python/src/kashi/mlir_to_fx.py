@@ -9,12 +9,20 @@ from torch.utils import _pytree as pytree
 
 from kashi.functional import functional_original
 
-
 # --- Adapter: private PyTorch APIs used for schema-driven binding. ----------
 
 
 def _resolve(op, name: str) -> torch._ops.OpOverload:
-    """``torch.<ns>.<name>[.<overload>]`` -> ``torch.ops.<ns>.<name>.<overload>``."""
+    """Resolve an MLIR operator name to a callable PyTorch OpOverload.
+
+    For example:
+        "torch.aten.linear" -> torch.ops.aten.linear.default
+        "torch.aten.add.Tensor" -> torch.ops.aten.add.Tensor
+        "torch.vllm.unified_kv_cache_update" ->
+            torch.ops.vllm.unified_kv_cache_update.default
+
+    If no overload is specified, assume "default".
+    """
     if not name.startswith("torch."):
         raise _error(op, f"malformed operator name {name!r}")
     namespace, _, rest = name.removeprefix("torch.").partition(".")
@@ -31,18 +39,24 @@ def _resolve(op, name: str) -> torch._ops.OpOverload:
     return getattr(packet, overload)
 
 
-def _schema_arguments(overload: torch._ops.OpOverload):
-    return overload._schema.arguments
-
-
 # The importer encodes dtypes with this table; decoding with its inverse keeps
 # both directions in step.
 _INT_TO_DTYPE = {v: k for k, v in TORCH_DTYPE_TO_INT.items()}
 
 
 def _decode(argument, value, op):
-    """Decode an operand by its schema type. ``Argument.type`` reports enum
-    types such as ``ScalarType`` as ``int``; ``real_type`` keeps them."""
+    """Decode literals representing PyTorch-specific argument types.
+
+    For example (MLIR types omitted):
+        %dtype = torch.constant.int 5
+        %cpu = torch.constant.device "cpu"
+        %y = torch.aten.empty.memory_format %size, %dtype, %none,
+            %cpu, %none, %none
+
+    The operator schema tells us to interpret 5 as torch.float16 and "cpu" as
+    torch.device("cpu").
+    """
+    # Use real_type because type represents enums such as ScalarType as int.
     kind = str(argument.real_type)
     if kind.startswith("Optional[") and kind.endswith("]"):
         kind = kind[len("Optional[") : -1]
@@ -63,11 +77,14 @@ def _decode(argument, value, op):
 def rebuild_fx(
     module: ir.Module, out_spec: pytree.TreeSpec | None = None
 ) -> torch.fx.GraphModule:
-    """Rebuild an executable FX graph from a Torch-dialect ``func.func @main``.
+    """Reconstruct an executable FX graph from a Torch-dialect MLIR module.
 
-    ``out_spec`` restores the original output structure, which the importer
-    flattens. Without it, one result is returned bare and several as a tuple.
-    ``module`` is not modified.
+    MLIR block arguments become FX placeholders. Operations are translated in program
+    order, mapping SSA values to FX nodes, Python literals, or containers to preserve
+    data dependencies.
+
+    *out_spec* restores the original FX output structure (e.g. x vs. (x,)). Without it,
+    results are returned as a tuple unless there is exactly one.
     """
     block = _main_block(module)
     graph = torch.fx.Graph()
@@ -109,6 +126,17 @@ def rebuild_fx(
 
 
 def _main_block(module: ir.Module) -> ir.Block:
+    """Extract the single block of the main function.
+
+    Only straight-line programs with the following structure are supported:
+
+        module {
+            func.func @main(<args>) -> <result_types> {
+                <ops>
+                return <results>
+            }
+        }
+    """
     ops = list(module.body.operations)
     if (
         len(ops) != 1
@@ -133,8 +161,17 @@ def _supported_argument_type(type_str: str) -> bool:
 
 
 def _call(graph, op, name, operands, *, max_results, min_results=0):
-    """Emit a call to the dispatcher operator ``name``, binding operands by
-    schema. An operator with no results is still emitted, exactly once."""
+    """Reconstruct an MLIR operator as an FX call_function node.
+
+    Use the operator schema to decode literals and distinguish positional and
+    keyword-only arguments, since MLIR represents all operands positionally.
+
+    For example (MLIR types omitted):
+        %z = torch.aten.add.Tensor %x, %y, %alpha
+
+    Becomes:
+        z = torch.ops.aten.add.Tensor(x, y, alpha=alpha)
+    """
     target = _resolve(op, name)
     num_results = _check_results(op, min_results, max_results)
     node = graph.call_function(target, *_bind(op, target, operands))
@@ -153,11 +190,9 @@ def _check_results(op, min_results, max_results) -> int:
 
 def _bind(op, target, operands):
     """Bind MLIR operands to ``target``'s schema as ``(args, kwargs)``."""
-    arguments = _schema_arguments(target)
+    arguments = target._schema.arguments
     if len(operands) != len(arguments):
-        raise _error(
-            op, f"expected {len(arguments)} operands, found {len(operands)}"
-        )
+        raise _error(op, f"expected {len(arguments)} operands, found {len(operands)}")
     args, kwargs = [], {}
     for argument, value in zip(arguments, operands):
         value = _decode(argument, value, op)
@@ -184,12 +219,10 @@ def _expand_functional(graph, op, original, form, operands):
     the original destination-passing op; the buffer is the result."""
     target = _resolve(op, "torch." + original.replace("::", "."))
     _check_results(op, 1, 1)
-    names = [a.name for a in _schema_arguments(target)]
+    names = [a.name for a in target._schema.arguments]
     dummy_names = [n for n in names if n != form.output]
     if len(operands) != len(dummy_names):
-        raise _error(
-            op, f"expected {len(dummy_names)} operands, found {len(operands)}"
-        )
+        raise _error(op, f"expected {len(dummy_names)} operands, found {len(operands)}")
     like = operands[dummy_names.index(form.like)]
     buffer = graph.call_function(
         torch.ops.aten.empty_like.default,
@@ -203,6 +236,13 @@ def _expand_functional(graph, op, original, form, operands):
 
 
 def _output(op, operands, out_spec):
+    """Restore the original FX output structure from MLIR return operands.
+
+    For example:
+        return %x
+
+    May be reconstructed as x, (x,), or [x], depending on out_spec.
+    """
     if out_spec is None:
         return operands[0] if len(operands) == 1 else tuple(operands)
     if out_spec.num_leaves != len(operands):
@@ -214,6 +254,19 @@ def _output(op, operands, out_spec):
 
 
 def _constant(attr_type):
+    """Create a handler that converts MLIR constants to Python literals.
+
+    Unlike MLIR, FX does not require separate nodes for literal arguments.
+
+    For example (MLIR types omitted):
+        %dim = torch.constant.int -1
+        %n = torch.constant.int 3
+        %y = torch.aten.chunk %x, %n, %dim
+
+    Becomes:
+        y = torch.ops.aten.chunk.default(x, 3, -1)
+    """
+
     def convert(graph, op, operands):
         return [attr_type(op.attributes["value"]).value]
 
@@ -221,22 +274,39 @@ def _constant(attr_type):
 
 
 def _list_unpack(graph, op, operands):
+    """Rewrite MLIR ListUnpack operations as individual FX getitem calls.
+
+    For example (MLIR types omitted):
+        %chunks = torch.aten.chunk %x, %n, %dim
+        %1:2 = torch.prim.ListUnpack %chunks
+
+    Becomes:
+        chunks = torch.ops.aten.chunk.default(x, n, dim)
+        getitem = operator.getitem(chunks, 0)
+        getitem_1 = operator.getitem(chunks, 1)
+    """
     (src,) = operands
     if not isinstance(src, torch.fx.Node):
         raise _error(op, "only the result of an operation can be unpacked")
+    # Import specializes ListUnpack to the example length. Do not index unused
+    # elements: a later execution may produce a shorter dynamic split list.
     return [
-        graph.call_function(operator.getitem, (src, i))
-        for i in range(len(op.results))
+        graph.call_function(operator.getitem, (src, i)) if any(result.uses) else None
+        for i, result in enumerate(op.results)
     ]
 
 
+# Structural operations have no corresponding PyTorch dispatcher operator
+# and are instead reconstructed as Python literals, lists, or getitem calls.
 _STRUCTURAL = {
     "torch.prim.ListUnpack": _list_unpack,
     "torch.constant.int": _constant(ir.IntegerAttr),
     "torch.constant.float": _constant(ir.FloatAttr),
     "torch.constant.bool": _constant(ir.BoolAttr),
     "torch.constant.device": _constant(ir.StringAttr),
+    "torch.constant.str": _constant(ir.StringAttr),
     "torch.constant.none": lambda graph, op, operands: [None],
+    # %size = torch.prim.ListConstruct %a, %b -> [a, b]
     "torch.prim.ListConstruct": lambda graph, op, operands: [list(operands)],
 }
 

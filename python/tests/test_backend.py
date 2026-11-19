@@ -1,12 +1,12 @@
 """torch.compile integration tests for the standalone FX -> MLIR -> FX backend."""
 
 import pytest
+
 torch = pytest.importorskip("torch")
 
+from kashi.backend import compile_fx
 from torch import nn
 from torch.utils import _pytree as pytree
-
-from kashi.backend import compile_fx
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,7 @@ class EmbedChunkView(nn.Module):
         self.o = nn.Linear(8, 8)
 
     def forward(self, ids):
-        q, k, v = self.qkv(self.embed(ids)).chunk(3, dim=-1)
+        q, k, _v = self.qkv(self.embed(ids)).chunk(3, dim=-1)
         return self.o(q).view(2, -1), k
 
 
@@ -123,7 +123,7 @@ class SymbolicModel(nn.Module):
         self.linear = nn.Linear(8, 24)
 
     def forward(self, ids):
-        q, k, v = self.linear(self.embed(ids)).chunk(3, dim=-1)
+        q, _k, _v = self.linear(self.embed(ids)).chunk(3, dim=-1)
         return q.view(-1, 2, 4), torch.empty(ids.shape[0], 8)
 
 
@@ -137,7 +137,10 @@ def test_symbolic_dimension_reuses_compiled_graph():
     for ids in (first, torch.tensor([1, 2, 3, 4, 5])):
         (view, empty), (expected_view, expected_empty) = compiled(ids), model(ids)
         torch.testing.assert_close(view, expected_view)
-        assert (empty.shape, empty.dtype) == (expected_empty.shape, expected_empty.dtype)
+        assert (empty.shape, empty.dtype) == (
+            expected_empty.shape,
+            expected_empty.dtype,
+        )
     assert len(spy.calls) == 1
 
 
@@ -167,7 +170,9 @@ def test_custom_ops_with_opaque_inputs():
         ops.write,
     ]
     rebuilt = [
-        t for t in _call_targets(fn.__self__) if t in (ops.scale.default, ops.write.default)
+        t
+        for t in _call_targets(fn.__self__)
+        if t in (ops.scale.default, ops.write.default)
     ]
     assert rebuilt == [ops.scale.default, ops.write.default]
 
