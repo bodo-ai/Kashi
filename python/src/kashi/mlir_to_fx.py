@@ -46,8 +46,8 @@ def _decode(argument, value, op):
     """Decode literals representing PyTorch-specific argument types.
 
     For example (MLIR types omitted):
-        %dtype = torch.constant.int 5 
-        %cpu = torch.constant.device "cpu" 
+        %dtype = torch.constant.int 5
+        %cpu = torch.constant.device "cpu"
         %y = torch.aten.empty.memory_format %size, %dtype, %none,
             %cpu, %none, %none
 
@@ -218,6 +218,7 @@ def _constant(attr_type):
     Becomes:
         y = torch.ops.aten.chunk.default(x, 3, -1)
     """
+
     def convert(graph, op, operands):
         return [attr_type(op.attributes["value"]).value]
 
