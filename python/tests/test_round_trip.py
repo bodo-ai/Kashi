@@ -157,7 +157,7 @@ def test_data_attr_and_long_round_trip_detach_and_convert():
         (torch.float16, False, False),
     ],
 )
-def test_to_dtyperound_trip(dtype, keyword, copy):
+def test_to_dtype_round_trip(dtype, keyword, copy):
     """Dtype conversion retains values and requested copy semantics."""
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -177,7 +177,7 @@ def test_to_dtyperound_trip(dtype, keyword, copy):
 
 
 @pytest.mark.parametrize("dim,keyword", [(0, False), (-1, True)])
-def test_size_dimround_trip(dim, keyword):
+def test_size_dim_round_trip(dim, keyword):
     """Dimension-specific size queries use the runtime input shape."""
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
