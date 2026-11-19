@@ -9,6 +9,7 @@ import operator
 
 from kashi.importer import import_fx
 from kashi.rebuild import rebuild_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
 
 
@@ -23,7 +24,10 @@ def _graph_module(build, inputs):
     graph = torch.fx.Graph()
     graph.output(build(graph))
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    _RecordVals(gm).run(*inputs)
+    fake_mode = FakeTensorMode()
+    fake_inputs = [fake_mode.from_tensor(x) for x in inputs]
+    with fake_mode:
+        _RecordVals(gm).run(*fake_inputs)
     return gm, inputs
 
 

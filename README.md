@@ -80,6 +80,28 @@ into `kashi_core`, links tests against that library and Catch2, and
 registers each Catch2 case with CTest. If test sources exist but no cases are
 discovered, the command fails.
 
+## Coverage
+
+The Linux GitHub Actions job collects coverage during its normal test run.
+Run the same commands locally:
+
+```sh
+pixi run --locked coverage-python
+pixi run --locked -e cpp-coverage coverage-cpp
+```
+
+Python coverage measures line and branch coverage of `kashi`. The C++ task
+uses the locked Linux x86-64 Clang/LLVM environment and an instrumented
+`build/coverage-cpp/` tree. It measures `cpp/lib/` and `cpp/include/` through
+Catch2/CTest, not the native extension loaded by Python or code in dependencies.
+It reports `no native tests yet` until there are native tests to run.
+
+Reports are written to `build/coverage/`: `python.xml` and `python.md` for
+Python, `cpp.txt` and (when coverage is available) `cpp.json` for C++. GitHub
+Actions posts a summary and uploads the machine-readable reports and native
+summary as `coverage-reports`. Test and tool failures fail the job; coverage
+percentages are advisory.
+
 
 ## Native mutation testing
 

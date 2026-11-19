@@ -3,6 +3,7 @@ project(kashi LANGUAGES CXX)
 option(KASHI_BUILD_TESTS "Build the native Catch2 tests" OFF)
 option(KASHI_MUTATION "Instrument project native code for Mull" OFF)
 option(KASHI_LINT "Run clang-tidy on project C++ sources" OFF)
+option(KASHI_COVERAGE "Instrument native tests for LLVM coverage" OFF)
 set(KASHI_MULL_PLUGIN "" CACHE FILEPATH "Mull LLVM frontend plugin")
 
 if(KASHI_MUTATION)
@@ -23,6 +24,16 @@ if(KASHI_LINT)
   find_program(KASHI_CLANG_TIDY NAMES clang-tidy REQUIRED)
 endif()
 
+if(KASHI_COVERAGE)
+  if(NOT KASHI_BUILD_TESTS OR KASHI_MUTATION)
+    message(FATAL_ERROR "KASHI_COVERAGE requires tests and cannot be combined with Mull")
+  endif()
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "KASHI_COVERAGE requires Clang")
+  endif()
+  set(KASHI_COVERAGE_FLAGS -fprofile-instr-generate -fcoverage-mapping)
+endif()
+
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(nanobind CONFIG REQUIRED)
 
@@ -32,7 +43,12 @@ file(GLOB_RECURSE KASHI_LIB_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/*.cxx")
 
 if(KASHI_LIB_SOURCES)
-  add_library(kashi_core STATIC ${KASHI_LIB_SOURCES})
+  if(KASHI_COVERAGE)
+    # Keep every translation unit in the test binary, even if no test calls it.
+    add_library(kashi_core OBJECT ${KASHI_LIB_SOURCES})
+  else()
+    add_library(kashi_core STATIC ${KASHI_LIB_SOURCES})
+  endif()
   set_target_properties(kashi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
   if(KASHI_LINT)
     set_property(TARGET kashi_core PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
@@ -41,6 +57,11 @@ if(KASHI_LIB_SOURCES)
   if(KASHI_MUTATION)
     target_compile_options(kashi_core PRIVATE
       -O0 -g -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
+  endif()
+  if(KASHI_COVERAGE)
+    target_compile_options(kashi_core PRIVATE ${KASHI_COVERAGE_FLAGS})
+    # Both the test executable and the extension link these object files.
+    target_link_options(kashi_core INTERFACE -fprofile-instr-generate)
   endif()
 else()
   add_library(kashi_core INTERFACE)
@@ -74,6 +95,11 @@ if(KASHI_BUILD_TESTS)
       # The Mull policy excludes test sources while permitting inline project headers.
       target_compile_options(kashi_native_tests PRIVATE
         -O0 -g -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
+    endif()
+    if(KASHI_COVERAGE)
+      # Instrument test translation units for coverage of inline project headers.
+      target_compile_options(kashi_native_tests PRIVATE ${KASHI_COVERAGE_FLAGS})
+      target_link_options(kashi_native_tests PRIVATE -fprofile-instr-generate)
     endif()
     catch_discover_tests(kashi_native_tests)
   endif()

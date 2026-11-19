@@ -6,6 +6,7 @@ import operator
 import re
 
 from kashi.importer import import_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
 
 
@@ -24,12 +25,13 @@ def test_import_fx_preserves_aten_linear(linear, meta_key):
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    example_inputs = [torch.randn(2, 4), torch.randn(3, 4), torch.randn(3)]
+    with FakeTensorMode():
+        example_inputs = [torch.randn(2, 4), torch.randn(3, 4), torch.randn(3)]
 
-    for node, value in zip(graph.find_nodes(op="placeholder"), example_inputs):
-        node.meta[meta_key] = value
+        for node, value in zip(graph.find_nodes(op="placeholder"), example_inputs):
+            node.meta[meta_key] = value
 
-    y.meta[meta_key] = linear(*example_inputs)
+        y.meta[meta_key] = linear(*example_inputs)
 
     result = import_fx(gm)
 
@@ -64,9 +66,10 @@ def test_import_fx_preserves_aten_embedding(embedding, indices_first, kwargs):
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    example_inputs = [torch.randn(10, 4), torch.tensor([1, 3, 5])]
-    weight.meta["val"], indices.meta["val"] = example_inputs
-    y.meta["val"] = torch.ops.aten.embedding.default(*example_inputs)
+    with FakeTensorMode():
+        example_inputs = [torch.randn(10, 4), torch.tensor([1, 3, 5])]
+        weight.meta["val"], indices.meta["val"] = example_inputs
+        y.meta["val"] = torch.ops.aten.embedding.default(*example_inputs)
 
     result = import_fx(gm)
 
@@ -89,9 +92,10 @@ def test_import_fx_preserves_aten_view(op, target, shape):
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    example_inputs = [torch.randn(2, 3)]
-    x.meta["val"] = example_inputs[0]
-    y.meta["val"] = example_inputs[0].view(3, 2)
+    with FakeTensorMode():
+        example_inputs = [torch.randn(2, 3)]
+        x.meta["val"] = example_inputs[0]
+        y.meta["val"] = example_inputs[0].view(3, 2)
 
     result = import_fx(gm)
 
@@ -117,11 +121,12 @@ def test_import_fx_preserves_chunk_with_getitem(op, target):
     graph.output((first, second))
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    example_inputs = [torch.randn(2, 6)]
-    x.meta["val"] = example_inputs[0]
-    chunk_vals = example_inputs[0].chunk(2, dim=-1)
-    chunks.meta["val"] = chunk_vals
-    first.meta["val"], second.meta["val"] = chunk_vals
+    with FakeTensorMode():
+        example_inputs = [torch.randn(2, 6)]
+        x.meta["val"] = example_inputs[0]
+        chunk_vals = example_inputs[0].chunk(2, dim=-1)
+        chunks.meta["val"] = chunk_vals
+        first.meta["val"], second.meta["val"] = chunk_vals
 
     result = import_fx(gm)
 
@@ -142,7 +147,8 @@ def test_import_fx_preserves_aten_empty(empty):
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    y.meta["val"] = torch.empty(2, 3, dtype=torch.float16, device="cpu")
+    with FakeTensorMode():
+        y.meta["val"] = torch.empty(2, 3, dtype=torch.float16, device="cpu")
 
     result = import_fx(gm)
 
@@ -161,8 +167,9 @@ def test_import_fx_preserves_torch_size_feeding_empty():
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    size.meta["val"] = torch.Size([2, 3])
-    y.meta["val"] = torch.empty(2, 3, dtype=torch.float32, device="cpu")
+    with FakeTensorMode():
+        size.meta["val"] = torch.Size([2, 3])
+        y.meta["val"] = torch.empty(2, 3, dtype=torch.float32, device="cpu")
 
     result = import_fx(gm)
 
@@ -175,8 +182,9 @@ def _view_graph(output):
     x = graph.placeholder("x")
     y = graph.call_function(torch.ops.aten.view.default, (x, [6]))
     graph.output(output(y))
-    x.meta["val"] = torch.randn(2, 3)
-    y.meta["val"] = torch.randn(6)
+    with FakeTensorMode():
+        x.meta["val"] = torch.randn(2, 3)
+        y.meta["val"] = torch.randn(6)
     return torch.fx.GraphModule(torch.nn.Module(), graph)
 
 
@@ -244,8 +252,13 @@ def test_import_fx_rejects_multi_overload_packet():
     y = graph.call_function(torch.ops.aten.add, (a, b))
     graph.output(y)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    for node, value in [(a, torch.randn(2)), (b, torch.randn(2)), (y, torch.randn(2))]:
-        node.meta["val"] = value
+    with FakeTensorMode():
+        for node, value in [
+            (a, torch.randn(2)),
+            (b, torch.randn(2)),
+            (y, torch.randn(2)),
+        ]:
+            node.meta["val"] = value
 
     with pytest.raises(
         NotImplementedError, match="Ambiguous overload packet.*aten.add"
