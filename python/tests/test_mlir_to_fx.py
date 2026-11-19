@@ -5,7 +5,7 @@ torch = pytest.importorskip("torch")
 import operator
 
 from iree.compiler import ir
-from kashi.rebuild import rebuild_fx
+from kashi.mlir_to_fx import rebuild_fx
 from torch.utils import _pytree as pytree
 
 
