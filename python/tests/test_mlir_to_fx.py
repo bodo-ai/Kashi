@@ -1,12 +1,12 @@
 import pytest
+
 torch = pytest.importorskip("torch")
 
 import operator
 
 from iree.compiler import ir
-from torch.utils import _pytree as pytree
-
 from kashi.mlir_to_fx import rebuild_fx
+from torch.utils import _pytree as pytree
 
 
 def _parse(body: str) -> ir.Module:
@@ -222,7 +222,12 @@ def test_rebuild_rejects_unpack_of_literal_list():
 
 
 def _empty(dtype="%int5", layout="%none", memory_format="%none"):
-    types = {"%int5": "!torch.int", "%int99": "!torch.int", "%int0": "!torch.int", "%none": "!torch.none"}
+    types = {
+        "%int5": "!torch.int",
+        "%int99": "!torch.int",
+        "%int0": "!torch.int",
+        "%none": "!torch.none",
+    }
     return f"""
 func.func @main() -> !torch.vtensor<[2,3],f16> {{
   %int2 = torch.constant.int 2
@@ -379,5 +384,7 @@ func.func @main(%arg0: !torch.vtensor<[2],f32>, %arg1: !torch.any) -> !torch.vte
     ids=["unknown-op", "unknown-namespace", "unknown-overload"],
 )
 def test_rebuild_rejects_unresolvable_operator(test_ops, name, match):
-    with pytest.raises(NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"):
+    with pytest.raises(
+        NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"
+    ):
         rebuild_fx(_with_operator(name))

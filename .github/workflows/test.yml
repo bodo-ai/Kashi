@@ -8,6 +8,20 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Formatting and linting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.82.0
+          run-install: false
+      - name: Check Python and C++
+        run: pixi run --locked lint
+
   test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -28,15 +42,24 @@ jobs:
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - uses: prefix-dev/setup-pixi@v0.11.3
+        id: pixi
         with:
           pixi-version: v0.82.0
           run-install: false
       - name: Install locked environment
         run: pixi install --locked
       - name: Python tests
+        if: runner.os != 'Linux'
         run: pixi run --locked test-python
+      - name: Python tests with coverage
+        if: runner.os == 'Linux'
+        run: pixi run --locked coverage-python
       - name: Native tests
+        if: runner.os != 'Linux'
         run: pixi run --locked test-cpp
+      - name: Native tests with coverage
+        if: runner.os == 'Linux'
+        run: pixi run --locked -e cpp-coverage coverage-cpp
       - name: Build wheel
         run: pixi run --locked python -m build --wheel --outdir "$RUNNER_TEMP/wheels"
       - name: Install wheel and import outside checkout
@@ -58,3 +81,37 @@ jobs:
               if not path.is_relative_to(environment):
                   raise RuntimeError(f"{module.__name__} was not imported from the wheel environment")
           PY
+      - name: Summarize coverage
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.pixi.outcome == 'success' }}
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          reports = Path('build/coverage')
+          print('## Python coverage\n')
+          xml = reports / 'python.xml'
+          if not xml.is_file():
+              print('No Python coverage report was generated.')
+          elif ElementTree.parse(xml).getroot().get('lines-valid') == '0':
+              print('No executable Python statements to measure.')
+          else:
+              print((reports / 'python.md').read_text())
+
+          print('\n## C++ coverage\n')
+          native = reports / 'cpp.txt'
+          if native.is_file():
+              print('```text\n' + native.read_text() + '```')
+          else:
+              print('No C++ coverage report was generated.')
+          PY
+      - name: Upload coverage reports
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.pixi.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            build/coverage/python.xml
+            build/coverage/cpp.txt
+            build/coverage/cpp.json
+          if-no-files-found: warn

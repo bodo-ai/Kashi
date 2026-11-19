@@ -7,7 +7,6 @@ from iree.compiler import ir
 from iree.compiler.extras.fx_importer import TORCH_DTYPE_TO_INT
 from torch.utils import _pytree as pytree
 
-
 # --- Adapter: private PyTorch APIs used for schema-driven binding. ----------
 
 
@@ -176,9 +175,7 @@ def _call(graph, op, name, operands, *, max_results, min_results=0):
         raise _error(op, f"expected {expected} result, found {num_results}")
     arguments = target._schema.arguments
     if len(operands) != len(arguments):
-        raise _error(
-            op, f"expected {len(arguments)} operands, found {len(operands)}"
-        )
+        raise _error(op, f"expected {len(arguments)} operands, found {len(operands)}")
     args, kwargs = [], {}
     for argument, value in zip(arguments, operands):
         value = _decode(argument, value, op)
@@ -243,8 +240,7 @@ def _list_unpack(graph, op, operands):
     if not isinstance(src, torch.fx.Node):
         raise _error(op, "only the result of an operation can be unpacked")
     return [
-        graph.call_function(operator.getitem, (src, i))
-        for i in range(len(op.results))
+        graph.call_function(operator.getitem, (src, i)) for i in range(len(op.results))
     ]
 
 

@@ -1,9 +1,7 @@
-
 """Minimal vLLM model for end-to-end compiler integration tests."""
 
 import torch
-import torch.nn as nn
-
+from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
@@ -20,25 +18,19 @@ class SimpleVllm(nn.Module):
         num_heads = config.num_attention_heads
         head_size = hidden_size // num_heads
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, hidden_size
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, hidden_size)
 
-        self.qkv_proj = nn.Linear(
-            hidden_size, 3 * hidden_size, bias=False
-        )
+        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
 
         self.attn = Attention(
             num_heads=num_heads,
             head_size=head_size,
-            scale=head_size ** -0.5,
+            scale=head_size**-0.5,
             num_kv_heads=num_heads,
             prefix=f"{prefix}.attn.0",
         )
 
-        self.o_proj = nn.Linear(
-            hidden_size, hidden_size, bias=False
-        )
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def embed_input_ids(self, input_ids):
         return self.embed_tokens(input_ids)
@@ -75,9 +67,7 @@ class SimpleVllmForCausalLM(nn.Module):
             prefix=model_prefix,
         )
 
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=False
-        )
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_input_ids(input_ids)

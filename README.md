@@ -36,6 +36,21 @@ All variants use vLLM 0.33.0 and IREE compiler/runtime 3.14.0. Python 3.12 and t
 
 Use `pixi info` to inspect the selected platform. To select a specific compatible variant, pass `--platform`, for example `pixi run --locked --platform linux-64-cpu test-python`.
 
+## Formatting and linting
+
+Run all check-only tasks with `pixi run --locked lint`. The Linux CI job
+runs the same command on pushes and pull requests.
+
+| Language | Rewrite formatting | Check formatting | Lint |
+| --- | --- | --- | --- |
+| Python (`python/`, `scripts/`) | `pixi run --locked format-python` | `pixi run --locked check-format-python` | `pixi run --locked lint-python` |
+| C++ (`cpp/`) | `pixi run --locked format-cpp` | `pixi run --locked check-format-cpp` | `pixi run --locked lint-cpp` |
+
+Ruff handles Python formatting and linting. C++ uses clang-format with
+LLVM style and clang-tidy on the project targets in `build/lint-cpp/`.
+Clang-tidy checks headers included by those targets and treats reported
+warnings as errors.
+
 ## Tests
 
 The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.
@@ -64,6 +79,28 @@ test sources in `cpp/tests/` (`.cpp`, `.cc`, or `.cxx`). CMake links the units
 into `kashi_core`, links tests against that library and Catch2, and
 registers each Catch2 case with CTest. If test sources exist but no cases are
 discovered, the command fails.
+
+## Coverage
+
+The Linux GitHub Actions job collects coverage during its normal test run.
+Run the same commands locally:
+
+```sh
+pixi run --locked coverage-python
+pixi run --locked -e cpp-coverage coverage-cpp
+```
+
+Python coverage measures line and branch coverage of `kashi`. The C++ task
+uses the locked Linux x86-64 Clang/LLVM environment and an instrumented
+`build/coverage-cpp/` tree. It measures `cpp/lib/` and `cpp/include/` through
+Catch2/CTest, not the native extension loaded by Python or code in dependencies.
+It reports `no native tests yet` until there are native tests to run.
+
+Reports are written to `build/coverage/`: `python.xml` and `python.md` for
+Python, `cpp.txt` and (when coverage is available) `cpp.json` for C++. GitHub
+Actions posts a summary and uploads the machine-readable reports and native
+summary as `coverage-reports`. Test and tool failures fail the job; coverage
+percentages are advisory.
 
 
 ## Native mutation testing

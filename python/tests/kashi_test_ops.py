@@ -46,8 +46,12 @@ def _write(x, out, tag, *, dep):
 
 LIB.impl("scale", _scale, "CompositeExplicitAutograd")
 LIB.impl("write", _write, "CompositeExplicitAutograd")
-torch.library.register_fake("kashi_test::scale", lambda x, tag: torch.empty_like(x), lib=LIB)
-torch.library.register_fake("kashi_test::write", lambda x, out, tag, *, dep: None, lib=LIB)
+torch.library.register_fake(
+    "kashi_test::scale", lambda x, tag: torch.empty_like(x), lib=LIB
+)
+torch.library.register_fake(
+    "kashi_test::write", lambda x, out, tag, *, dep: None, lib=LIB
+)
 
 
 class OpsModel(nn.Module):
