@@ -9,7 +9,7 @@ from kashi.importer import import_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
-def test_cpu_rms_normalizationround_trip():
+def test_cpu_rms_normalization_round_trip():
     """CPU RMS normalization preserves reduction and broadcast arithmetic."""
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -26,7 +26,7 @@ def test_cpu_rms_normalizationround_trip():
     torch.testing.assert_close(rebuilt(*inputs), original(*inputs))
 
 
-def test_cpu_gated_activationround_trip():
+def test_cpu_gated_activation_round_trip():
     """CPU gating keeps reshape, trailing slices and SiLU semantics."""
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
