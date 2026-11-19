@@ -1,5 +1,7 @@
 """Integration tests for the opt-in IREE compilation and graph reassembly path."""
 
+import sys
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -49,6 +51,7 @@ def _depends_on(node, source):
     )
 
 
+@pytest.mark.skipif(sys.platform == "darwin", reason="CUDA/PTX integration is not exercised on macOS")
 def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
     """Real CUDA compilation produces kernel calls around the mutating operator."""
     from kashi.iree_backend import compile_iree_fx

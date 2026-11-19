@@ -114,6 +114,8 @@ its opaque kernel calls cannot execute until kernel launching is implemented.
 The existing round-trip and vLLM tests continue to validate executable PyTorch
 semantics. The IREE tests separately compile real kernels and check the returned
 graph's custom-op boundaries, kernel operands and output wiring.
+The CUDA/PTX compilation test is skipped on macOS; platform-independent IREE
+partitioning and reconstruction tests still run there.
 
 ## Tests
 
