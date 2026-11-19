@@ -11,7 +11,6 @@ from vllm_test_utils import (
     QWEN_PROMPTS,
     assert_outputs_match,
     generate_qwen,
-    model_dir,
 )
 
 

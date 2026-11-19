@@ -1,10 +1,9 @@
 """Helpers for FX importer and reconstruction tests."""
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-
 from kashi.importer import import_fx
 from kashi.rebuild import rebuild_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 class _RecordExamples(torch.fx.Interpreter):

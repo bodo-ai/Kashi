@@ -6,11 +6,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from torch._subclasses.fake_tensor import FakeTensorMode
-
 from fx_test_utils import _RecordExamples, _round_trip
-
 from kashi.importer import import_fx
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 def test_cpu_rms_normalization_round_trip():
@@ -36,7 +34,9 @@ def test_cpu_gated_activation_round_trip():
     x = graph.placeholder("x")
     reshaped = graph.call_method("reshape", (x, -1, 4))
     gate = graph.call_function(operator.getitem, (reshaped, (Ellipsis, slice(None, 2))))
-    value = graph.call_function(operator.getitem, (reshaped, (Ellipsis, slice(2, None))))
+    value = graph.call_function(
+        operator.getitem, (reshaped, (Ellipsis, slice(2, None)))
+    )
     activated = graph.call_function(torch.nn.functional.silu, (gate,))
     graph.output(graph.call_function(operator.mul, (activated, value)))
     x_value = torch.tensor([[-2.0, -0.5, 1.5, 2.0], [0.0, 3.0, -1.0, 4.0]])
@@ -59,7 +59,9 @@ def test_split_literal_sections_preserve_nested_tuple_output():
         assert isinstance(actual["parts"], list)
         assert isinstance(actual["parts"][0], tuple)
         assert len(actual["parts"][0]) == len(expected["parts"][0]) == 3
-        for result, reference in zip(actual["parts"][0], expected["parts"][0], strict=True):
+        for result, reference in zip(
+            actual["parts"][0], expected["parts"][0], strict=True
+        ):
             torch.testing.assert_close(result, reference)
         torch.testing.assert_close(actual["parts"][1], expected["parts"][1])
 

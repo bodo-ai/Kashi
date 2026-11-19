@@ -7,11 +7,11 @@ torch = pytest.importorskip("torch")
 
 import operator
 
+from fx_test_utils import _round_trip
 from kashi.importer import import_fx
 from kashi.rebuild import rebuild_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
-from fx_test_utils import _round_trip
 
 
 class _RecordVals(torch.fx.Interpreter):

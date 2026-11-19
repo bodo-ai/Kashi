@@ -10,7 +10,6 @@ import pytest
 import torch
 import vllm_backend_spy
 
-
 # A local config and token IDs avoid downloading a model or tokenizer. A head
 # size of 64 is supported by both vLLM's CPU and GPU attention backends.
 QWEN_CONFIG = {
@@ -34,7 +33,9 @@ QWEN_MAX_TOKENS = 4
 
 
 @contextmanager
-def vllm_test_environment(monkeypatch, *, cpu_cache_space, offline=False, clear_after=False):
+def vllm_test_environment(
+    monkeypatch, *, cpu_cache_space, offline=False, clear_after=False
+):
     """Isolate vLLM settings and the backend spy, restoring Inductor safely."""
     import torch._inductor.config
 
@@ -117,7 +118,12 @@ def generate(
             **engine_options,
         )
         llm.apply_model(
-            partial(fill_weights, seed=weight_seed, scale=weight_scale, norm_scale=norm_scale)
+            partial(
+                fill_weights,
+                seed=weight_seed,
+                scale=weight_scale,
+                norm_scale=norm_scale,
+            )
         )
         if record_generation:
             # Exclude vLLM's startup/profile calls: these counts must come from
@@ -166,7 +172,9 @@ def generate_qwen(model_dir, compilation_config, *, record_generation=False):
 @pytest.fixture
 def model_dir(tmp_path, monkeypatch):
     """Provide an offline Qwen3 configuration and isolate vLLM test settings."""
-    with vllm_test_environment(monkeypatch, cpu_cache_space=None, offline=True, clear_after=True):
+    with vllm_test_environment(
+        monkeypatch, cpu_cache_space=None, offline=True, clear_after=True
+    ):
         (tmp_path / "config.json").write_text(json.dumps(QWEN_CONFIG))
         yield tmp_path
 
