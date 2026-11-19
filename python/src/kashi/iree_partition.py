@@ -39,7 +39,10 @@ def _constant(name: str) -> bool:
 def _supported(type_: ir.Type) -> bool:
     """Identify values supported by the compiled segment interface."""
     text = str(type_)
-    return text.startswith(("!torch.vtensor", "!torch.tensor", "!torch.list")) or text == "!torch.int"
+    return (
+        text.startswith(("!torch.vtensor", "!torch.tensor", "!torch.list"))
+        or text == "!torch.int"
+    )
 
 
 def _clone(operation, mapping, *, rewrite_device: bool):
@@ -47,9 +50,12 @@ def _clone(operation, mapping, *, rewrite_device: bool):
     attributes = {name: operation.attributes[name] for name in operation.attributes}
     # Device constants in IREE segments are normalized for the Torch frontend;
     # the driver and source still carry the original CUDA device.
-    if rewrite_device and operation.name == "torch.constant.device":
-        if ir.StringAttr(operation.attributes["value"]).value.startswith("cuda"):
-            attributes["value"] = ir.StringAttr.get("cpu")
+    if (
+        rewrite_device
+        and operation.name == "torch.constant.device"
+        and ir.StringAttr(operation.attributes["value"]).value.startswith("cuda")
+    ):
+        attributes["value"] = ir.StringAttr.get("cpu")
     cloned = ir.Operation.create(
         operation.name,
         results=[value.type for value in operation.results],
@@ -77,7 +83,9 @@ def _source_block(module: ir.Module):
         raise NotImplementedError("expected func.return at the end of @main")
     for operation in operations:
         if len(operation.regions):
-            raise NotImplementedError(f"nested regions are not supported: {operation.name}")
+            raise NotImplementedError(
+                f"nested regions are not supported: {operation.name}"
+            )
         if operation.name == "func.return" and operation != operations[-1]:
             raise NotImplementedError("unexpected early func.return in @main")
         if operation.name != "func.return" and not operation.name.startswith("torch."):
@@ -97,7 +105,9 @@ def _driver(block, operations, clonable, segment_io):
         for index, (live_in, live_out) in segment_io.items():
             func.FuncOp(
                 f"segment_{index}",
-                ir.FunctionType.get([v.type for v in live_in], [v.type for v in live_out]),
+                ir.FunctionType.get(
+                    [v.type for v in live_in], [v.type for v in live_out]
+                ),
                 visibility="private",
             )
         main = func.FuncOp(
@@ -175,7 +185,9 @@ def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
         else:
             groups[-1].append(operation)
     if len(devices) > 1:
-        raise NotImplementedError(f"multiple source devices are unsupported: {sorted(devices)}")
+        raise NotImplementedError(
+            f"multiple source devices are unsupported: {sorted(devices)}"
+        )
     produced = {value for group in groups for op in group for value in op.results}
 
     # Consumers distinguish local uses from values that must survive a call.
@@ -195,24 +207,25 @@ def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
     segments = []
     with module.context, ir.Location.unknown():
         compiled = ir.Module.create()
+
+        def need_constant(value, needed):
+            """Collect a constant-built list and its transitive dependencies."""
+            position = clonable[value]
+            if position in needed:
+                return
+            needed.add(position)
+            for operand in clonable_ops[position].operands:
+                need_constant(operand, needed)
+
         for index, group in enumerate(groups):
             local = {value for operation in group for value in operation.results}
             live_in = []
             needed = set()
 
-            def need_constant(value):
-                """Collect a constant-built list and its transitive dependencies."""
-                position = clonable[value]
-                if position in needed:
-                    return
-                needed.add(position)
-                for operand in clonable_ops[position].operands:
-                    need_constant(operand)
-
             for operation in group:
                 for value in operation.operands:
                     if value in clonable:
-                        need_constant(value)
+                        need_constant(value, needed)
                     elif value not in local and value not in live_in:
                         if not _supported(value.type) and value not in produced:
                             raise NotImplementedError(
@@ -230,20 +243,24 @@ def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
                         live_out.append(value)
                     else:
                         unsupported.append(str(value.type))
-            segments.append(SegmentInfo(
-                index=index,
-                func_name=f"segment_{index}",
-                live_in_types=[str(v.type) for v in live_in],
-                live_out_types=[str(v.type) for v in live_out],
-                unsupported_live_outs=unsupported,
-            ))
+            segments.append(
+                SegmentInfo(
+                    index=index,
+                    func_name=f"segment_{index}",
+                    live_in_types=[str(v.type) for v in live_in],
+                    live_out_types=[str(v.type) for v in live_out],
+                    unsupported_live_outs=unsupported,
+                )
+            )
             if not group:
                 continue
             segment_io[index] = (live_in, live_out)
             with ir.InsertionPoint(compiled.body):
                 function = func.FuncOp(
                     f"segment_{index}",
-                    ir.FunctionType.get([v.type for v in live_in], [v.type for v in live_out]),
+                    ir.FunctionType.get(
+                        [v.type for v in live_in], [v.type for v in live_out]
+                    ),
                 )
                 entry = function.add_entry_block()
             mapping = dict(zip(live_in, entry.arguments, strict=True))

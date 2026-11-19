@@ -125,7 +125,8 @@ def rebuild_fx(
             results = segment_handlers[callee](graph, operands)
             if len(results) != len(op.results):
                 raise _error(
-                    op, f"@{callee} returned {len(results)} values for {len(op.results)} results"
+                    op,
+                    f"@{callee} returned {len(results)} values for {len(op.results)} results",
                 )
         else:
             raise _error(op, "unsupported operation")
@@ -141,7 +142,8 @@ def _main_block(module: ir.Module, *, allow_declarations: bool = False) -> ir.Bl
     ops = list(module.body.operations)
     functions = [op for op in ops if op.operation.name == "func.func"]
     mains = [
-        op for op in functions
+        op
+        for op in functions
         if ir.StringAttr(op.attributes["sym_name"]).value == "main"
     ]
     declarations = [op for op in functions if op not in mains]

@@ -12,7 +12,7 @@ from iree.compiler.tools.binaries import find_tool
 from kashi.importer import import_fx
 from kashi.iree_partition import partition_at_custom_ops
 from kashi.iree_reassembly import flow_segment_handlers
-from kashi.rebuild import rebuild_fx
+from kashi.mlir_to_fx import rebuild_fx
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,9 @@ class IreeCompilation:
     kernels_ptx: Path | None
 
 
-def _source_device(gm: torch.fx.GraphModule, partition_device: str | None) -> str | None:
+def _source_device(
+    gm: torch.fx.GraphModule, partition_device: str | None
+) -> str | None:
     """Find the source tensor device so flow allocations use the original device."""
     devices = set()
     for node in gm.graph.nodes:
@@ -45,7 +47,9 @@ def _source_device(gm: torch.fx.GraphModule, partition_device: str | None) -> st
     if partition_device is not None:
         devices.add(partition_device)
     if len(devices) > 1:
-        raise NotImplementedError(f"IREE reassembly requires one source tensor device, got {sorted(devices)}")
+        raise NotImplementedError(
+            f"IREE reassembly requires one source tensor device, got {sorted(devices)}"
+        )
     return next(iter(devices), None)
 
 
@@ -57,7 +61,9 @@ def _cuda_target(cuda_target: str | None) -> str:
     try:
         major, minor = torch.cuda.get_device_capability()
     except Exception as error:
-        raise ValueError("Set cuda_target or IREE_CUDA_TARGET when no CUDA device is available") from error
+        raise ValueError(
+            "Set cuda_target or IREE_CUDA_TARGET when no CUDA device is available"
+        ) from error
     return f"sm_{major}{minor}"
 
 
@@ -88,14 +94,24 @@ def compile_iree_fx(
     """
     imported = import_fx(gm)
     if not imported.module.operation.verify():
-        raise RuntimeError(f"Verification failed for imported module:\n{imported.module}")
+        raise RuntimeError(
+            f"Verification failed for imported module:\n{imported.module}"
+        )
     partition = partition_at_custom_ops(imported.module)
     if partition.driver is None:
-        unsupported = [kind for segment in partition.segments for kind in segment.unsupported_live_outs]
-        raise NotImplementedError(f"Cannot build IREE driver; unsupported segment live-outs: {unsupported}")
+        unsupported = [
+            kind
+            for segment in partition.segments
+            for kind in segment.unsupported_live_outs
+        ]
+        raise NotImplementedError(
+            f"Cannot build IREE driver; unsupported segment live-outs: {unsupported}"
+        )
     device = _source_device(gm, partition.device)
     target = _cuda_target(cuda_target)
-    compiler_path = os.fspath(compiler) if compiler is not None else find_tool("iree-compile")
+    compiler_path = (
+        os.fspath(compiler) if compiler is not None else find_tool("iree-compile")
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -118,24 +134,37 @@ def compile_iree_fx(
     ]
     try:
         completed = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=1800,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(f"Could not run IREE compiler {compiler_path}: {error}") from error
+        raise RuntimeError(
+            f"Could not run IREE compiler {compiler_path}: {error}"
+        ) from error
     log_path = artifact_dir / "iree-compile.log"
     log_path.write_text(completed.stdout)
     if completed.returncode:
-        raise RuntimeError(f"IREE compiler exited with {completed.returncode}; see {log_path}")
+        raise RuntimeError(
+            f"IREE compiler exited with {completed.returncode}; see {log_path}"
+        )
 
     flow_files = sorted(phases_dir.glob("*.flow.mlir"))
     if len(flow_files) != 1:
-        raise RuntimeError(f"Expected one IREE flow phase in {phases_dir}, found {len(flow_files)}")
+        raise RuntimeError(
+            f"Expected one IREE flow phase in {phases_dir}, found {len(flow_files)}"
+        )
     flow_ir = flow_files[0]
     ptx_files = tuple(sorted(kernels_dir.glob("*.ptx")))
     kernels_ptx = None
     if ptx_files:
         kernels_ptx = artifact_dir / "kernels.ptx"
-        kernels_ptx.write_text("\n".join(f"// {path.name}\n{path.read_text()}" for path in ptx_files))
+        kernels_ptx.write_text(
+            "\n".join(f"// {path.name}\n{path.read_text()}" for path in ptx_files)
+        )
 
     handlers = flow_segment_handlers(flow_ir.read_text(), device=device)
     graph = rebuild_fx(partition.driver, imported.out_spec, segment_handlers=handlers)
