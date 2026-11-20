@@ -12,8 +12,7 @@ from kashi.backend import compile_fx
 
 
 def _input_ids_index(gm):
-    # Models can have multiple symbolic integer inputs (tokens and positions).
-    # Count the actual input IDs instead of guessing which integer is the batch.
+    """Return the index of the ``input_ids`` placeholder, or ``None`` if absent."""
     placeholders = gm.graph.find_nodes(op="placeholder")
     matches = [i for i, n in enumerate(placeholders) if "input_ids" in n.name.lower()]
     assert len(matches) <= 1, f"ambiguous input_ids placeholders: {matches}"
