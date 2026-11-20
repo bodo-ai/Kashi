@@ -120,6 +120,24 @@ def test_reading_base_of_mutated_view_after_call_raises():
         decompose_custom_ops(gm.graph)
 
 
+def test_uses_the_graph_fake_mode_inside_a_dynamo_backend():
+    """A Dynamo backend runs under a TracingContext whose fake mode is not the
+    one that produced the graph's example values."""
+    from torch._guards import TracingContext, tracing
+
+    graph = torch.fx.Graph()
+    x, w = graph.placeholder("x"), graph.placeholder("w")
+    out = _empty(graph, [3, 8])
+    graph.call_function(torch.ops._C.rms_norm.default, (out, x, w, EPS))
+    graph.output((out,))
+    gm = _fake(graph, torch.randn(3, 8), torch.randn(8))
+
+    with tracing(TracingContext(FakeTensorMode())):
+        decompose_custom_ops(gm.graph)
+
+    assert not [n for n in gm.graph.nodes if _is_c_op(n)]
+
+
 def test_graph_without_custom_ops_is_unchanged():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")

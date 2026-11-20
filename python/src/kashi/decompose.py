@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 
 import torch
-from torch._guards import detect_fake_mode
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.utils import _pytree as pytree
 
 DECOMPOSED_FROM_KEY = "kashi_decomposed_from"
@@ -37,8 +37,12 @@ class _Emitter:
         with self.graph.inserting_before(self.before):
             node = self.graph.call_function(target, args)
         values = pytree.tree_map_only(torch.fx.Node, lambda n: n.meta["val"], args)
-        mode = detect_fake_mode(pytree.tree_leaves(values))
-        with mode or nullcontext():
+        # Use the mode that made the graph's values; detect_fake_mode would
+        # prefer a Dynamo backend's TracingContext mode, which differs.
+        modes = [
+            v.fake_mode for v in pytree.tree_leaves(values) if isinstance(v, FakeTensor)
+        ]
+        with modes[0] if modes else nullcontext():
             node.meta["val"] = target(*values)
         node.meta[DECOMPOSED_FROM_KEY] = self.tag
         return node
