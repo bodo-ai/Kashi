@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Compile a Qwen3 model's vLLM graph to CUDA PTX through the kashi IREE backend.
 
 vLLM traces the model once with Dynamo and hands the whole FX graph to the
