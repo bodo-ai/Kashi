@@ -1,5 +1,6 @@
 """Opt-in decomposition of vLLM custom operators into ATen operators."""
 
+import operator
 import sys
 
 import pytest
@@ -115,6 +116,45 @@ def test_reading_base_of_mutated_view_after_call_raises():
     graph.call_function(torch.ops._C.rms_norm.default, (view, x, None, EPS))
     graph.output((graph.call_function(aten.neg.default, (out,)),))
     gm = _fake(graph, torch.randn(3, 8))
+
+    with pytest.raises(NotImplementedError, match="alias"):
+        decompose_custom_ops(gm.graph)
+
+
+def test_mutating_a_slice_of_a_graph_input_raises():
+    graph = torch.fx.Graph()
+    buf, x = graph.placeholder("buf"), graph.placeholder("x")
+    out = graph.call_function(aten.slice.Tensor, (buf, 0, 0, 3))
+    graph.call_function(torch.ops._C.rms_norm.default, (out, x, None, EPS))
+    graph.output((out,))
+    gm = _fake(graph, torch.empty(5, 8), torch.randn(3, 8))
+
+    with pytest.raises(NotImplementedError, match="graph input"):
+        decompose_custom_ops(gm.graph)
+
+
+def test_reading_through_unsqueeze_alias_after_call_raises():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    u = graph.call_function(aten.unsqueeze.default, (_empty(graph, [3, 8]), 0))
+    out = graph.call_function(aten.squeeze.dim, (u, 0))
+    graph.call_function(torch.ops._C.rms_norm.default, (out, x, None, EPS))
+    graph.output((graph.call_function(aten.neg.default, (u,)),))
+    gm = _fake(graph, torch.randn(3, 8))
+
+    with pytest.raises(NotImplementedError, match="alias"):
+        decompose_custom_ops(gm.graph)
+
+
+def test_reading_split_base_after_call_raises():
+    graph = torch.fx.Graph()
+    x, w = graph.placeholder("x"), graph.placeholder("w")
+    qkv = graph.call_function(aten.clone.default, (x,))
+    parts = graph.call_function(aten.split_with_sizes.default, (qkv, [8, 8], -1))
+    q = graph.call_function(operator.getitem, (parts, 0))
+    graph.call_function(torch.ops._C.rms_norm.default, (q, q, w, EPS))
+    graph.output((graph.call_function(aten.neg.default, (qkv,)),))
+    gm = _fake(graph, torch.randn(3, 16), torch.randn(8))
 
     with pytest.raises(NotImplementedError, match="alias"):
         decompose_custom_ops(gm.graph)

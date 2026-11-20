@@ -11,6 +11,7 @@ turns that into an MLIR ``NameLoc`` so later IREE passes can still group them.
 """
 
 import math
+import operator
 from collections import Counter
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -22,7 +23,27 @@ from torch.utils import _pytree as pytree
 DECOMPOSED_FROM_KEY = "kashi_decomposed_from"
 
 aten = torch.ops.aten
-_VIEW_OPS = (aten.view.default, aten.reshape.default, aten._unsafe_view.default)
+
+
+def _is_view(node: torch.fx.Node) -> bool:
+    """Whether ``node`` shares storage with its first argument.
+
+    Covers every ATen op whose schema marks its result as a read-only alias of
+    its input (view, slice, select, unsqueeze, transpose, expand, split, ...),
+    ``getitem`` of such a multi-output view, and ``_unsafe_view``.
+    """
+    if node.op != "call_function" or not node.args:
+        return False
+    target = node.target
+    if target is operator.getitem:
+        return isinstance(node.args[0], torch.fx.Node) and _is_view(node.args[0])
+    if target is aten._unsafe_view.default:
+        return True
+    if not isinstance(target, torch._ops.OpOverload):
+        return False
+    returns = target._schema.returns
+    alias = returns[0].alias_info if returns else None
+    return alias is not None and not alias.is_write
 
 
 class _Emitter:
@@ -159,7 +180,7 @@ def _bind(node: torch.fx.Node) -> dict:
 def _check_aliases(mutated, op, tag, position, op_position):
     """Reject writes still observable through a graph input or another alias."""
     base = mutated
-    while base.op == "call_function" and base.target in _VIEW_OPS:
+    while _is_view(base):
         base = base.args[0]
     if base.op == "placeholder":
         raise NotImplementedError(
@@ -168,7 +189,7 @@ def _check_aliases(mutated, op, tag, position, op_position):
     aliases, pending = {base}, [base]
     while pending:
         for user in pending.pop().users:
-            if user.target in _VIEW_OPS and user not in aliases:
+            if _is_view(user) and user not in aliases:
                 aliases.add(user)
                 pending.append(user)
     for alias in aliases:
