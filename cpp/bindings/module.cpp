@@ -8,8 +8,8 @@
 /// Define the private Python interface to the embedded IREE compiler.
 NB_MODULE(_native, m) {
   namespace nb = nanobind;
-  nb::exception<kashi::UnsupportedPartition>(m, "_UnsupportedPartition",
-                                             PyExc_NotImplementedError);
+  const nb::exception<kashi::UnsupportedPartition> unsupportedPartition(
+      m, "_UnsupportedPartition", PyExc_NotImplementedError);
   m.def(
       "compile_iree",
       [](const std::string &assembly, std::filesystem::path artifactDir,

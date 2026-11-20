@@ -60,6 +60,11 @@ public:
 
 template <typename Derived, typename OpType>
 struct Probe : PassWrapper<Derived, OperationPass<ModuleOp>> {
+private:
+  friend Derived;
+  Probe() = default;
+
+public:
   /// Stop at the first typed operation expected at this checkpoint.
   void runOnOperation() override {
     auto module = this->getOperation();

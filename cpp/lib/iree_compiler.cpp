@@ -59,7 +59,7 @@ struct Diagnostics {
     std::lock_guard lock(self.mutex);
     if (severity == IREE_COMPILER_DIAGNOSTIC_SEVERITY_ERROR)
       self.log << "error: ";
-    self.log.write(text, size) << '\n';
+    self.log.write(text, static_cast<std::streamsize>(size)) << '\n';
   }
 
   /// Record a stage failure and throw without obscuring its exception category.
@@ -174,13 +174,16 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
     diagnostics.fail("parse");
   OwningOpRef<ModuleOp> original(
       cast<ModuleOp>(unwrap(ireeCompilerInvocationExportStealModule(inv))));
-  auto partition = partitionTorchModule(*original);
-  if (failed(partition))
+  auto partitionResult = partitionTorchModule(*original);
+  if (failed(partitionResult))
     diagnostics.fail<UnsupportedPartition>("partition");
-  writeModule(*partition->segments, dir / "partitioned.mlir", diagnostics);
-  writeModule(*partition->driver, dir / "driver.mlir", diagnostics);
+  // Clang-tidy does not recognize MLIR's failed() check on FailureOr.
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  auto &partition = *partitionResult;
+  writeModule(*partition.segments, dir / "partitioned.mlir", diagnostics);
+  writeModule(*partition.driver, dir / "driver.mlir", diagnostics);
   if (!ireeCompilerInvocationImportStealModule(
-          inv, wrap(partition->segments.release().getOperation())))
+          inv, wrap(partition.segments.release().getOperation())))
     diagnostics.fail("verify partitioned module");
 
   auto run = [&](const char *from, const char *to) {
@@ -286,7 +289,7 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
         return mlir::iree_compiler::IREE::VM::translateModuleToBytecode(
             *vm, {}, {}, out);
       });
-  return std::move(partition->sourceDevice);
+  return std::move(partition.sourceDevice);
 }
 } // namespace
 
