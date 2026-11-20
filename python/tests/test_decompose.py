@@ -181,3 +181,99 @@ def test_silu_and_mul_writes_result():
     (result,) = gm(x_val)
     expected = torch.nn.functional.silu(x_val[:, :4]) * x_val[:, 4:]
     torch.testing.assert_close(result, expected)
+
+
+# --- _C.rotary_embedding (NeoX style only). ---------------------------------
+
+T, HEAD = 5, 16
+
+
+def _ref_rope(positions, x, head_size, cache):
+    cos, sin = (part.unsqueeze(-2) for part in cache[positions].chunk(2, -1))
+    x1, x2 = x.view(x.shape[0], -1, head_size).chunk(2, -1)
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
+    return rotated.view(x.shape)
+
+
+def _rope_inputs(cache_width=HEAD):
+    return (
+        torch.tensor([0, 3, 1, 9, 4]),
+        torch.randn(T, 2 * HEAD),
+        torch.randn(T, HEAD),
+        torch.randn(10, cache_width),
+    )
+
+
+def _rope_graph(*, key=True, is_neox=True, extra=()):
+    graph = torch.fx.Graph()
+    pos, qin, kin, cache = (graph.placeholder(n) for n in ("pos", "q", "k", "cache"))
+    q = graph.call_function(aten.clone.default, (qin,))
+    k = graph.call_function(aten.clone.default, (kin,)) if key else None
+    graph.call_function(
+        torch.ops._C.rotary_embedding.default,
+        (pos, q, k, HEAD, cache, is_neox, *extra),
+    )
+    graph.output((q, k) if key else (q,))
+    return graph
+
+
+def test_rotary_embedding_neox_matches_reference():
+    inputs = _rope_inputs()
+    pos, qin, kin, cache = inputs
+    gm = _decompose(_fake(_rope_graph(), *inputs))
+
+    q, k = gm(*inputs)
+    torch.testing.assert_close(q, _ref_rope(pos, qin, HEAD, cache))
+    torch.testing.assert_close(k, _ref_rope(pos, kin, HEAD, cache))
+
+
+def test_rotary_views_keep_token_dim_symbolic():
+    gm = _decompose(_fake(_rope_graph(), *_rope_inputs()))
+
+    views = [
+        n
+        for n in gm.graph.nodes
+        if n.target is aten.view.default and DECOMPOSED_FROM_KEY in n.meta
+    ]
+    assert views and all(n.args[1][0] == -1 for n in views)
+
+
+def test_qwen_rms_norm_then_rotary_chain():
+    graph = torch.fx.Graph()
+    pos, qin, kin, cache, w = (
+        graph.placeholder(n) for n in ("pos", "q", "k", "cache", "w")
+    )
+    qv = graph.call_function(aten.view.default, (qin, [T, 2, HEAD]))
+    out = _empty(graph, [T, 2, HEAD])
+    graph.call_function(torch.ops._C.rms_norm.default, (out, qv, w, EPS))
+    q1 = graph.call_function(aten.view.default, (out, [T, 2 * HEAD]))
+    k = graph.call_function(aten.clone.default, (kin,))
+    graph.call_function(
+        torch.ops._C.rotary_embedding.default, (pos, q1, k, HEAD, cache, True)
+    )
+    graph.output((graph.call_function(aten.view.default, (q1, [-1, 2, HEAD])),))
+    inputs = (*_rope_inputs(), torch.randn(HEAD))
+    pos_val, q_val, _, cache_val, w_val = inputs
+    gm = _decompose(_fake(graph, *inputs))
+
+    (query,) = gm(*inputs)
+    normed = _ref_rms(q_val.view(T, 2, HEAD), w_val, EPS).view(T, 2 * HEAD)
+    expected = _ref_rope(pos_val, normed, HEAD, cache_val).view(-1, 2, HEAD)
+    torch.testing.assert_close(query, expected)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["not_neox", "rope_dim_offset", "inverse", "no_key", "partial_rotary"],
+)
+def test_unsupported_rotary_variants_raise(variant):
+    graph = _rope_graph(
+        key=variant != "no_key",
+        is_neox=variant != "not_neox",
+        extra={"rope_dim_offset": (1, False), "inverse": (0, True)}.get(variant, ()),
+    )
+    width = HEAD // 2 if variant == "partial_rotary" else HEAD
+    gm = _fake(graph, *_rope_inputs(width))
+
+    with pytest.raises(NotImplementedError, match="rotary_embedding"):
+        decompose_custom_ops(gm.graph)

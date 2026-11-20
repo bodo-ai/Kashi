@@ -10,6 +10,7 @@ Every emitted node records which call it came from under
 turns that into an MLIR ``NameLoc`` so later IREE passes can still group them.
 """
 
+import math
 from collections import Counter
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -74,10 +75,67 @@ def _silu_and_mul(emit: _Emitter, a: dict) -> dict:
     return {a["result"]: emit(aten.mul.Tensor, emit(aten.silu.default, gate), up)}
 
 
+def _rotary_embedding(emit: _Emitter, a: dict) -> dict:
+    """NeoX-style rotation over the full head, the only variant Qwen3 uses."""
+    head_size, cache = a["head_size"], a["cos_sin_cache"]
+    problems = [
+        message
+        for failed, message in (
+            (not a["is_neox"], "is_neox=False"),
+            (a["rope_dim_offset"] != 0, f"rope_dim_offset={a['rope_dim_offset']}"),
+            (a["inverse"], "inverse=True"),
+            (a["key"] is None, "key=None"),
+            (
+                cache.meta["val"].shape[-1] != head_size,
+                "partial rotary (cos_sin_cache width != head_size)",
+            ),
+        )
+        if failed
+    ]
+    if problems:
+        raise NotImplementedError(
+            f"unsupported _C.rotary_embedding: {', '.join(problems)}"
+        )
+
+    half = head_size // 2
+    cos_sin = emit(aten.index.Tensor, cache, [a["positions"]])
+    cos = emit(
+        aten.unsqueeze.default, emit(aten.slice.Tensor, cos_sin, -1, 0, half), -2
+    )
+    sin = emit(
+        aten.unsqueeze.default,
+        emit(aten.slice.Tensor, cos_sin, -1, half, head_size),
+        -2,
+    )
+
+    def rotate(x):
+        # The token dimension stays -1 so a symbolic token count is never baked in.
+        shape = list(x.meta["val"].shape[1:])
+        heads = math.prod(shape) // head_size
+        heads_view = emit(aten.view.default, x, [-1, heads, head_size])
+        x1 = emit(aten.slice.Tensor, heads_view, -1, 0, half)
+        x2 = emit(aten.slice.Tensor, heads_view, -1, half, head_size)
+        first = emit(
+            aten.sub.Tensor,
+            emit(aten.mul.Tensor, x1, cos),
+            emit(aten.mul.Tensor, x2, sin),
+        )
+        second = emit(
+            aten.add.Tensor,
+            emit(aten.mul.Tensor, x2, cos),
+            emit(aten.mul.Tensor, x1, sin),
+        )
+        rotated = emit(aten.cat.default, [first, second], -1)
+        return emit(aten.view.default, rotated, [-1, *shape])
+
+    return {a["query"]: rotate(a["query"]), a["key"]: rotate(a["key"])}
+
+
 _DECOMPOSITIONS: dict[str, _Rule] = {
     "_C::rms_norm": _rms_norm,
     "_C::fused_add_rms_norm": _fused_add_rms_norm,
     "_C::silu_and_mul": _silu_and_mul,
+    "_C::rotary_embedding": _rotary_embedding,
 }
 
 
