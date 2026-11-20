@@ -35,11 +35,11 @@ def _is_c_op(node):
     return node.op == "call_function" and str(node.target).startswith("_C.")
 
 
-def _empty(graph, shape, dtype=torch.float32):
+def _empty(graph, shape, dtype=torch.float32, device="cpu"):
     return graph.call_function(
         aten.empty.memory_format,
         (shape,),
-        {"dtype": dtype, "device": torch.device("cpu")},
+        {"dtype": dtype, "device": torch.device(device)},
     )
 
 
@@ -368,3 +368,52 @@ def test_partitioned_artifact_keeps_tags(tmp_path):
 
     partitioned = (result.artifact_dir / "partitioned.mlir").read_text()
     assert "kashi.decomposed:_C.rms_norm#0" in partitioned
+
+
+# --- Parity with vLLM's real kernels (CUDA only). ---------------------------
+
+
+def _cuda_case(name):
+    """Build ``name``'s graph with CUDA buffers and matching CUDA inputs."""
+    graph = torch.fx.Graph()
+    if name == "rotary_embedding":
+        return _rope_graph(), [t.cuda() for t in _rope_inputs()]
+    if name == "silu_and_mul":
+        x = graph.placeholder("x")
+        out = _empty(graph, [3, 4], device="cuda")
+        graph.call_function(torch.ops._C.silu_and_mul.default, (out, x))
+        graph.output((out,))
+        return graph, [torch.randn(3, 8, device="cuda")]
+    x, w = graph.placeholder("x"), graph.placeholder("w")
+    if name == "rms_norm":
+        out = _empty(graph, [3, 8], device="cuda")
+        graph.call_function(torch.ops._C.rms_norm.default, (out, x, w, EPS))
+        graph.output((out,))
+        return graph, [torch.randn(3, 8, device="cuda"), torch.randn(8, device="cuda")]
+    res = graph.placeholder("res")
+    i = graph.call_function(aten.clone.default, (x,))
+    r = graph.call_function(aten.clone.default, (res,))
+    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i, r, w, EPS))
+    graph.output((i, r))
+    return graph, [
+        torch.randn(3, 8, device="cuda"),
+        torch.randn(8, device="cuda"),
+        torch.randn(3, 8, device="cuda"),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM _C kernels need CUDA")
+@pytest.mark.parametrize(
+    "case", ["rms_norm", "fused_add_rms_norm", "silu_and_mul", "rotary_embedding"]
+)
+def test_decomposition_matches_vllm_kernel_on_cuda(case):
+    graph, inputs = _cuda_case(case)
+    kernel = torch.fx.GraphModule(torch.nn.Module(), graph)
+    decomposed = _decompose(_fake(_cuda_case(case)[0], *inputs))
+
+    kernel_out = kernel(*[t.clone() for t in inputs])
+    decomposed_out = decomposed(*[t.clone() for t in inputs])
+
+    assert len(kernel_out) == len(decomposed_out)
+    for got, want in zip(decomposed_out, kernel_out, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
