@@ -55,8 +55,14 @@ if(NOT KASHI_IREE_SOURCE_DIR)
     if(NOT _staging)
       set(_staging "${KASHI_IREE_SOURCE_DIR}.staging-${_suffix}")
       file(MAKE_DIRECTORY "${_staging}")
-      execute_process(COMMAND "${GIT_EXECUTABLE}" clone --filter=blob:none --no-checkout
-        https://github.com/iree-org/iree.git "${_staging}" COMMAND_ERROR_IS_FATAL ANY)
+      # Fetch the complete pinned tree explicitly; a filtered default-branch
+      # clone can have the commit without the objects needed to check it out.
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}" init --quiet
+        COMMAND_ERROR_IS_FATAL ANY)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}" remote add origin
+        https://github.com/iree-org/iree.git COMMAND_ERROR_IS_FATAL ANY)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}" fetch --no-tags
+        --depth 1 origin "${KASHI_IREE_REVISION}" COMMAND_ERROR_IS_FATAL ANY)
       execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}"
         checkout --detach "${KASHI_IREE_REVISION}" COMMAND_ERROR_IS_FATAL ANY)
       execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}"
