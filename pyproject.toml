@@ -13,7 +13,7 @@ dependencies = ["iree-base-compiler==3.14.0"]
 [tool.scikit-build]
 wheel.packages = ["python/src/kashi"]
 build-dir = "build/scikit/{wheel_tag}-iree-5332c68"
-cmake.version = ">=3.26"
+cmake.version = ">=3.29"
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
@@ -43,8 +43,9 @@ platforms = [
 python = "3.12.*"
 setuptools = "==78.1.1"
 cxx-compiler = "*"
-cmake = ">=3.26"
+cmake = ">=3.29"
 ninja = "*"
+sccache = "*"
 python-build = "*"
 pip = "*"
 pytest = "*"
@@ -55,6 +56,9 @@ ruff = "*"
 clang-tools = "21.*"
 clangxx = "21.*"
 pre-commit = ">=4.7.0,<5"
+
+[tool.pixi.target.linux-64.dependencies]
+mold = "*"
 
 [tool.pixi.pypi-dependencies]
 kashi = { path = ".", editable = true }
