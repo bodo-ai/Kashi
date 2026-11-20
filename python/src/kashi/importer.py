@@ -435,7 +435,9 @@ def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None
         if any(node_order[user] > node_order[node] for user in alias.users):
             reject(f"{alias.name} aliases output and is used after the call")
 
-    output_users = [user for user in output.users if node_order[user] > node_order[node]]
+    output_users = [
+        user for user in output.users if node_order[user] > node_order[node]
+    ]
     with graph.inserting_before(node):
         result = graph.call_function(
             torch.ops.kashi.unified_attention.default,
@@ -453,7 +455,11 @@ def _derived_before(base: torch.fx.Node, call: torch.fx.Node, node_order) -> set
     found, stack = {base}, [base]
     while stack:
         for user in stack.pop().users:
-            if user is not call and node_order[user] < node_order[call] and user not in found:
+            if (
+                user is not call
+                and node_order[user] < node_order[call]
+                and user not in found
+            ):
                 found.add(user)
                 stack.append(user)
     return found

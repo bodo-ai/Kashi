@@ -125,9 +125,8 @@ def test_duplicate_run_identity_and_invalid_transitions_are_rejected(tmp_path):
 def test_lock_is_exclusive_and_released_after_exit(tmp_path):
     path = tmp_path / "lock"
     with exclusive_lock(path):
-        with pytest.raises(LockError):
-            with exclusive_lock(path):
-                pass
+        with pytest.raises(LockError), exclusive_lock(path):
+            pass
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     with exclusive_lock(path):
         pass
@@ -142,12 +141,17 @@ with exclusive_lock(sys.argv[1]):
  sys.stdin.read(1)
  os._exit(9)
 """
-    proc = subprocess.Popen([sys.executable, "-c", script, str(path)], cwd=Path(__file__).resolve().parents[2], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(path)],
+        cwd=Path(__file__).resolve().parents[2],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
     try:
         assert proc.stdout.readline().strip() == "locked"
-        with pytest.raises(LockError):
-            with exclusive_lock(path):
-                pass
+        with pytest.raises(LockError), exclusive_lock(path):
+            pass
         proc.stdin.write("x")
         proc.stdin.flush()
         assert proc.wait(timeout=5) == 9
@@ -162,8 +166,14 @@ with exclusive_lock(sys.argv[1]):
 def test_list_pods_walks_every_cursor_and_encodes_it():
     requests = []
     pages = [
-        {"pods": [{"id": "one", "name": "first"}], "pagination": {"nextCursor": "a+/=", "hasNextPage": True}},
-        {"pods": [{"id": "two", "name": "second"}], "pagination": {"nextCursor": None, "hasNextPage": False}},
+        {
+            "pods": [{"id": "one", "name": "first"}],
+            "pagination": {"nextCursor": "a+/=", "hasNextPage": True},
+        },
+        {
+            "pods": [{"id": "two", "name": "second"}],
+            "pagination": {"nextCursor": None, "hasNextPage": False},
+        },
     ]
 
     def open_request(request, timeout):
@@ -172,24 +182,51 @@ def test_list_pods_walks_every_cursor_and_encodes_it():
 
     api = RunpodAPI("key-123", opener=open_request)
     assert [pod["id"] for pod in api.list_pods()] == ["one", "two"]
-    assert requests == [("https://api.runpod.io/v2/pods", "Bearer key-123"), ("https://api.runpod.io/v2/pods?cursor=a%2B%2F%3D", "Bearer key-123")]
+    assert requests == [
+        ("https://api.runpod.io/v2/pods", "Bearer key-123"),
+        ("https://api.runpod.io/v2/pods?cursor=a%2B%2F%3D", "Bearer key-123"),
+    ]
 
 
-@pytest.mark.parametrize("pagination", [None, {}, {"hasNextPage": True, "nextCursor": None}, {"hasNextPage": "false", "nextCursor": None}])
+@pytest.mark.parametrize(
+    "pagination",
+    [
+        None,
+        {},
+        {"hasNextPage": True, "nextCursor": None},
+        {"hasNextPage": "false", "nextCursor": None},
+    ],
+)
 def test_list_pods_rejects_incomplete_pagination(pagination):
-    api = RunpodAPI("key", opener=lambda *_args, **_kwargs: Response({"pods": [], "pagination": pagination}))
+    api = RunpodAPI(
+        "key",
+        opener=lambda *_args, **_kwargs: Response(
+            {"pods": [], "pagination": pagination}
+        ),
+    )
     with pytest.raises(APIError):
         api.list_pods()
 
 
 def test_list_pods_rejects_repeated_cursor():
-    api = RunpodAPI("key", opener=lambda *_args, **_kwargs: Response({"pods": [], "pagination": {"hasNextPage": True, "nextCursor": "same"}}))
+    api = RunpodAPI(
+        "key",
+        opener=lambda *_args, **_kwargs: Response(
+            {"pods": [], "pagination": {"hasNextPage": True, "nextCursor": "same"}}
+        ),
+    )
     with pytest.raises(APIError):
         api.list_pods()
 
 
 def http_error(request, status, headers=None):
-    return urllib.error.HTTPError(request.full_url, status, "failed", headers or {}, io.BytesIO(b"sensitive error body"))
+    return urllib.error.HTTPError(
+        request.full_url,
+        status,
+        "failed",
+        headers or {},
+        io.BytesIO(b"sensitive error body"),
+    )
 
 
 def test_rate_limit_retries_honor_retry_after_for_get_and_delete():
@@ -233,7 +270,9 @@ def test_long_retry_after_fails_without_retrying_too_early():
         calls.append(request.method)
         raise http_error(request, 429, {"Retry-After": "3600"})
 
-    api = RunpodAPI("key", opener=opener, sleep=lambda _: pytest.fail("must not sleep an hour"))
+    api = RunpodAPI(
+        "key", opener=opener, sleep=lambda _: pytest.fail("must not sleep an hour")
+    )
     with pytest.raises(APIError):
         api.list_pods()
     assert calls == ["GET"]
@@ -280,7 +319,10 @@ def test_ambiguous_create_remains_unresolved_until_delayed_pod_is_found(tmp_path
     api = FakeAPI()
     assert reconcile(journal, api, "account-1")[0]["name"] == "bench-exact"
     assert not api.deleted
-    api.pods = [{"name": "bench-exact-extra", "id": "other"}, {"name": "bench-exact", "id": "late"}]
+    api.pods = [
+        {"name": "bench-exact-extra", "id": "other"},
+        {"name": "bench-exact", "id": "late"},
+    ]
     assert reconcile(journal, api, "account-1") == []
     assert api.deleted == ["late"]
 
@@ -290,11 +332,13 @@ def test_reconcile_deletes_all_exact_matches_and_verified_id_only(tmp_path):
     create_record(journal)
     journal.mark_sent("run-1")
     journal.set_pod_id("run-1", "verified")
-    api = FakeAPI([
-        {"name": "bench-exact", "id": "first"},
-        {"name": "bench-exact", "id": "second"},
-        {"name": "bench-exact-other", "id": "unrelated"},
-    ])
+    api = FakeAPI(
+        [
+            {"name": "bench-exact", "id": "first"},
+            {"name": "bench-exact", "id": "second"},
+            {"name": "bench-exact-other", "id": "unrelated"},
+        ]
+    )
     assert reconcile(journal, api, "account-1") == []
     assert set(api.deleted) == {"verified", "first", "second"}
 
@@ -320,7 +364,10 @@ def test_failed_deletion_does_not_forget_previously_confirmed_matches(tmp_path):
     journal = Journal(tmp_path / "journal.json")
     create_record(journal)
     journal.mark_sent("run-1")
-    api = FakeAPI([{"name": "bench-exact", "id": "one"}, {"name": "bench-exact", "id": "two"}], deletes={"two": False})
+    api = FakeAPI(
+        [{"name": "bench-exact", "id": "one"}, {"name": "bench-exact", "id": "two"}],
+        deletes={"two": False},
+    )
     assert reconcile(journal, api, "account-1")
     assert set(api.deleted) == {"one", "two"}
     api.deleted.clear()
@@ -359,7 +406,11 @@ j.begin('run', 'bench-abrupt', 1700000000, 'account')
 j.mark_sent('run')
 os._exit(13)
 """
-    result = subprocess.run([sys.executable, "-c", script, str(path)], cwd=Path(__file__).resolve().parents[2], check=False)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        cwd=Path(__file__).resolve().parents[2],
+        check=False,
+    )
     assert result.returncode == 13
     journal = Journal(path)
     assert reconcile(journal, FakeAPI(), "account")[0]["state"] == "may-have-been-sent"
