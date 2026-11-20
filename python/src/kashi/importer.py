@@ -388,8 +388,8 @@ def _resolve_packet(node: torch.fx.Node) -> None:
 
 
 def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
-    """Replace vLLM's ``unified_attention_with_output`` call with
-    ``kashi.unified_attention``; later uses of ``output`` read its result.
+    """Replace vLLM's ``unified_attention_with_output`` call with equivalent
+    functional version ``kashi.unified_attention`` (a dummy without implementation).
 
     Only safe when nothing else can observe the write: ``output`` must be a
     contiguous, query-shaped view of a fresh ``empty`` that nothing reads
@@ -401,6 +401,7 @@ def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None
             f"Cannot functionalize attention, {reason}: {node.format_node()}"
         )
 
+    # Check output shape and other properties to match pattern
     bound = torch.fx.operator_schemas.normalize_function(
         node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     ).kwargs
@@ -423,7 +424,7 @@ def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None
         if any(order[user] > order[node] for user in alias.users):
             reject(f"{alias.name} aliases output and is used after the call")
 
-    later = [user for user in output.users if order[user] > order[node]]
+    output_users = [user for user in output.users if order[user] > order[node]]
     with graph.inserting_before(node):
         result = graph.call_function(
             torch.ops.kashi.unified_attention.default,
@@ -431,7 +432,7 @@ def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None
             {"kv_cache_dummy_dep": bound["kv_cache_dummy_dep"]},
         )
     result.meta = dict(output.meta)
-    for user in later:
+    for user in output_users:
         user.replace_input_with(output, result)
     graph.erase_node(node)
 
