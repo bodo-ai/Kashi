@@ -1,9 +1,8 @@
-import pytest
-
-torch = pytest.importorskip("torch")
-
 import operator
 
+import pytest
+import torch
+from fx_test_utils import call_targets
 from iree.compiler import ir
 from kashi.mlir_to_fx import rebuild_fx
 from torch.utils import _pytree as pytree
@@ -12,10 +11,6 @@ from torch.utils import _pytree as pytree
 def _parse(body: str) -> ir.Module:
     with ir.Context():
         return ir.Module.parse(body)
-
-
-def _targets(gm):
-    return [n.target for n in gm.graph.nodes if n.op == "call_function"]
 
 
 def _call_nodes(gm):
@@ -62,7 +57,7 @@ func.func @main(%arg0: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[3,2],f32> {
 def test_rebuild_linear(bias):
     gm = rebuild_fx(_parse(LINEAR if bias else LINEAR_NO_BIAS))
 
-    assert _targets(gm) == [torch.ops.aten.linear.default]
+    assert call_targets(gm) == [torch.ops.aten.linear.default]
     x, w, b = torch.randn(2, 4), torch.randn(3, 4), torch.randn(3)
     if bias:
         torch.testing.assert_close(gm(x, w, b), torch.ops.aten.linear.default(x, w, b))
@@ -134,7 +129,7 @@ func.func @main(%arg0: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
 def test_rebuild_keeps_unused_op():
     gm = rebuild_fx(_parse(UNUSED_OP))
 
-    assert _targets(gm) == [torch.ops.aten.view.default]
+    assert call_targets(gm) == [torch.ops.aten.view.default]
 
 
 MULTI_RESULT = """
@@ -196,7 +191,7 @@ func.func @main(%arg0: !torch.vtensor<[2,6],f32>) -> (!torch.vtensor<[2,3],f32>,
 def test_rebuild_chunk():
     gm = rebuild_fx(_parse(CHUNK))
 
-    assert _targets(gm) == [
+    assert call_targets(gm) == [
         torch.ops.aten.chunk.default,
         operator.getitem,
         operator.getitem,
@@ -377,7 +372,7 @@ def test_rebuild_zero_result_operator_runs_once(test_ops):
 
     out, d = gm(3, x, test_ops.Tag(2.0), test_ops.Tag(3.0))
 
-    assert _targets(gm).count(torch.ops.kashi_test.write.default) == 1
+    assert call_targets(gm).count(torch.ops.kashi_test.write.default) == 1
     torch.testing.assert_close(out, x + 3.0)
     torch.testing.assert_close(d, x * 2.0)
 

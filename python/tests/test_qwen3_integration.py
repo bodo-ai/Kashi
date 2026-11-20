@@ -1,50 +1,44 @@
 """Exercise real Qwen3 prefill and decode through the kashi vLLM backend."""
 
 import pytest
-
-pytest.importorskip("torch")
-pytest.importorskip("vllm")
-
-import vllm_backend_spy
+from backend_spy import VLLM_BACKEND, VLLM_SPY
 from vllm_test_utils import (
     QWEN_MAX_TOKENS,
     QWEN_PROMPTS,
     assert_outputs_match,
     generate_qwen,
-    model_dir,
 )
 
-# Pytest discovers the imported fixture by name; expose that use to Ruff.
-__all__ = ["model_dir"]
+pytestmark = pytest.mark.integration
 
 
-def test_qwen3_generation_matches_uncompiled_vllm(model_dir):
+def test_qwen3_generation_matches_uncompiled_vllm(qwen_model_dir):
     """Compare compiled and eager Qwen3 token IDs and selected log-probabilities."""
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
     compiled = generate_qwen(
-        model_dir,
+        qwen_model_dir,
         CompilationConfig(
             mode=CompilationMode.DYNAMO_TRACE_ONCE,
-            backend="vllm_backend_spy.spy_compile_fx",
+            backend=VLLM_BACKEND,
             # Replaying a CUDA graph would bypass the Python spy on decode.
             cudagraph_mode=CUDAGraphMode.NONE,
         ),
         record_generation=True,
     )
     reference = generate_qwen(
-        model_dir,
+        qwen_model_dir,
         CompilationConfig(
             mode=CompilationMode.NONE,
             cudagraph_mode=CUDAGraphMode.NONE,
         ),
     )
 
-    assert len(vllm_backend_spy.CALLS) == 1
-    gm, rebuilt = vllm_backend_spy.CALLS[0]
+    assert len(VLLM_SPY.calls) == 1
+    gm, rebuilt = VLLM_SPY.calls[0]
     assert rebuilt is not gm.forward
-    # Both prompts are prefetched in one batch; subsequent calls decode both.
-    assert {14, 2} <= set(vllm_backend_spy.TOKEN_COUNTS)
+    # Both prompts are prefilled in one batch; subsequent calls decode both.
+    assert {14, 2} <= set(VLLM_SPY.token_counts)
 
     assert_outputs_match(
         compiled,
