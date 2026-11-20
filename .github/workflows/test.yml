@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
 jobs:
   lint:
     name: Formatting and linting
@@ -61,27 +64,6 @@ jobs:
       - name: Native tests with coverage
         if: runner.os == 'Linux'
         run: pixi run --locked -e cpp-coverage coverage-cpp
-      - name: Build wheel
-        run: pixi run --locked python -m build --wheel --outdir "$RUNNER_TEMP/wheels"
-      - name: Install wheel and import outside checkout
-        run: |
-          pixi run --locked python -m venv "$RUNNER_TEMP/wheel-env"
-          "$RUNNER_TEMP/wheel-env/bin/python" -I -m pip install --no-deps "$RUNNER_TEMP"/wheels/*.whl
-          mkdir -p "$RUNNER_TEMP/wheel-check"
-          cd "$RUNNER_TEMP/wheel-check"
-          "$RUNNER_TEMP/wheel-env/bin/python" -I - <<'PY'
-          import pathlib
-          import sys
-          import kashi
-          import kashi._native
-
-          environment = pathlib.Path(sys.prefix).resolve()
-          for module in (kashi, kashi._native):
-              path = pathlib.Path(module.__file__).resolve()
-              print(f"{module.__name__}: {path}")
-              if not path.is_relative_to(environment):
-                  raise RuntimeError(f"{module.__name__} was not imported from the wheel environment")
-          PY
       - name: Require more than 90% changed-line coverage
         if: runner.os == 'Linux' && github.event_name == 'pull_request'
         shell: bash

@@ -341,6 +341,7 @@ def main():
     runner = executable("MULL_RUNNER", "mull-runner-19")
     reporter = executable("MULL_REPORTER", "mull-reporter-19")
     compiler = executable("MULL_CXX", "clang++-19")
+    c_compiler = executable("MULL_CC", "clang-19")
     plugin = Path(
         os.environ.get("MULL_PLUGIN", "/usr/lib/mull-ir-frontend-19")
     ).resolve()
@@ -402,8 +403,10 @@ def main():
             "-DKASHI_BUILD_TESTS=ON",
             "-DKASHI_MUTATION=ON",
             f"-DKASHI_MULL_PLUGIN={plugin}",
+            f"-DKASHI_MULL_CONFIG={env['MULL_CONFIG']}",
             f"-DCMAKE_CXX_COMPILER={compiler}",
-            "-DCMAKE_BUILD_TYPE=Debug",
+            f"-DCMAKE_C_COMPILER={c_compiler}",
+            "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dnanobind_DIR={nanobind}",
@@ -411,10 +414,7 @@ def main():
         ],
         env=env,
     )
-    # Recompile when the policy changes as it is consumed by the plugin.
-    build_output = run(
-        ["cmake", "--build", BUILD, "--clean-first"], env=env, capture=True
-    )
+    build_output = run(["cmake", "--build", BUILD], env=env, capture=True)
     print(build_output, end="", flush=True)
     if "Using some defaults" in build_output or "Failed to load passes" in build_output:
         raise MutationError("Mull plugin or configuration failed during compilation")
@@ -466,6 +466,10 @@ def main():
             [
                 runner,
                 "--allow-surviving",
+                # Let the fork regression's five-second child alarm fail the
+                # test before Mull classifies a deadlock mutant as a timeout.
+                "--minimum-timeout",
+                "8000",
                 "--reporters",
                 "SQLite",
                 "--report-dir",

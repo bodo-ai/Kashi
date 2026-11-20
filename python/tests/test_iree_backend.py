@@ -1,5 +1,7 @@
 """Integration tests for the opt-in IREE compilation and graph reassembly path."""
 
+import json
+import re
 import sys
 
 import pytest
@@ -14,6 +16,7 @@ from torch.utils import _pytree as pytree
 # extensions; its input and destination must remain correctly ordered in FX.
 _LIB = torch.library.Library("kashi_iree_integration", "FRAGMENT")
 _LIB.define("write(Tensor(a!) out, Tensor value) -> ()")
+_LIB.define("fill(Tensor(a!) out, float value) -> ()")
 
 
 def _write(out, value):
@@ -22,6 +25,14 @@ def _write(out, value):
 
 
 _LIB.impl("write", _write, "CompositeExplicitAutograd")
+
+
+def _fill(out, value):
+    """Consume a scalar at a custom boundary by mutating the output tensor."""
+    out.fill_(value)
+
+
+_LIB.impl("fill", _fill, "CompositeExplicitAutograd")
 
 
 def _graph_with_mutating_boundary():
@@ -55,10 +66,14 @@ def _depends_on(node, source):
 @pytest.mark.skipif(
     sys.platform == "darwin", reason="CUDA/PTX integration is not exercised on macOS"
 )
-def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
+def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(
+    tmp_path, monkeypatch
+):
     """Real CUDA compilation produces kernel calls around the mutating operator."""
     from kashi.iree_backend import compile_iree_fx
     from kashi.iree_reassembly import IreeKernel
+
+    monkeypatch.setenv("PATH", "")
 
     compiled = compile_iree_fx(
         _graph_with_mutating_boundary(), output_dir=tmp_path, cuda_target="sm_80"
@@ -77,10 +92,19 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
     after = [node for node in kernels if calls.index(node) > calls.index(write)]
     assert any(_depends_on(write.args[1], node) for node in before)
     assert any(_depends_on(node, write.args[0]) for node in after)
+    manifest = json.loads(compiled.kernel_manifest.read_text())
+    linked_files = set()
     for node in kernels:
-        name = f"module_{node.target.executable}_cuda_nvptx_fb.ptx"
-        ptx = next(path for path in compiled.ptx_files if path.name == name)
-        assert f".entry {node.target.export.replace('$', '_')}" in ptx.read_text()
+        kernel = manifest[node.target.executable][node.target.export]
+        path = compiled.artifact_dir / kernel["file"]
+        linked_files.add(path)
+        assert path in compiled.ptx_files
+        assert re.search(
+            rf"\.entry\s+{re.escape(kernel['entry'])}\s*\(", path.read_text()
+        )
+        assert node.meta["iree_ptx_entry"] == kernel["entry"]
+        assert kernel["entry"] != node.target.export
+    assert len(linked_files) == 1 and len(kernels) >= 2
     output = next(
         node for node in compiled.graph.graph.nodes if node.op == "output"
     ).args[0]
@@ -89,17 +113,36 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
         compiled.graph(torch.ones(4, 8), torch.empty(4, 8))
 
 
-def test_missing_compiler_fails_without_falling_back(tmp_path):
-    """An unavailable compiler must not silently return an ordinary FX graph."""
+@pytest.mark.skipif(
+    sys.platform == "darwin", reason="The public IREE backend requires CUDA compilation"
+)
+def test_compile_iree_fx_rejects_float_crossing_custom_boundary(tmp_path):
+    """An unsupported segment live-out fails before a driver is emitted."""
     from kashi.iree_backend import compile_iree_fx
 
-    with pytest.raises(RuntimeError, match="Could not run IREE compiler"):
-        compile_iree_fx(
-            _graph_with_mutating_boundary(),
-            output_dir=tmp_path,
-            cuda_target="sm_80",
-            compiler=tmp_path / "missing-iree-compile",
-        )
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    out = graph.placeholder("out")
+    scalar = graph.call_function(torch.ops.aten.Float.Tensor, (x,))
+    fill = graph.call_function(
+        torch.ops.kashi_iree_integration.fill.default, (out, scalar)
+    )
+    graph.output(out)
+    with FakeTensorMode() as mode:
+        x.meta["val"] = mode.from_tensor(torch.empty(()))
+        out.meta["val"] = mode.from_tensor(torch.empty(4))
+    scalar.meta["val"] = 0.0
+    fill.meta["val"] = None
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    with pytest.raises(NotImplementedError, match="partition"):
+        compile_iree_fx(gm, output_dir=tmp_path, cuda_target="sm_80")
+
+    (artifact_dir,) = tmp_path.glob("kashi-iree-*")
+    log = (artifact_dir / "iree-compile.log").read_text()
+    assert "unsupported live-out for segment_0" in log
+    assert "!torch.float" in log
+    assert not (artifact_dir / "driver.mlir").exists()
 
 
 DRIVER = """

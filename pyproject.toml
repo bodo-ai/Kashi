@@ -8,9 +8,12 @@ version = "0.1.0"
 description = "Python and MLIR compiler development skeleton"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = ["iree-base-compiler==3.14.0"]
 
 [tool.scikit-build]
 wheel.packages = ["python/src/kashi"]
+build-dir = "build/scikit/{wheel_tag}-iree-5332c68"
+cmake.version = ">=3.26"
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
@@ -40,7 +43,7 @@ platforms = [
 python = "3.12.*"
 setuptools = "==78.1.1"
 cxx-compiler = "*"
-cmake = ">=3.20"
+cmake = ">=3.26"
 ninja = "*"
 python-build = "*"
 pip = "*"
@@ -74,9 +77,10 @@ bash -c 'set -e
 nanobind_dir=$(python -m nanobind --cmake_dir)
 cmake -S . -B build/lint-cpp -G Ninja \
     -DCMAKE_CXX_COMPILER=clang++ -DKASHI_BUILD_TESTS=ON -DKASHI_LINT=ON \
+    -DCMAKE_BUILD_TYPE=Release \
     -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
     -Dnanobind_DIR="$nanobind_dir" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
-cmake --build build/lint-cpp --clean-first'
+cmake --build build/lint-cpp'
 '''
 lint = { depends-on = ["check-format-python", "lint-python", "check-format-cpp", "lint-cpp"] }
 

@@ -1,0 +1,52 @@
+name: Embedded compiler wheels
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            build: cp312-manylinux_x86_64
+            arch: x86_64
+          - runner: macos-15
+            build: cp312-macosx_arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build, repair, and smoke-test wheel outside checkout
+        uses: pypa/cibuildwheel@v3.3.1
+        env:
+          CIBW_BUILD: ${{ matrix.build }}
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_LINUX: CMAKE_BUILD_PARALLEL_LEVEL=4
+          CIBW_ENVIRONMENT_MACOS: CMAKE_BUILD_PARALLEL_LEVEL=4 MACOSX_DEPLOYMENT_TARGET=14.0
+          CIBW_BEFORE_TEST_LINUX: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
+          CIBW_BEFORE_TEST_MACOS: pip install torch==2.14.0
+          CIBW_TEST_SOURCES: scripts/smoke_embedded_wheel.py
+          CIBW_TEST_COMMAND: python -I scripts/smoke_embedded_wheel.py iree-first && python -I scripts/smoke_embedded_wheel.py kashi-first
+      - name: Audit repaired wheel ABI, contents, notices, and size
+        env:
+          KASHI_PYPI_LIMIT_MIB: ${{ vars.KASHI_PYPI_LIMIT_MIB || '100' }}
+        run: python scripts/audit_embedded_wheel.py wheelhouse/*.whl --limit-mib "$KASHI_PYPI_LIMIT_MIB"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.build }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
