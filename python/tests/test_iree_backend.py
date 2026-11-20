@@ -85,8 +85,29 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
         node for node in compiled.graph.graph.nodes if node.op == "output"
     ).args[0]
     assert isinstance(output, dict) and isinstance(output["result"], tuple)
-    with pytest.raises(NotImplementedError, match="opaque"):
-        compiled.graph(torch.ones(4, 8), torch.empty(4, 8))
+
+
+@pytest.mark.parametrize("mode", ["cuda", "iree"])
+def test_alias_only_graph_executes_without_iree_segments(tmp_path, monkeypatch, mode):
+    """A graph containing only alias-sensitive operations needs no VMFB."""
+    from kashi.iree_backend import compile_iree_fx
+
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", mode)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    view = graph.call_function(torch.ops.aten.view.default, (x, [2, 2]))
+    graph.output(view)
+    with FakeTensorMode() as fake_mode:
+        value = fake_mode.from_tensor(torch.empty(4))
+        x.meta["val"] = value
+        view.meta["val"] = value.view(2, 2)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    compiled = compile_iree_fx(gm, output_dir=tmp_path, cuda_target="sm_80")
+    source = torch.arange(4.0)
+    result = compiled.graph(source)
+    torch.testing.assert_close(result, source.view(2, 2))
+    assert result.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+    assert not compiled.ptx_files and compiled.vmfb_path is None
 
 
 def test_missing_compiler_fails_without_falling_back(tmp_path):
