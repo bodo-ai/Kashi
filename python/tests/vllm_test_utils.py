@@ -1,17 +1,28 @@
 """Shared setup, generation and parity checks for the vLLM integration tests."""
 
 import gc
-import json
 import math
 from contextlib import contextmanager
 from functools import partial
 
-import pytest
 import torch
-import vllm_backend_spy
+from backend_spy import VLLM_SPY
 
-# A local config and token IDs avoid downloading a model or tokenizer. A head
+# Local configs and token IDs avoid downloading a model or tokenizer. A head
 # size of 64 is supported by both vLLM's CPU and GPU attention backends.
+SIMPLE_VLLM_CONFIG = {
+    "architectures": ["SimpleVllmForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 128,
+    "num_attention_heads": 2,  # head size 64; CPU attention rejects 16
+    "num_key_value_heads": 2,
+    "num_hidden_layers": 1,
+    "intermediate_size": 256,
+    "vocab_size": 128,
+    "max_position_embeddings": 256,
+    "torch_dtype": "float32",
+}
+
 QWEN_CONFIG = {
     "architectures": ["Qwen3ForCausalLM"],
     "model_type": "qwen3",
@@ -57,9 +68,7 @@ def vllm_test_environment(
     else:
         monkeypatch.setenv("VLLM_CPU_KVCACHE_SPACE", cpu_cache_space)
 
-    vllm_backend_spy.CALLS.clear()
-    vllm_backend_spy.TOKEN_COUNTS.clear()
-    vllm_backend_spy.MODULES.clear()
+    VLLM_SPY.clear()
     # PyTorch's config module needs its own patch context: pytest's setattr
     # undo deletes the proxied setting and breaks later in-process tests.
     # vLLM's CPU sampler's precompiled-header build can fail with macOS clang.
@@ -68,9 +77,7 @@ def vllm_test_environment(
             yield
     finally:
         if clear_after:
-            vllm_backend_spy.CALLS.clear()
-            vllm_backend_spy.TOKEN_COUNTS.clear()
-            vllm_backend_spy.MODULES.clear()
+            VLLM_SPY.clear()
 
 
 def fill_weights(model, *, seed, scale, norm_scale=None):
@@ -130,7 +137,7 @@ def generate(
         if record_generation:
             # Exclude vLLM's startup/profile calls: these counts must come from
             # the actual requests, not warmup of the compiled graph.
-            vllm_backend_spy.TOKEN_COUNTS.clear()
+            VLLM_SPY.token_counts.clear()
         outputs = llm.generate(
             prompts, SamplingParams(**sampling_options), **(generation_options or {})
         )
@@ -142,7 +149,7 @@ def generate(
 
 
 def generate_qwen(model_dir, compilation_config, *, record_generation=False):
-    """Run the offline Qwen configuration used by both vLLM and IREE tests."""
+    """Run the offline Qwen3 configuration with fixed seeds and engine options."""
     return generate(
         model_dir,
         compilation_config,
@@ -169,16 +176,6 @@ def generate_qwen(model_dir, compilation_config, *, record_generation=False):
         generation_options={"use_tqdm": False},
         record_generation=record_generation,
     )
-
-
-@pytest.fixture
-def model_dir(tmp_path, monkeypatch):
-    """Provide an offline Qwen3 configuration and isolate vLLM test settings."""
-    with vllm_test_environment(
-        monkeypatch, cpu_cache_space=None, offline=True, clear_after=True
-    ):
-        (tmp_path / "config.json").write_text(json.dumps(QWEN_CONFIG))
-        yield tmp_path
 
 
 def assert_outputs_match(

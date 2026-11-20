@@ -15,7 +15,10 @@ wheel.packages = ["python/src/kashi"]
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
 pythonpath = ["python/tests"]
-addopts = ["--import-mode=importlib"]
+addopts = ["--import-mode=importlib", "--strict-markers"]
+markers = [
+  "integration: runs a real vLLM engine end to end (deselect with -m 'not integration')",
+]
 
 [tool.ruff]
 target-version = "py310"

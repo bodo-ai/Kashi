@@ -4,7 +4,6 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -12,14 +11,15 @@ import pytest
 @pytest.mark.parametrize(
     ("test_suffix", "unit_suffix"), [(".cc", ".cpp"), (".cpp", ".cxx")]
 )
-def test_native_sources_require_mutation_toolchain(tmp_path, test_suffix, unit_suffix):
-    root = Path(__file__).resolve().parents[2]
+def test_native_sources_require_mutation_toolchain(
+    tmp_path, repo_root, test_suffix, unit_suffix
+):
     script_dir = tmp_path / "scripts"
     test_dir = tmp_path / "cpp" / "tests"
     unit_dir = tmp_path / "cpp" / "lib"
     for directory in (script_dir, test_dir, unit_dir):
         directory.mkdir(parents=True)
-    shutil.copy2(root / "scripts" / "test_mutation.py", script_dir)
+    shutil.copy2(repo_root / "scripts" / "test_mutation.py", script_dir)
     (test_dir / f"example{test_suffix}").write_text("// native test\n")
     (unit_dir / f"example{unit_suffix}").write_text("// native unit\n")
 
@@ -38,11 +38,10 @@ def test_native_sources_require_mutation_toolchain(tmp_path, test_suffix, unit_s
 
 
 @pytest.fixture
-def mutation_git_checkout(tmp_path):
-    root = Path(__file__).resolve().parents[2]
+def mutation_git_checkout(tmp_path, repo_root):
     for directory in ("scripts", "cpp/lib", "cpp/include", "cpp/tests"):
         (tmp_path / directory).mkdir(parents=True)
-    shutil.copy2(root / "scripts" / "test_mutation.py", tmp_path / "scripts")
+    shutil.copy2(repo_root / "scripts" / "test_mutation.py", tmp_path / "scripts")
     (tmp_path / "cpp/lib/existing.cpp").write_text("int existing() { return 1; }\n")
     (tmp_path / "cpp/tests/example.cpp").write_text("// test source\n")
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)

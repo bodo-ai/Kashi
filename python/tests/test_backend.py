@@ -1,29 +1,16 @@
 """torch.compile integration tests for the standalone FX -> MLIR -> FX backend."""
 
+import kashi_test_ops
 import pytest
-
-torch = pytest.importorskip("torch")
-
-from kashi.backend import compile_fx
+import torch
+from backend_spy import BackendSpy
+from fx_test_utils import assert_tree_close, call_targets
 from torch import nn
-from torch.utils import _pytree as pytree
 
 
 @pytest.fixture(autouse=True)
 def _reset_dynamo():
     torch._dynamo.reset()
-
-
-class Spy:
-    """Wraps compile_fx; records each graph received and callable returned."""
-
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, gm, example_inputs):
-        fn = compile_fx(gm, example_inputs)
-        self.calls.append((gm, fn))
-        return fn
 
 
 class EmbedChunkView(nn.Module):
@@ -58,14 +45,14 @@ CASES = {
     "empty": (Empty, lambda: torch.randn(2, 2)),
 }
 
-# torch.empty returns uninitialized memory: only shape and dtype are comparable.
+# Output leaves produced by torch.empty, whose values are arbitrary.
 UNINITIALIZED_LEAVES = {"empty": {0}}
 
 
 def _compile(model_cls):
     torch.manual_seed(0)
     model = model_cls()
-    spy = Spy()
+    spy = BackendSpy()
     return model, spy, torch.compile(model, backend=spy, dynamic=False)
 
 
@@ -83,14 +70,9 @@ def test_backend_matches_eager(case):
     assert isinstance(fn.__self__, torch.fx.GraphModule)
     assert fn.__self__ is not gm
 
-    assert pytree.tree_structure(actual) == pytree.tree_structure(expected)
-    skip = UNINITIALIZED_LEAVES.get(case, set())
-    leaves = zip(pytree.tree_leaves(actual), pytree.tree_leaves(expected))
-    for i, (a, e) in enumerate(leaves):
-        if i in skip:
-            assert (a.shape, a.dtype) == (e.shape, e.dtype)
-        else:
-            torch.testing.assert_close(a, e)
+    assert_tree_close(
+        actual, expected, uninitialized=UNINITIALIZED_LEAVES.get(case, ())
+    )
 
 
 def test_reuses_compiled_graph_for_new_values():
@@ -129,30 +111,19 @@ class SymbolicModel(nn.Module):
 
 def test_symbolic_dimension_reuses_compiled_graph():
     torch.manual_seed(0)
-    model, spy = SymbolicModel(), Spy()
+    model, spy = SymbolicModel(), BackendSpy()
     compiled = torch.compile(model, backend=spy)
     first = torch.tensor([1, 2, 3])
     torch._dynamo.mark_dynamic(first, 0)
 
     for ids in (first, torch.tensor([1, 2, 3, 4, 5])):
-        (view, empty), (expected_view, expected_empty) = compiled(ids), model(ids)
-        torch.testing.assert_close(view, expected_view)
-        assert (empty.shape, empty.dtype) == (
-            expected_empty.shape,
-            expected_empty.dtype,
-        )
+        assert_tree_close(compiled(ids), model(ids), uninitialized={1})
     assert len(spy.calls) == 1
 
 
-def _call_targets(gm):
-    return [n.target for n in gm.graph.nodes if n.op == "call_function"]
-
-
 def test_custom_ops_with_opaque_inputs():
-    import kashi_test_ops
-
     model = kashi_test_ops.OpsModel(kashi_test_ops.Tag(2.0), kashi_test_ops.Tag(3.0))
-    spy = Spy()
+    spy = BackendSpy()
     compiled = torch.compile(model, backend=spy, fullgraph=True)
     first = torch.randn(3, 4)
     torch._dynamo.mark_dynamic(first, 0)
@@ -165,24 +136,17 @@ def test_custom_ops_with_opaque_inputs():
 
     gm, fn = spy.calls[0]
     ops = torch.ops.kashi_test
-    assert [t for t in _call_targets(gm) if t in (ops.scale, ops.write)] == [
-        ops.scale,
-        ops.write,
+    assert call_targets(gm, only={ops.scale, ops.write}) == [ops.scale, ops.write]
+    assert call_targets(fn.__self__, only={ops.scale.default, ops.write.default}) == [
+        ops.scale.default,
+        ops.write.default,
     ]
-    rebuilt = [
-        t
-        for t in _call_targets(fn.__self__)
-        if t in (ops.scale.default, ops.write.default)
-    ]
-    assert rebuilt == [ops.scale.default, ops.write.default]
 
 
 def test_functionalized_custom_ops_round_trip(monkeypatch):
-    import kashi_test_ops
-
     kashi_test_ops.functional_entries(monkeypatch)
     model = kashi_test_ops.OpsModel(kashi_test_ops.Tag(2.0), kashi_test_ops.Tag(3.0))
-    spy = Spy()
+    spy = BackendSpy()
     compiled = torch.compile(model, backend=spy, fullgraph=True)
     first = torch.randn(3, 4)
     torch._dynamo.mark_dynamic(first, 0)
@@ -195,8 +159,8 @@ def test_functionalized_custom_ops_round_trip(monkeypatch):
 
     _, fn = spy.calls[0]
     ops = torch.ops.kashi_test
-    wanted = (torch.ops.aten.empty_like.default, ops.scale.default, ops.write.default)
-    assert [t for t in _call_targets(fn.__self__) if t in wanted] == [
+    wanted = {torch.ops.aten.empty_like.default, ops.scale.default, ops.write.default}
+    assert call_targets(fn.__self__, only=wanted) == [
         ops.scale.default,
         torch.ops.aten.empty_like.default,
         ops.write.default,

@@ -1,7 +1,5 @@
 import pytest
-
-torch = pytest.importorskip("torch")
-
+import torch
 from kashi import functional
 from torch._subclasses.fake_tensor import FakeTensorMode
 

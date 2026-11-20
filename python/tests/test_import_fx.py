@@ -1,10 +1,8 @@
-import pytest
-
-torch = pytest.importorskip("torch")
-
 import operator
 import re
 
+import pytest
+import torch
 from kashi.importer import import_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
