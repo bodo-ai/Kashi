@@ -419,12 +419,12 @@ def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None
     if base.target is not torch.ops.aten.empty.memory_format:
         reject(f"output is not a fresh buffer (it comes from {base.name})")
 
-    order = {n: i for i, n in enumerate(graph.nodes)}
-    for alias in _derived_before(base, node, order) - {output}:
-        if any(order[user] > order[node] for user in alias.users):
+    node_order = {n: i for i, n in enumerate(graph.nodes)}
+    for alias in _derived_before(base, node, node_order) - {output}:
+        if any(node_order[user] > node_order[node] for user in alias.users):
             reject(f"{alias.name} aliases output and is used after the call")
 
-    output_users = [user for user in output.users if order[user] > order[node]]
+    output_users = [user for user in output.users if node_order[user] > node_order[node]]
     with graph.inserting_before(node):
         result = graph.call_function(
             torch.ops.kashi.unified_attention.default,
@@ -437,12 +437,12 @@ def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None
     graph.erase_node(node)
 
 
-def _derived_before(base: torch.fx.Node, call: torch.fx.Node, order) -> set:
+def _derived_before(base: torch.fx.Node, call: torch.fx.Node, node_order) -> set:
     """``base`` and every node computed from it before ``call``."""
     found, stack = {base}, [base]
     while stack:
         for user in stack.pop().users:
-            if user is not call and order[user] < order[call] and user not in found:
+            if user is not call and node_order[user] < node_order[call] and user not in found:
                 found.add(user)
                 stack.append(user)
     return found
