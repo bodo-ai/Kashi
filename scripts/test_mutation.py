@@ -525,11 +525,14 @@ def main():
     )
     REPORT.write_text(summary + generated.read_text())
     print(summary + f"Human-readable report: {REPORT}\nSQLite results: {DATABASE}")
+    if base and survived:
+        print(f"Mutation check failed: {survived} surviving mutant(s)", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except (MutationError, OSError, subprocess.CalledProcessError) as error:
         message = f"mutation testing error: {error}"
         print(message, file=sys.stderr)

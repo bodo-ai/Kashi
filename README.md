@@ -127,25 +127,28 @@ Catch2/CTest, not the native extension loaded by Python or code in dependencies.
 It reports `no native tests yet` until there are native tests to run.
 
 Reports are written to `build/coverage/`: `python.xml` and `python.md` for
-Python, `cpp.txt` and (when coverage is available) `cpp.json` for C++. GitHub
+Python, `cpp.txt` and (when coverage is available) `cpp.json` and `cpp.lcov` for C++. GitHub
 Actions posts a summary and uploads the machine-readable reports and native
-summary as `coverage-reports`. Test and tool failures fail the job; coverage
-percentages are advisory.
+summary as `coverage-reports`. On pull requests, more than 90% of added or
+modified executable lines must be covered across `python/src/kashi/`,
+`cpp/lib/`, and `cpp/include/`. Lines are compared against the PR base; a
+changed source file with no coverage data fails the check. Test-only changes
+do not affect the percentage. Push runs report coverage without enforcing it.
 
 
 ## Native mutation testing
 
 Every pull request runs Mull against added or modified C++ files under
 `cpp/lib/` and `cpp/include/`, using the full contents of each selected file.
-Manually dispatched runs cover all project C++ code. Survivors
-are advisory; infrastructure and baseline failures fail the job.
+The PR check fails if any mutant survives across all tests. Manually dispatched
+runs cover all project C++ code and report survivors without failing on them.
+Baseline and infrastructure errors fail both modes.
 
 Reports are in `build/mutation/reports/`.
 
 Mutation testing requires Clang 19 and Mull 0.36.0 with its LLVM 19 frontend
 plugin; see `.github/workflows/mutation.yml` for the pinned Linux installation.
-Use the scheduled or manually dispatched Linux workflow when the toolchain is
-unavailable locally.
+Use the manually dispatched Linux workflow when the toolchain is unavailable locally.
 
 ## Runpod MI300X benchmark
 
