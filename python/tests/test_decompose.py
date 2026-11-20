@@ -126,3 +126,58 @@ def test_graph_without_custom_ops_is_unchanged():
     decompose_custom_ops(gm.graph)
 
     assert str(gm.graph) == before
+
+
+# --- _C.fused_add_rms_norm and _C.silu_and_mul. -----------------------------
+
+
+def test_fused_add_rms_norm_updates_input_and_residual():
+    graph = torch.fx.Graph()
+    x, res, w = (graph.placeholder(n) for n in ("x", "res", "w"))
+    i = graph.call_function(aten.clone.default, (x,))
+    r = graph.call_function(aten.clone.default, (res,))
+    pre = graph.call_function(aten.mul.Tensor, (i, 2.0))
+    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i, r, w, EPS))
+    graph.output((pre, i, r))
+    inputs = torch.randn(3, 8), torch.randn(3, 8), torch.randn(8)
+    x_val, res_val, w_val = inputs
+    gm = _decompose(_fake(graph, *inputs))
+
+    pre_out, i_out, r_out = gm(*inputs)
+    torch.testing.assert_close(pre_out, 2 * x_val)
+    torch.testing.assert_close(r_out, x_val + res_val)
+    torch.testing.assert_close(i_out, _ref_rms(x_val + res_val, w_val, EPS))
+
+
+def test_chained_fused_add_rms_norm_threads_the_residual():
+    graph = torch.fx.Graph()
+    x, y, res, w = (graph.placeholder(n) for n in ("x", "y", "res", "w"))
+    i1 = graph.call_function(aten.clone.default, (x,))
+    r = graph.call_function(aten.clone.default, (res,))
+    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i1, r, w, EPS))
+    i2 = graph.call_function(aten.add.Tensor, (y, i1))
+    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i2, r, w, EPS))
+    graph.output((i2, r))
+    inputs = torch.randn(3, 8), torch.randn(3, 8), torch.randn(3, 8), torch.randn(8)
+    x_val, y_val, res_val, w_val = inputs
+    gm = _decompose(_fake(graph, *inputs))
+
+    r1 = x_val + res_val
+    r2 = (y_val + _ref_rms(r1, w_val, EPS)) + r1
+    i2_out, r_out = gm(*inputs)
+    torch.testing.assert_close(r_out, r2)
+    torch.testing.assert_close(i2_out, _ref_rms(r2, w_val, EPS))
+
+
+def test_silu_and_mul_writes_result():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    out = _empty(graph, [3, 4])
+    graph.call_function(torch.ops._C.silu_and_mul.default, (out, x))
+    graph.output((out,))
+    x_val = torch.randn(3, 8)
+    gm = _decompose(_fake(graph, x_val))
+
+    (result,) = gm(x_val)
+    expected = torch.nn.functional.silu(x_val[:, :4]) * x_val[:, 4:]
+    torch.testing.assert_close(result, expected)

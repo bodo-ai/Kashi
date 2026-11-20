@@ -56,8 +56,28 @@ def _rms_norm(emit: _Emitter, a: dict) -> dict:
     }
 
 
+def _fused_add_rms_norm(emit: _Emitter, a: dict) -> dict:
+    x, residual = a["input"], a["residual"]
+    summed = emit(aten.add.Tensor, x, residual)
+    normalized = [x.meta["val"].shape[-1]]
+    return {
+        x: emit(aten.rms_norm.default, summed, normalized, a["weight"], a["epsilon"]),
+        residual: summed,
+    }
+
+
+def _silu_and_mul(emit: _Emitter, a: dict) -> dict:
+    x = a["input"]
+    half = x.meta["val"].shape[-1] // 2
+    gate = emit(aten.slice.Tensor, x, -1, 0, half)
+    up = emit(aten.slice.Tensor, x, -1, half, 2 * half)
+    return {a["result"]: emit(aten.mul.Tensor, emit(aten.silu.default, gate), up)}
+
+
 _DECOMPOSITIONS: dict[str, _Rule] = {
     "_C::rms_norm": _rms_norm,
+    "_C::fused_add_rms_norm": _fused_add_rms_norm,
+    "_C::silu_and_mul": _silu_and_mul,
 }
 
 
