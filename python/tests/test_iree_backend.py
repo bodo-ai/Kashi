@@ -43,6 +43,19 @@ def _graph_with_mutating_boundary():
     return torch.fx.GraphModule(torch.nn.Module(), graph)
 
 
+def _alias_only_graph():
+    """Build a graph whose view must retain its input's storage."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    view = graph.call_function(torch.ops.aten.view.default, (x, [2, 2]))
+    graph.output(view)
+    with FakeTensorMode() as fake_mode:
+        value = fake_mode.from_tensor(torch.empty(4))
+        x.meta["val"] = value
+        view.meta["val"] = value.view(2, 2)
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
 def _depends_on(node, source):
     """Return whether an FX value transitively depends on another graph node."""
     if node is source:
@@ -93,21 +106,98 @@ def test_alias_only_graph_executes_without_iree_segments(tmp_path, monkeypatch, 
     from kashi.iree_backend import compile_iree_fx
 
     monkeypatch.setenv("KASHI_IREE_EXECUTION", mode)
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    view = graph.call_function(torch.ops.aten.view.default, (x, [2, 2]))
-    graph.output(view)
-    with FakeTensorMode() as fake_mode:
-        value = fake_mode.from_tensor(torch.empty(4))
-        x.meta["val"] = value
-        view.meta["val"] = value.view(2, 2)
-    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    gm = _alias_only_graph()
     compiled = compile_iree_fx(gm, output_dir=tmp_path, cuda_target="sm_80")
     source = torch.arange(4.0)
     result = compiled.graph(source)
     torch.testing.assert_close(result, source.view(2, 2))
     assert result.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
     assert not compiled.ptx_files and compiled.vmfb_path is None
+
+
+def test_backend_executes_alias_only_graph_and_retains_artifacts(monkeypatch):
+    """The Dynamo backend keeps its workspace while its CPU-only driver runs."""
+    import gc
+
+    from kashi.iree_backend import compile_iree_backend
+
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", "cuda")
+    compiled = compile_iree_backend(_alias_only_graph(), ())
+    artifact_dir = compiled.compilation.artifact_dir
+    source = torch.arange(4.0)
+    result = compiled(source)
+    torch.testing.assert_close(result, source.view(2, 2))
+    assert result.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+    assert artifact_dir.is_dir()
+    del compiled
+    gc.collect()
+    assert not artifact_dir.exists()
+
+
+def test_backend_cleans_workspace_when_compilation_fails(tmp_path, monkeypatch):
+    """Failure during compilation does not leave a temporary artifact tree."""
+    from kashi import iree_backend
+
+    monkeypatch.setattr(iree_backend.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", "invalid")
+    with pytest.raises(ValueError, match="KASHI_IREE_EXECUTION"):
+        iree_backend.compile_iree_backend(_alias_only_graph(), ())
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin", reason="CUDA/PTX compilation is unavailable"
+)
+def test_iree_runtime_mode_builds_real_segment_calls_without_a_gpu(
+    tmp_path, monkeypatch
+):
+    """The runtime mode emits a VMFB and connects real segment targets."""
+    from kashi.iree_backend import compile_iree_fx
+    from kashi.iree_runtime import _SegmentTarget
+
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", "iree")
+    compiled = compile_iree_fx(
+        _graph_with_mutating_boundary(), output_dir=tmp_path, cuda_target="sm_80"
+    )
+    assert compiled.execution_mode == "iree"
+    assert compiled.vmfb_path.is_file() and compiled.ptx_files
+    targets = [n.target for n in compiled.graph.graph.nodes if n.op == "call_function"]
+    assert any(isinstance(target, _SegmentTarget) for target in targets)
+
+
+def test_rebuilt_segment_keeps_distinct_outputs_and_unsigned_bits():
+    """IREE-deduplicated outputs must regain independent storage and dtype."""
+    from kashi.iree_backend import _preserve_segment_results
+    from kashi.iree_partition import SegmentInfo
+
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+
+    def reused_view(graph, args):
+        """Represent a compiled segment that returns one view twice."""
+        view = graph.call_function(torch.ops.aten.view.default, (args[0], [4]))
+        return [view, view, 3]
+
+    segment = SegmentInfo(
+        0,
+        "segment_0",
+        ["!torch.vtensor<[4],si8>"],
+        ["!torch.vtensor<[4],si8>", "!torch.vtensor<[4],ui8>", "!torch.int"],
+        [],
+    )
+    handler = _preserve_segment_results({"segment_0": reused_view}, [segment])
+    graph.output(tuple(handler["segment_0"](graph, [source])))
+    rebuilt = torch.fx.GraphModule(torch.nn.Module(), graph)
+    expected_signed = torch.tensor([-1, 0, 127, -128], dtype=torch.int8)
+    expected_unsigned = torch.tensor([255, 0, 127, 128], dtype=torch.uint8)
+    data = expected_signed.clone()
+    first, second, scalar = rebuilt(data)
+    torch.testing.assert_close(first, expected_signed)
+    torch.testing.assert_close(second, expected_unsigned)
+    assert scalar == 3
+    first.fill_(0)
+    torch.testing.assert_close(second, expected_unsigned)
+    torch.testing.assert_close(data, expected_signed)
 
 
 def test_missing_compiler_fails_without_falling_back(tmp_path):

@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from kashi.iree_cuda import create_cuda_kernel
+from kashi.iree_cuda import _grid, create_cuda_kernel
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
@@ -188,3 +188,69 @@ hal.executable private @example {
     )
     assert result is x
     torch.testing.assert_close(x.cpu(), torch.arange(16, dtype=torch.float32) * 2)
+
+
+@pytest.mark.parametrize(
+    ("op", "lhs", "rhs", "expected"),
+    [
+        ("addi", 7, 0, 7),
+        ("subi", 7, 3, 4),
+        ("muli", 7, 3, 21),
+        ("divui", 7, 3, 2),
+        ("ceildivui", 7, 3, 3),
+        ("minui", 7, 3, 3),
+        ("maxui", 7, 3, 7),
+    ],
+)
+def test_workgroup_grid_arithmetic(op, lhs, rhs, expected):
+    """Interpret IREE grid arithmetic without evaluating unrelated divisions."""
+    body = f"""
+      %result = arith.{op} %lhs, %rhs : index
+      %one = arith.constant 1 : index
+      hal.return %result, %one, %one : index, index, index
+    """
+    args = ["%device: !hal.device", "%lhs: index", "%rhs: index"]
+    assert _grid(args, body, {}, [lhs, rhs], "test") == (expected, 1, 1)
+
+
+@pytest.mark.parametrize("op", ["divui", "ceildivui"])
+def test_workgroup_grid_rejects_zero_divisor(op):
+    """An invalid divisor must not produce an incorrect GPU launch grid."""
+    body = f"%result = arith.{op} %lhs, %rhs : index"
+    args = ["%device: !hal.device", "%lhs: index", "%rhs: index"]
+    with pytest.raises(NotImplementedError, match="workgroup divisor 0"):
+        _grid(args, body, {}, [7, 0], "test")
+
+
+@pytest.mark.parametrize(
+    ("op", "expressions", "expected"),
+    [
+        ("apply", ["(d0 + 1) * 2 - s0"], 13),
+        ("apply", ["d0 floordiv s0"], 2),
+        ("apply", ["d0 ceildiv s0"], 3),
+        ("apply", ["d0 mod s0"], 1),
+        ("apply", ["-d0 + 10"], 3),
+        ("min", ["d0 + 1", "d0 ceildiv s0"], 3),
+        ("max", ["d0 + 1", "d0 ceildiv s0"], 8),
+    ],
+)
+def test_workgroup_grid_affine_expressions(op, expressions, expected):
+    """Preserve affine precedence and rounding in generated launch sizes."""
+    body = f"""
+      %result = affine.{op} #grid(%lhs)[%rhs]
+      %one = arith.constant 1 : index
+      hal.return %result, %one, %one : index, index, index
+    """
+    args = ["%device: !hal.device", "%lhs: index", "%rhs: index"]
+    maps = {"#grid": (["d0"], ["s0"], expressions)}
+    assert _grid(args, body, maps, [7, 3], "test") == (expected, 1, 1)
+
+
+@pytest.mark.parametrize("expression", ["d0 floordiv 0", "d1 + 1", "d0 / 2"])
+def test_workgroup_grid_rejects_invalid_affine_expressions(expression):
+    """Bad affine metadata cannot silently launch an incorrect grid."""
+    body = "%result = affine.apply #grid(%lhs)"
+    args = ["%device: !hal.device", "%lhs: index"]
+    maps = {"#grid": (["d0"], [], [expression])}
+    with pytest.raises(NotImplementedError, match="affine"):
+        _grid(args, body, maps, [7], "test")

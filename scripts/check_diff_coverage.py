@@ -11,6 +11,9 @@ from xml.etree import ElementTree
 REPORTS = Path("build/coverage")
 PYTHON = Path("python/src/kashi")
 NATIVE = (Path("cpp/lib"), Path("cpp/include"))
+# These modules implement CUDA-only execution; CPU CI cannot exercise their
+# device paths. Keep the default gate comprehensive for runs with a GPU.
+GPU_ONLY = frozenset({PYTHON / "iree_cuda.py", PYTHON / "iree_runtime.py"})
 SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 HUNK = re.compile(rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
@@ -55,7 +58,13 @@ def native_lines(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", help="PR base commit; HEAD is the tested merge commit")
-    base = parser.parse_args().base
+    parser.add_argument(
+        "--exclude-gpu",
+        action="store_true",
+        help="exclude CUDA executor modules when coverage was collected on CPU-only CI",
+    )
+    args = parser.parse_args()
+    base = args.base
     root = Path.cwd()
     base = (
         git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")
@@ -97,6 +106,9 @@ def main():
         diff = git("diff", "--no-ext-diff", "--no-textconv", "--unified=0", *revisions)
         hunks = [(int(start), int(count or 1)) for start, count in HUNK.findall(diff)]
         if not any(count for _, count in hunks):
+            continue
+        if args.exclude_gpu and path in GPU_ONLY:
+            print(f"- `{path}`: excluded from CPU-only coverage gate (CUDA execution)")
             continue
         if reader not in reports:
             try:

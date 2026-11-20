@@ -190,9 +190,17 @@ Python, `cpp.txt` and (when coverage is available) `cpp.json` and `cpp.lcov` for
 Actions posts a summary and uploads the machine-readable reports and native
 summary as `coverage-reports`. On pull requests, more than 90% of added or
 modified executable lines must be covered across `python/src/kashi/`,
-`cpp/lib/`, and `cpp/include/`. Lines are compared against the PR base; a
-changed source file with no coverage data fails the check. Test-only changes
-do not affect the percentage. Push runs report coverage without enforcing it.
+`cpp/lib/`, and `cpp/include/`. Linux CPU-only CI explicitly excludes
+`python/src/kashi/iree_cuda.py` and `python/src/kashi/iree_runtime.py` from this
+gate; both files remain visible in the full coverage report and require CUDA
+tests for execution coverage. The summary names any excluded changed files.
+All other changed source files must have coverage data. Lines are compared
+against the PR base; test-only changes do not affect the percentage. Push runs
+report coverage without enforcing it.
+
+For a local GPU-inclusive changed-line check, run the coverage tasks above,
+then run `python scripts/check_diff_coverage.py <base-commit>` without
+`--exclude-gpu`.
 
 
 ## Native mutation testing
