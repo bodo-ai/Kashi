@@ -1,0 +1,837 @@
+
+import contextlib
+import io
+import traceback
+import os
+import operator
+from pathlib import Path
+
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+
+import torch
+import torch.nn as nn
+import torch.fx as fx
+from torch._dynamo import register_backend
+from torch._dynamo.backends.common import aot_autograd
+from torch._functorch.aot_autograd import make_boxed_func
+from torch._library.fake_class_registry import FakeScriptObject
+from torch.fx.node import map_arg
+from torch._subclasses.fake_tensor import FakeTensor
+
+from torch_mlir.fx import stateless_fx_import
+from torch_mlir.extras.fx_importer import FxImporter, ContextCache
+from torch_mlir.ir import Module, IntegerAttr, FloatAttr, StringAttr, Type
+from torch_mlir import ir
+from torch_mlir.dialects import torch as torch_d
+from torch_mlir.extras.fx_importer import TORCH_DTYPE_TO_INT
+
+from vllm import LLM, ModelRegistry, SamplingParams
+from vllm.model_executor.layers.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
+
+
+class VllmContextCache(ContextCache):
+    """Adapt fake vLLM values to Torch-MLIR types during FX import.
+
+    vLLM represents opaque scripted objects, tuples of fake tensors, and
+    `torch.Size` values with Torch types that the stock cache cannot infer.
+    """
+    def value_info_to_type(
+        self, val, *, tensor_meta=None, mutable=False
+    ):
+        """Map one example value to Torch-MLIR type metadata.
+
+        Args:
+            val: Concrete or fake example value from Dynamo.
+            tensor_meta: Optional tensor metadata forwarded to the base cache.
+            mutable: Whether the imported value may be mutated.
+
+        Returns:
+            An MLIR type for vLLM-specific values or the base cache's result.
+        """
+        print("!!!Using VllmContextCache!!!")
+
+        if isinstance(val, FakeScriptObject):
+            return Type.parse(
+                "!torch.any",
+                context=self._c,
+            )
+
+        if isinstance(val, tuple) and all(
+            isinstance(x, FakeTensor) for x in val
+        ):
+            return Type.parse(
+                "!torch.list<vtensor>",
+                context=self._c,
+            )
+
+        if isinstance(val, torch.Size):
+            return Type.parse(
+                "!torch.list<int>",
+                context=self._c,
+            )
+
+        return super().value_info_to_type(
+            val,
+            tensor_meta=tensor_meta,
+            mutable=mutable,
+        )
+
+
+
+class VllmFxImporter(FxImporter):
+    """Install the vLLM-aware context cache used by `stateless_fx_import`."""
+    def __init__(self, **kwargs):
+        """Initialize the base importer and replace its value-type cache."""
+
+        print("!!!Initializing VllmFxImporter!!!")
+
+        super().__init__(**kwargs)
+
+        self._cc = VllmContextCache(
+            self._c,
+            py_attr_tracker=self._py_attr_tracker,
+        )
+
+
+INT_TO_TORCH_DTYPE = {
+    value: dtype
+    for dtype, value in TORCH_DTYPE_TO_INT.items()
+}
+
+
+def reconstruct_args(target, operands, values):
+    """Rebuild schema-ordered FX args and kwargs from Torch-MLIR operands.
+
+    Args:
+        target: ATen overload whose schema defines argument names and order.
+        operands: MLIR operands in schema order.
+        values: Mapping from MLIR SSA values to reconstructed Python/FX values.
+
+    Returns:
+        `(args, kwargs)` suitable for `graph.call_function`.
+
+    Torch-MLIR stores operands positionally, while ATen schemas can contain
+    keyword-only arguments. ScalarType operands are encoded as integers and
+    are converted back to `torch.dtype` for the `dtype` schema argument.
+    """
+    schema_args = target._schema.arguments
+
+    if len(operands) != len(schema_args):
+        raise ValueError(
+            f"{target}: expected {len(schema_args)} "
+            f"operands, got {len(operands)}"
+        )
+
+    args = []
+    kwargs = {}
+
+    for schema_arg, operand in zip(schema_args, operands):
+        value = values[operand]
+
+        # Torch-MLIR encodes ScalarType as an integer.
+        if schema_arg.name == "dtype" and value is not None:
+            value = INT_TO_TORCH_DTYPE[value]
+
+        if schema_arg.kwarg_only:
+            kwargs[schema_arg.name] = value
+        else:
+            args.append(value)
+
+    return tuple(args), kwargs
+
+def resolve_aten_target(name):
+    """Resolve an MLIR ATen operation name to its registered overload.
+
+    Args:
+        name: Name prefixed by `torch.aten.` with an optional overload suffix.
+
+    Returns:
+        The corresponding `torch.ops.aten` overload packet member.
+
+    Raises:
+        NotImplementedError: If the name is outside the ATen namespace or the
+            requested operator/overload is not registered.
+    """
+    prefix = "torch.aten."
+    if not name.startswith(prefix):
+        raise NotImplementedError(f"Unsupported MLIR operation: {name}")
+
+    op_name, separator, overload = name[len(prefix):].partition(".")
+    try:
+        op_packet = getattr(torch.ops.aten, op_name)
+        return getattr(op_packet, overload if separator else "default")
+    except (AttributeError, RuntimeError) as error:
+        raise NotImplementedError(
+            f"Unsupported ATen operation: {name}"
+        ) from error
+
+
+def mlir_to_fx(module: Module, segment_handlers=None) -> fx.GraphModule:
+    """Convert the supported Torch-MLIR entry function back into an FX graph.
+
+    Args:
+        module: Torch-MLIR module containing the imported `main` function.
+        segment_handlers: Optional `{callee name: handler}` for `func.call`
+            operations. Used for driver modules (see `iree_phase_dump`) whose
+            ordinary ops were compiled elsewhere: `handler(graph, args)` appends
+            the callee's FX nodes to `graph` and returns the FX values of its
+            results. Without a handler, `func.call` is unsupported.
+
+    Returns:
+        An FX GraphModule. Constants/list ops become Python values or indexing,
+        ATen ops use registered schemas, and known vLLM custom ops remain opaque
+        FX calls. Unknown operations fail explicitly.
+    """
+    segment_handlers = segment_handlers or {}
+    graph = fx.Graph()
+
+    main = next(
+        op for op in module.body.operations
+        if op.operation.name == "func.func"
+        and StringAttr(
+            op.attributes["sym_name"]
+        ).value == "main"
+    )
+    block = main.regions[0].blocks[0]
+
+    values = {
+        arg: graph.placeholder(f"arg{i}")
+        for i, arg in enumerate(block.arguments)
+    }
+
+
+    # torch.operator
+    custom_ops = {
+        "torch._C.rms_norm": torch.ops._C.rms_norm.default,
+        "torch._C.fused_add_rms_norm": torch.ops._C.fused_add_rms_norm.default,
+        "torch._C.rotary_embedding": torch.ops._C.rotary_embedding.default,
+        "torch._C.silu_and_mul": torch.ops._C.silu_and_mul.default,
+
+        "torch.vllm.unified_kv_cache_update":
+            torch.ops.vllm.unified_kv_cache_update.default,
+
+        "torch.vllm.unified_attention_with_output":
+            torch.ops.vllm.unified_attention_with_output.default,
+    }
+
+    for op in block.operations:
+        operation = op.operation
+        name = operation.name
+
+        if name == "func.return":
+            outputs = tuple(
+                values[arg] for arg in operation.operands
+            )
+            graph.output(outputs)
+
+        elif name == "torch.constant.none":
+            values[operation.results[0]] = None
+
+        elif name == "torch.constant.bool":
+            attr = operation.attributes["value"]
+            values[operation.results[0]] = bool(IntegerAttr(attr).value)
+
+        elif name == "torch.constant.device":
+            attr = operation.attributes["value"]
+            values[operation.results[0]] = torch.device(
+                StringAttr(attr).value
+            )
+
+        elif name == "torch.constant.int":
+            value = IntegerAttr(
+                operation.attributes["value"]
+            ).value
+
+            values[operation.results[0]] = int(value)
+        elif name == "torch.constant.float":
+            value = FloatAttr(operation.attributes["value"]).value
+            values[operation.results[0]] = float(value)
+        elif name == "torch.constant.str":
+            value = StringAttr(operation.attributes["value"]).value
+            values[operation.results[0]] = value
+
+        elif name == "torch.prim.ListConstruct":
+            values[operation.results[0]] = [
+                values[arg] for arg in operation.operands
+            ]
+
+        elif name == "torch.prim.ListUnpack":
+            source = values[operation.operands[0]]
+
+            for i, result in enumerate(operation.results):
+                values[result] = graph.call_function(
+                    operator.getitem,
+                    args=(source, i),
+                )
+
+        elif name.startswith("torch.aten."):
+            target = resolve_aten_target(name)
+            args, kwargs = reconstruct_args(
+                target,
+                operation.operands,
+                values,
+            )
+            result = graph.call_function(target, args=args, kwargs=kwargs)
+            if len(operation.results) != 1:
+                raise NotImplementedError(
+                    f"Expected one result for {name}, got {len(operation.results)}"
+                )
+            values[operation.results[0]] = result
+
+        elif name == "torch.operator":
+            op_name = StringAttr(operation.attributes["name"]).value
+            if op_name in custom_ops:
+                result = graph.call_function(
+                    custom_ops[op_name],
+                    args=tuple(values[arg] for arg in operation.operands),
+                )
+                if len(operation.results) == 1:
+                    values[operation.results[0]] = result
+                elif len(operation.results) == 0:
+                    # Side-effect-only operation.
+                    pass
+                else:
+                    raise NotImplementedError(
+                        f"Multiple results for {op_name}"
+                    )
+            else:
+                raise NotImplementedError(
+                    f"Unsupported torch.operator: {op_name}"
+                )
+
+        elif name == "func.call":
+            # A call into a separately compiled segment: splice that segment's
+            # nodes in here, so the segment and the custom ops around it end up
+            # in one graph in their original order.
+            callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+            if callee not in segment_handlers:
+                raise NotImplementedError(f"Unsupported MLIR operation: func.call @{callee}")
+            segment_values = segment_handlers[callee](
+                graph, [values[arg] for arg in operation.operands]
+            )
+            if len(segment_values) != len(operation.results):
+                raise ValueError(
+                    f"@{callee} produced {len(segment_values)} values for "
+                    f"{len(operation.results)} call results"
+                )
+            for result, value in zip(operation.results, segment_values):
+                values[result] = value
+
+        else:
+            raise NotImplementedError(
+                f"Unsupported MLIR operation: {name}"
+            )
+
+    graph.lint()
+    return fx.GraphModule(nn.Module(), graph)
+
+
+def normalize_fx(gm: fx.GraphModule):
+    """Rewrite Dynamo FX nodes into the ATen forms accepted by Torch-MLIR.
+
+    Args:
+        gm: Dynamo graph containing the supported demo operators.
+
+    Returns:
+        The same graph after normalization. The conversion is intentionally
+        limited to operators exercised by this demo and preserves fake/example
+        metadata used by import.
+    """
+
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            if node.target is torch._C._nn.linear:
+                node.target = torch.ops.aten.linear.default
+            elif node.target is torch._C._autograd._get_data_attr:
+                node.target = torch.ops.aten.detach.default
+            elif node.target is torch.ops._C.rms_norm:
+                node.target = torch.ops._C.rms_norm.default
+
+            elif node.target is torch.ops._C.fused_add_rms_norm:
+                node.target = torch.ops._C.fused_add_rms_norm.default
+
+            elif node.target is torch.ops._C.rotary_embedding:
+                node.target = torch.ops._C.rotary_embedding.default
+
+            elif node.target is torch.ops._C.silu_and_mul:
+                node.target = torch.ops._C.silu_and_mul.default
+
+            elif node.target is torch.nn.functional.embedding:
+                # NOTE: aten.embedding expects arguments in a different order than F.embedding
+                # TODO: support other arguments e.g. padding_idx
+                input_ids, weight = node.args[:2]
+                node.target = torch.ops.aten.embedding.default
+                node.args = (weight, input_ids, -1, False, False)
+                node.kwargs = {}
+
+            # The captured demo graph supplies only `size`; unsupported optional
+            # torch.empty arguments must not be silently misrepresented.
+            elif node.target is torch.empty:
+                assert len(node.args) == 1
+
+                size = node.args[0]
+                node.target = torch.ops.aten.empty.memory_format
+                node.args = (size,)
+
+            # vLLM custom ops:
+            elif node.target is torch.ops.vllm.unified_kv_cache_update:
+                node.target = torch.ops.vllm.unified_kv_cache_update.default
+
+            elif node.target is torch.ops.vllm.unified_attention_with_output:
+                node.target = torch.ops.vllm.unified_attention_with_output.default
+
+        elif node.op == "call_method":
+            if node.target == "long":
+                x, = node.args
+                node.op = "call_function"
+                node.target = torch.ops.aten.to.dtype
+                node.args = (x, torch.int64)
+                node.kwargs = {}
+
+            elif node.target == "size":
+                x, *size_args = node.args
+                dim = node.kwargs.get("dim", size_args[0] if size_args else None)
+                node.op = "call_function"
+                node.target = (
+                    torch.ops.aten.size.int
+                    if dim is not None
+                    else torch.ops.aten.size.default
+                )
+                node.args = (x, dim) if dim is not None else (x,)
+                node.kwargs = {}
+
+            elif node.target == "split":
+                x, split_size_or_sections, *split_args = node.args
+                dim = node.kwargs.get("dim", split_args[0] if split_args else 0)
+                node.op = "call_function"
+                node.target = (
+                    torch.ops.aten.split_with_sizes.default
+                    if isinstance(split_size_or_sections, (tuple, list))
+                    else torch.ops.aten.split.Tensor
+                )
+                node.args = (x, split_size_or_sections, dim)
+                node.kwargs = {}
+
+            elif node.target == "view":
+                x, *shape = node.args
+
+                if len(shape) == 1 and isinstance(shape[0], fx.Node) and isinstance(
+                    shape[0].meta.get("val"), torch.Size
+                ):
+                    shape = shape[0]
+                elif len(shape) == 1 and isinstance(
+                    shape[0], (tuple, list)
+                ):
+                    shape = list(shape[0])
+
+                node.op = "call_function"
+                node.target = torch.ops.aten.view.default
+                node.args = (x, shape)
+                node.kwargs = {}
+
+            elif node.target == "chunk":
+                x, chunks = node.args
+                dim = node.kwargs.get("dim", 0)
+
+                node.op = "call_function"
+                node.target = torch.ops.aten.chunk.default
+                node.args = (x, chunks, dim)
+                node.kwargs = {}
+
+        if "val" not in node.meta:
+            if "example_value" in node.meta:
+                node.meta["val"] = node.meta["example_value"]
+
+    gm.graph.lint()
+    gm.recompile()
+    return gm
+
+
+def normalize_torch_size(gm):
+    """Replace `torch.Size` wrappers with the list/tuple shapes Torch-MLIR expects.
+
+    Args:
+        gm: FX graph with `torch.Size` constructor nodes.
+
+    Returns:
+        The same graph with each supported wrapper replaced by its dimensions.
+        Since the wrapper has no tensor computation, its users can consume the
+        shape list directly.
+    """
+    graph = gm.graph
+
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not torch.Size:
+            continue
+
+        assert len(node.args) == 1
+        assert not node.kwargs
+        assert isinstance(node.args[0], (tuple, list))
+
+        shape = list(node.args[0])
+
+        for user in list(node.users):
+            user.args = map_arg(
+                user.args,
+                lambda n: shape if n is node else n,
+            )
+            user.kwargs = map_arg(
+                user.kwargs,
+                lambda n: shape if n is node else n,
+            )
+
+        graph.erase_node(node)
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
+
+def reassemble_iree_fx_graph(dump) -> fx.GraphModule:
+    """Rebuild one FX graph from a successful IREE dump.
+
+    The dump's driver module supplies the order and wiring of segments, vLLM
+    custom ops and constants. `mlir_to_fx` converts the custom ops exactly as in
+    the plain round trip, while each `func.call @segment_N` is replaced by the
+    FX nodes of that segment's IREE flow-phase function: opaque kernel calls
+    plus whatever IREE left as ordinary ops, converted back to ATen.
+
+    Args:
+        dump: `iree_phase_dump.IreeDump` returned by `dump_iree_phases`.
+
+    Returns:
+        A GraphModule with the same placeholders and outputs as the unpartitioned
+        graph. Its kernel nodes are opaque and cannot be executed yet.
+
+    Raises:
+        ValueError: If the partition could not build a driver module.
+    """
+    # Imported lazily: the plain round trip must not require IREE's Python package.
+    from iree_fx_reassembly import flow_segment_handlers
+
+    partition = dump.partition
+    if partition.driver is None:
+        raise ValueError(
+            "no driver module: a value crossing a segment boundary has a type "
+            "that cannot be returned from a segment (see segments.txt)"
+        )
+    handlers = flow_segment_handlers(dump.flow_ir.read_text(), device=partition.device)
+    return mlir_to_fx(partition.driver, segment_handlers=handlers)
+
+
+def print_reassembled_graph(dump) -> None:
+    """Print (and save) the reassembled graph in tabular and graph form.
+
+    The two renderings match the ones printed for the original Dynamo graph, so
+    the graphs can be compared side by side. Failures are reported, not raised:
+    the reassembled graph is diagnostic output and must never change what the
+    backend returns.
+    """
+    try:
+        gm = reassemble_iree_fx_graph(dump)
+    except Exception:
+        print("IREE reassembly failed:")
+        print(traceback.format_exc())
+        return
+
+    # Render once and reuse the text so the saved file equals what was printed.
+    rendered = io.StringIO()
+    with contextlib.redirect_stdout(rendered):
+        gm.graph.print_tabular()
+        print(gm.graph)
+    text = rendered.getvalue()
+    (dump.out_dir / "reassembled_fx.txt").write_text(text)
+    print("\nReassembled FX (vLLM custom ops + IREE kernel calls):")
+    print(text)
+
+@register_backend(name="mlir_roundtrip_backend")
+def mlir_roundtrip_backend(gm: fx.GraphModule, example_inputs):
+    """Run the FX -> Torch-MLIR -> FX round trip, optionally dumping IREE phases.
+
+    Args:
+        gm: Dynamo FX graph to normalize and import.
+        example_inputs: Inputs supplied by Dynamo; currently unused directly.
+
+    Returns:
+        The reconstructed graph's `forward` callable for Dynamo. IREE dumping
+        is diagnostic and opt-in; its failures must not break this backend.
+    """
+    print("\nOriginal Dynamo FX:")
+    gm.graph.print_tabular()
+    print(gm.graph)
+    # Normalize FX graph into the form Torch MLIR expects
+    # the alternative would be to run this backend before AOTAutograd
+    # but at that point some operators (e.g. linear) would be inlined
+    # and some information would be lost.
+    gm_norm = normalize_fx(gm)
+    gm_norm = normalize_torch_size(gm_norm)
+
+    print("\nNormalized ATen FX:")
+    gm_norm.graph.print_tabular()
+
+    context = ir.Context()
+    torch_d.register_dialect(context)
+    vllm_importer = VllmFxImporter(context=context)
+    module = stateless_fx_import(
+        gm_norm,
+        output_type="raw",
+        fx_importer=vllm_importer
+    )
+
+    print("\nGenerated MLIR:")
+    print(module)
+
+    # Opt-in: partition a copy of the module at vLLM custom ops, compile the
+    # ordinary-op segments with IREE (dumping phases and kernels), and print the
+    # graph reassembled from the custom ops and the compiled segments. This is
+    # diagnostic only: the round trip below does not use any of it, and
+    # dump_iree_phases / print_reassembled_graph report their own errors.
+    dump_dir = os.environ.get("IREE_PHASE_DUMP_DIR")
+    if dump_dir:
+        from iree_phase_dump import dump_iree_phases
+
+        dump = dump_iree_phases(module, Path(dump_dir))
+        if dump is not None:
+            print_reassembled_graph(dump)
+
+    gm_reconstructed = mlir_to_fx(module)
+    print("\nReconstructed FX:")
+    gm_reconstructed.graph.print_tabular()
+    print(gm_reconstructed.graph)
+
+    return gm_reconstructed.forward
+
+@register_backend(name="normalized_fx_backend")
+def normalized_fx_backend(gm: fx.GraphModule, example_inputs):
+    """Normalize an FX graph and return it without MLIR import/export.
+
+    Args:
+        gm: Dynamo FX graph.
+        example_inputs: Inputs supplied by Dynamo; currently unused directly.
+
+    Returns:
+        The normalized graph's `forward` callable.
+    """
+    gm_norm = normalize_fx(gm)
+    gm_norm = normalize_torch_size(gm_norm)
+    return gm_norm.forward
+
+
+def debug_backend(graph: torch.fx.GraphModule, example_inputs):
+    """Compile an ATen-normalized graph with Inductor and box its callable.
+
+    Args:
+        graph: Graph after Dynamo's ATen normalization/decomposition.
+        example_inputs: Example arguments needed by Inductor.
+
+    Returns:
+        Inductor's compiled callable wrapped in Dynamo's boxed-function API.
+    """
+    graph.graph.print_tabular()
+    print("=====================================\n", flush=True)
+
+    compiled = torch._inductor.compile(graph, example_inputs)
+
+    return make_boxed_func(compiled)
+
+
+# Runs after Aten normalization/decomposition
+debug_backend_aot = aot_autograd(
+    fw_compiler=debug_backend,
+    inference_compiler=debug_backend,
+    decompositions={},
+)
+
+register_backend(name="debug_backend")(debug_backend_aot)
+
+
+@support_torch_compile
+class MyModel(nn.Module):
+    """Implement the single transformer block registered with vLLM for this demo.
+
+    The block owns its token embedding and projections, and delegates attention
+    and KV-cache behavior to vLLM's configured attention layer.
+    """
+    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+        """Construct the block from vLLM's model configuration.
+
+        Args:
+            vllm_config: Runtime configuration supplying HF dimensions.
+            prefix: vLLM module-name prefix used by the attention layer.
+        """
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+
+        hidden_size = config.hidden_size
+        num_heads = config.num_attention_heads
+        head_size = hidden_size // num_heads
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, hidden_size
+        )
+
+        self.qkv_proj = nn.Linear(
+            hidden_size, 3 * hidden_size, bias=False
+        )
+
+        self.attn = Attention(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=head_size ** -0.5,
+            num_kv_heads=num_heads,
+            prefix=f"{prefix}.attn",
+        )
+
+        self.o_proj = nn.Linear(
+            hidden_size, hidden_size, bias=False
+        )
+
+    def embed_input_ids(self, input_ids):
+        """Look up token embeddings.
+
+        Args:
+            input_ids: Integer token IDs.
+
+        Returns:
+            Their vocabulary-table embeddings.
+        """
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        """Run the block from token IDs or precomputed embeddings.
+
+        Args:
+            input_ids: Token IDs, unless `inputs_embeds` is supplied.
+            positions: Position tensor passed to vLLM attention.
+            inputs_embeds: Optional precomputed token embeddings.
+
+        Returns:
+            Projected attention output for this block.
+        """
+        if inputs_embeds is not None:
+            x = inputs_embeds
+        else:
+            x = self.embed_input_ids(input_ids)
+
+        q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+
+        x = self.attn(q, k, v)
+        x = self.o_proj(x)
+
+        return x
+
+
+class MyModelForCausalLM(nn.Module):
+    """Wrap the demo transformer block with the causal-LM vocabulary head."""
+    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+        """Construct the wrapped model and output projection.
+
+        Args:
+            vllm_config: Runtime configuration supplying HF model dimensions.
+            prefix: vLLM module-name prefix for the wrapped model.
+        """
+        super().__init__()
+
+        config = vllm_config.model_config.hf_config
+
+        model_prefix = f"{prefix}.model" if prefix else "model"
+
+        self.model = MyModel(
+            vllm_config=vllm_config,
+            prefix=model_prefix,
+        )
+
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
+
+    def embed_input_ids(self, input_ids):
+        """Return token embeddings from the wrapped transformer.
+
+        Args:
+            input_ids: Integer token IDs.
+
+        Returns:
+            Embeddings from the model's token table.
+        """
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        """Run the transformer block; vLLM applies the logits head separately.
+
+        Args:
+            input_ids: Token IDs, unless `inputs_embeds` is supplied.
+            positions: Position tensor for vLLM attention.
+            intermediate_tensors: vLLM pipeline state; unused by this demo.
+            inputs_embeds: Optional precomputed token embeddings.
+
+        Returns:
+            Hidden states from the transformer block.
+        """
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+        )
+
+    def compute_logits(self, hidden_states):
+        """Project hidden states onto vocabulary logits.
+
+        Args:
+            hidden_states: Final transformer activations.
+
+        Returns:
+            Unnormalized vocabulary scores.
+        """
+        return self.lm_head(hidden_states)
+
+
+def main():
+    """Register the demo model and generate a short dummy-weight completion."""
+    ModelRegistry.register_model(
+        "MyModelForCausalLM", MyModelForCausalLM
+    )
+
+    torch.manual_seed(42)
+
+    mlir_llm = LLM(
+        model="facebook/opt-125m",
+        hf_overrides={
+            "architectures": ["MyModelForCausalLM"]
+        },
+        load_format="dummy",
+        max_model_len=128,
+        kv_cache_memory_bytes=256 * 1024 * 1024,  # 256 MiB
+        gpu_memory_utilization=0.5,  # default 0.92 failed the free-memory check at startup
+        compilation_config={
+        "mode": 2,
+        "backend": "mlir_roundtrip_backend",
+    },
+    )
+
+    outputs = mlir_llm.generate(
+        ["Hello, my name is"],
+        SamplingParams(max_tokens=4),
+    )
+
+    mlir = outputs[0].outputs[0].token_ids
+    print(mlir)
+
+
+if __name__ == "__main__":
+    main()
