@@ -113,8 +113,19 @@ def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         if node.op in ("call_function", "call_method"):
             _rewrite(graph, node)
 
+    graph.eliminate_dead_code(is_impure_node=_is_impure)
     graph.lint()
     return torch.fx.GraphModule(gm, graph)
+
+
+def _is_impure(node: torch.fx.Node) -> bool:
+    """Keep every non-ATen operator during dead-code elimination: custom ops can
+    have side effects their schemas do not declare, e.g. vLLM's KV-cache update
+    and the attention that consumes its dependency."""
+    target = node.target
+    if isinstance(target, torch._ops.OpOverload) and target.namespace != "aten":
+        return True
+    return node.is_impure()
 
 
 def _expand_split_outputs(graph: torch.fx.Graph) -> None:

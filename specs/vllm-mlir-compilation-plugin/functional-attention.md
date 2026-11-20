@@ -46,7 +46,7 @@ Everything is specialized to `vllm::unified_attention_with_output` (vLLM 0.33 sc
    - `output` is not fresh: following `aten.view`s back from it must reach `aten.empty` (a graph input, `chunk`/`getitem`, `slice` or any other producer is rejected);
    - any other node computed from the buffer before the call is used after it.
 2. Is replaced by `kashi.unified_attention(query, key, value, layer_name, kv_cache_dummy_dep=...)`, with `output`'s fake metadata.
-3. Uses of `output` after the call are redirected to the new node; uses before it are unchanged. The now-dead `empty`/`view` stay in place: no DCE, per the existing spec.
+3. Uses of `output` after the call are redirected to the new node; uses before it are unchanged. The now-dead `empty`/`view` are removed by the dead-code elimination that ends `_normalize`, which keeps every non-ATen operator: custom ops such as vLLM's KV-cache update have side effects their schemas do not declare.
 
 **Rebuild (`rebuild_fx`).** `torch.operator "torch.kashi.unified_attention"` (exactly 5 operands and 1 result) becomes `aten.empty_like(query, memory_format=torch.contiguous_format)` followed by `torch.ops.vllm.unified_attention_with_output.default(query, key, value, buffer, layer_name, kv_cache_dummy_dep=dep)`; the MLIR result maps to the buffer. All other `torch.operator`s are unchanged.
 

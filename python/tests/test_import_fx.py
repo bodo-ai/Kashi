@@ -356,6 +356,27 @@ def test_import_fx_functionalizes_vllm_attention():
     assert gm.graph.find_nodes(op="call_function", target=ATTENTION)
 
 
+def test_import_fx_removes_dead_attention_buffer():
+    text = str(import_fx(_capture_attention(_vllm_attention)).module)
+
+    # The empty/view that fed output are dead once attention returns its result.
+    assert "torch.aten.empty.memory_format" not in text
+
+
+def _unused_kv_update(q, k, v, name):
+    KV_UPDATE(k, v, name)
+    q.view(3, 8)  # dead ATen op
+    return q
+
+
+def test_import_fx_keeps_unused_custom_ops():
+    text = str(import_fx(_capture_attention(_unused_kv_update)).module)
+
+    # The KV-cache write is a side effect its schema does not declare.
+    assert 'torch.operator "torch.vllm.unified_kv_cache_update"' in text
+    assert "torch.aten.view" not in text
+
+
 def _two_layers(q, k, v, name):
     a = torch.empty(3, 2, 4)
     ATTENTION(q, k, v, a, name)
