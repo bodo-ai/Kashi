@@ -2,6 +2,7 @@ import operator
 
 import pytest
 import torch
+import vllm.model_executor.layers.attention.attention  # noqa: F401 (torch.ops.vllm)
 from fx_test_utils import call_targets
 from iree.compiler import ir
 from kashi.mlir_to_fx import rebuild_fx
@@ -418,66 +419,39 @@ def test_rebuild_rejects_unresolvable_operator(test_ops, name, match):
         rebuild_fx(_with_operator(name))
 
 
-# --- Functional dummies expand to destination-passing ops. ------------------
+# --- kashi.unified_attention expands to vLLM attention. ---------------------
 
-FUNCTIONAL = """
-func.func @main(%arg0: !torch.vtensor<[?,4],f32>, %arg1: !torch.any) -> !torch.vtensor<[?,4],f32> {
-  %0 = torch.operator "torch.kashi.write_functional"(%arg0, %arg1, %arg0) : (!torch.vtensor<[?,4],f32>, !torch.any, !torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32>
-  return %0 : !torch.vtensor<[?,4],f32>
+ATTENTION = """
+func.func @main(%arg0: !torch.vtensor<[3,2,4],f32>, %arg1: !torch.vtensor<[3,2,4],f32>, %arg2: !torch.vtensor<[3,2,4],f32>, %arg3: !torch.any, %arg4: !torch.vtensor<[0],f32>) -> !torch.vtensor<[3,2,4],f32> {
+  %0 = torch.operator "torch.kashi.unified_attention"(%arg0, %arg1, %arg2, %arg3, %arg4) : (!torch.vtensor<[3,2,4],f32>, !torch.vtensor<[3,2,4],f32>, !torch.vtensor<[3,2,4],f32>, !torch.any, !torch.vtensor<[0],f32>) -> !torch.vtensor<[3,2,4],f32>
+  return %0 : !torch.vtensor<[3,2,4],f32>
 }
 """
 
 
-@pytest.fixture
-def functional_write(monkeypatch):
-    import kashi_test_ops
+def test_rebuild_expands_unified_attention():
+    gm = rebuild_fx(_parse(ATTENTION))
 
-    kashi_test_ops.functional_entries(monkeypatch)
-    return kashi_test_ops
-
-
-def test_rebuild_expands_functional_dummy(functional_write):
-    gm = rebuild_fx(_parse(FUNCTIONAL))
-
-    x, tag = gm.graph.find_nodes(op="placeholder")
-    empty, write = _call_nodes(gm)
+    query, key, value, layer_name, dep = gm.graph.find_nodes(op="placeholder")
+    empty, attention = _call_nodes(gm)
     assert (empty.target, empty.args, empty.kwargs) == (
         torch.ops.aten.empty_like.default,
-        (x,),
+        (query,),
         {"memory_format": torch.contiguous_format},
     )
-    assert (write.target, write.args, write.kwargs) == (
-        torch.ops.kashi_test.write.default,
-        (x, empty, tag),
-        {"dep": x},
+    assert (attention.target, attention.args, attention.kwargs) == (
+        torch.ops.vllm.unified_attention_with_output.default,
+        (query, key, value, empty, layer_name),
+        {"kv_cache_dummy_dep": dep},
     )
     (output,) = gm.graph.find_nodes(op="output")
     assert output.args[0] is empty
-    x_val = torch.randn(3, 4)
-    torch.testing.assert_close(gm(x_val, functional_write.Tag(3.0)), x_val + 3.0)
 
 
-def test_rebuild_functional_dummy_rejects_unregistered_original(
-    functional_write, monkeypatch
-):
-    from kashi import functional
-
-    monkeypatch.setitem(
-        functional._FUNCTIONAL_OPS,
-        "kashi_test::missing",
-        functional.FunctionalForm("missing_functional", output="out", like="x"),
+def test_rebuild_unified_attention_requires_one_result():
+    src = ATTENTION.replace("%0 = torch.operator", "torch.operator").replace(
+        "!torch.vtensor<[0],f32>) -> !torch.vtensor<[3,2,4],f32>\n  return %0",
+        "!torch.vtensor<[0],f32>) -> ()\n  return %arg0",
     )
-    with pytest.raises(
-        NotImplementedError,
-        match=r"Unsupported MLIR op torch\.operator.*no torch\.ops\.kashi_test\.missing\.default",
-    ):
-        rebuild_fx(_with_operator("torch.kashi.missing_functional"))
-
-
-def test_rebuild_functional_dummy_requires_one_result(functional_write):
-    src = FUNCTIONAL.replace("%0 = torch.operator", "torch.operator").replace(
-        "!torch.vtensor<[?,4],f32>) -> !torch.vtensor<[?,4],f32>\n  return %0",
-        "!torch.vtensor<[?,4],f32>) -> ()\n  return %arg0",
-    )
-    with pytest.raises(NotImplementedError, match="expected 1 result, found 0"):
+    with pytest.raises(NotImplementedError, match="expected 1 result .*found 0"):
         rebuild_fx(_parse(src))

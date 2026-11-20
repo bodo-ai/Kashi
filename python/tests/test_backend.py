@@ -141,27 +141,3 @@ def test_custom_ops_with_opaque_inputs():
         ops.scale.default,
         ops.write.default,
     ]
-
-
-def test_functionalized_custom_ops_round_trip(monkeypatch):
-    kashi_test_ops.functional_entries(monkeypatch)
-    model = kashi_test_ops.OpsModel(kashi_test_ops.Tag(2.0), kashi_test_ops.Tag(3.0))
-    spy = BackendSpy()
-    compiled = torch.compile(model, backend=spy, fullgraph=True)
-    first = torch.randn(3, 4)
-    torch._dynamo.mark_dynamic(first, 0)
-
-    for x in (first, torch.randn(5, 4)):
-        out, d = compiled(x)
-        torch.testing.assert_close(out, (x + 3.0).view(-1))
-        torch.testing.assert_close(d, x * 2.0)
-    assert len(spy.calls) == 1
-
-    _, fn = spy.calls[0]
-    ops = torch.ops.kashi_test
-    wanted = {torch.ops.aten.empty_like.default, ops.scale.default, ops.write.default}
-    assert call_targets(fn.__self__, only=wanted) == [
-        ops.scale.default,
-        torch.ops.aten.empty_like.default,
-        ops.write.default,
-    ]

@@ -7,8 +7,6 @@ from iree.compiler import ir
 from iree.compiler.extras.fx_importer import TORCH_DTYPE_TO_INT
 from torch.utils import _pytree as pytree
 
-from kashi.functional import functional_original
-
 # --- Adapter: private PyTorch APIs used for schema-driven binding. ----------
 
 
@@ -111,9 +109,8 @@ def rebuild_fx(
             results = _call(graph, op, name, operands, max_results=1, min_results=1)
         elif name == "torch.operator":
             qualified = ir.StringAttr(op.attributes["name"]).value
-            original = _functional_original(qualified)
-            if original is not None:
-                results = _expand_functional(graph, op, *original, operands)
+            if qualified == "torch.kashi.unified_attention":
+                results = _expand_attention(graph, op, operands)
             else:
                 results = _call(graph, op, qualified, operands, max_results=1)
         else:
@@ -173,23 +170,12 @@ def _call(graph, op, name, operands, *, max_results, min_results=0):
         z = torch.ops.aten.add.Tensor(x, y, alpha=alpha)
     """
     target = _resolve(op, name)
-    num_results = _check_results(op, min_results, max_results)
-    node = graph.call_function(target, *_bind(op, target, operands))
-    return [node] if num_results else []
-
-
-def _check_results(op, min_results, max_results) -> int:
     num_results = len(op.results)
     if not min_results <= num_results <= max_results:
         expected = (
             f"{max_results}" if min_results == max_results else f"at most {max_results}"
         )
         raise _error(op, f"expected {expected} result, found {num_results}")
-    return num_results
-
-
-def _bind(op, target, operands):
-    """Bind MLIR operands to ``target``'s schema as ``(args, kwargs)``."""
     arguments = target._schema.arguments
     if len(operands) != len(arguments):
         raise _error(op, f"expected {len(arguments)} operands, found {len(operands)}")
@@ -200,39 +186,30 @@ def _bind(op, target, operands):
             kwargs[argument.name] = value
         else:
             args.append(value)
-    return tuple(args), kwargs
+    node = graph.call_function(target, tuple(args), kwargs)
+    return [node] if num_results else []
 
 
-def _functional_original(qualified: str):
-    """``(original op name, form)`` when ``qualified`` names a kashi
-    functional dummy, else ``None``."""
-    if not qualified.startswith("torch.kashi."):
-        return None
-    dummy = qualified.removeprefix("torch.kashi.")
-    if dummy.endswith(".default"):
-        dummy = dummy.removesuffix(".default")
-    return functional_original(dummy)
-
-
-def _expand_functional(graph, op, original, form, operands):
-    """Expand a functional dummy into a fresh contiguous buffer written by
-    the original destination-passing op; the buffer is the result."""
-    target = _resolve(op, "torch." + original.replace("::", "."))
-    _check_results(op, 1, 1)
-    names = [a.name for a in target._schema.arguments]
-    dummy_names = [n for n in names if n != form.output]
-    if len(operands) != len(dummy_names):
-        raise _error(op, f"expected {len(dummy_names)} operands, found {len(operands)}")
-    like = operands[dummy_names.index(form.like)]
-    buffer = graph.call_function(
+def _expand_attention(graph, op, operands):
+    """Expand ``kashi.unified_attention`` (see ``import_fx``) back into vLLM's
+    ``unified_attention_with_output`` writing a fresh buffer, the result."""
+    target = _resolve(op, "torch.vllm.unified_attention_with_output")
+    if len(op.results) != 1 or len(operands) != 5:
+        raise _error(
+            op,
+            f"expected 1 result and 5 operands, found {len(op.results)} "
+            f"and {len(operands)}",
+        )
+    query, key, value, layer_name, dep = operands
+    output = graph.call_function(
         torch.ops.aten.empty_like.default,
-        (like,),
+        (query,),
         {"memory_format": torch.contiguous_format},
     )
-    full = list(operands)
-    full.insert(names.index(form.output), buffer)
-    graph.call_function(target, *_bind(op, target, full))
-    return [buffer]
+    graph.call_function(
+        target, (query, key, value, output, layer_name), {"kv_cache_dummy_dep": dep}
+    )
+    return [output]
 
 
 def _output(op, operands, out_spec):

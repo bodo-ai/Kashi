@@ -3,6 +3,7 @@ import re
 
 import pytest
 import torch
+import vllm.model_executor.layers.attention.attention  # noqa: F401 (torch.ops.vllm)
 from kashi.importer import import_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
@@ -276,85 +277,166 @@ def test_import_fx_opaque_hook_is_not_global():
     assert fx_importer.ContextCache.value_info_to_type is before
 
 
-# --- Functional form of destination-passing ops. -----------------------------
+# --- vLLM attention is imported in functional form. -------------------------
+
+ATTENTION = torch.ops.vllm.unified_attention_with_output
+KV_UPDATE = torch.ops.vllm.unified_kv_cache_update
 
 
-@pytest.fixture
-def functional_write(monkeypatch):
-    import kashi_test_ops
-
-    kashi_test_ops.functional_entries(monkeypatch)
-    return kashi_test_ops
+class _StopCapture(Exception):
+    pass
 
 
-def _capture(ops, name):
-    extra = {"InputBufferModel": (3, 4), "ChunkInputBufferModel": (6, 4)}
-    inputs = (torch.randn(3, 4),)
-    if name in extra:
-        inputs += (torch.empty(*extra[name]),)
-    return ops.capture(getattr(ops, name)(ops.Tag(3.0)), *inputs)[0]
+def _capture_attention(body, *extra):
+    """Capture ``body(q, k, v, layer_name, *extra)`` with Dynamo without running
+    it: real vLLM attention needs vLLM's forward context."""
+    from vllm.utils.torch_utils import LayerName
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_name = LayerName("layer.0")
+
+        def forward(self, q, k, v, *extra):
+            return body(q, k, v, self.layer_name, *extra)
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        raise _StopCapture
+
+    torch._dynamo.reset()
+    q, k, v = (torch.randn(3, 2, 4) for _ in range(3))
+    with pytest.raises(Exception, match="_StopCapture"):
+        torch.compile(Model(), backend=backend, fullgraph=True)(q, k, v, *extra)
+    (gm,) = graphs
+    return gm
+
+
+def _attention_lines(text):
+    return [l for l in text.splitlines() if '"torch.kashi.unified_attention"' in l]
 
 
 def _ssa_operands(line):
     return re.search(r"\((.*?)\)\s*:", line).group(1).split(", ")
 
 
-def test_import_fx_functionalizes_write(functional_write):
-    gm, _ = _captured_ops_model()
+def _result(line):
+    return line.split("=")[0].strip()
+
+
+def _returned(text):
+    (ret,) = (l for l in text.splitlines() if l.strip().startswith("return"))
+    return ret.split()[1]
+
+
+def _vllm_attention(q, k, v, name):
+    dep = KV_UPDATE(k, v, name)
+    out = torch.empty(6, 4).view(3, 2, 4)
+    ATTENTION(q, k, v, out, name, kv_cache_dummy_dep=dep)
+    return out.view(3, 8)
+
+
+def test_import_fx_functionalizes_vllm_attention():
+    gm = _capture_attention(_vllm_attention)
     result = import_fx(gm)
     text = str(result.module)
 
     assert result.module.operation.verify()
-    assert '"torch.kashi_test.write"' not in text
-    line = next(l for l in text.splitlines() if '"torch.kashi.write_functional"' in l)
-    assert line.rstrip().endswith("-> !torch.vtensor<[?,4],f32>")
-    result_name = line.split("=")[0].strip()
-    assert re.search(rf"torch\.aten\.view {re.escape(result_name)},", text)
+    assert "unified_attention_with_output" not in text
+    (line,) = _attention_lines(text)
+    assert line.rstrip().endswith("-> !torch.vtensor<[3,2,4],f32>")
+    kv_update = next(l for l in text.splitlines() if "unified_kv_cache_update" in l)
+    # query, key, value, layer_name, kv_cache_dummy_dep
+    operands = _ssa_operands(line)
+    assert len(operands) == 5 and operands[-1] == _result(kv_update)
+    assert re.search(rf"torch\.aten\.view {re.escape(_result(line))},", text)
     # The input graph is untouched.
-    assert gm.graph.find_nodes(op="call_function", target=torch.ops.kashi_test.write)
+    assert gm.graph.find_nodes(op="call_function", target=ATTENTION)
 
 
-def test_import_fx_functionalizes_each_call(functional_write):
-    result = import_fx(_capture(functional_write, "TwoWritesModel"))
-    text = str(result.module)
+def _two_layers(q, k, v, name):
+    a = torch.empty(3, 2, 4)
+    ATTENTION(q, k, v, a, name)
+    b = torch.empty(3, 2, 4)
+    ATTENTION(a, k, v, b, name, kv_cache_dummy_dep=a)
+    return b
 
-    assert result.module.operation.verify()
-    first, second = (
-        l for l in text.splitlines() if '"torch.kashi.write_functional"' in l
-    )
-    first_name = first.split("=")[0].strip()
-    second_name = second.split("=")[0].strip()
+
+def test_import_fx_functionalizes_each_attention_call():
+    text = str(import_fx(_capture_attention(_two_layers)).module)
+
+    first, second = _attention_lines(text)
     operands = _ssa_operands(second)
-    assert operands[0] == operands[-1] == first_name
-    (ret,) = (l for l in text.splitlines() if l.strip().startswith("return"))
-    assert ret.split()[1] == second_name
+    assert operands[0] == operands[-1] == _result(first)
+    assert _returned(text) == _result(second)
+
+
+def _output_as_dep(q, k, v, name):
+    out = torch.empty(3, 2, 4)
+    ATTENTION(q, k, v, out, name, kv_cache_dummy_dep=out)
+    return out
+
+
+def test_import_fx_functionalizes_attention_with_output_as_dep():
+    text = str(import_fx(_capture_attention(_output_as_dep)).module)
+
+    (line,) = _attention_lines(text)
+    empty = next(l for l in text.splitlines() if "torch.aten.empty.memory_format" in l)
+    # The dependency reads the buffer before the write; the result is returned.
+    assert _ssa_operands(line)[-1] == _result(empty)
+    assert _returned(text) == _result(line)
+
+
+def _graph_input(q, k, v, name, buf):
+    ATTENTION(q, k, v, buf, name)
+    return buf
+
+
+def _chunk_of_empty(q, k, v, name):
+    out = torch.empty(6, 2, 4).chunk(2)[0]
+    ATTENTION(q, k, v, out, name)
+    return out
+
+
+def _base_read_after(q, k, v, name):
+    base = torch.empty(6, 4)
+    ATTENTION(q, k, v, base.view(3, 2, 4), name)
+    return base
+
+
+def _wrong_shape(q, k, v, name):
+    out = torch.empty(3, 8)
+    ATTENTION(q, k, v, out, name)
+    return out
+
+
+def _strided(q, k, v, name):
+    out = torch.ops.aten.transpose.int(torch.empty(2, 3, 4), 0, 1)
+    ATTENTION(q, k, v, out, name)
+    return out
+
+
+def _scaled(q, k, v, name):
+    out = torch.empty(3, 2, 4)
+    ATTENTION(q, k, v, out, name, output_scale=q)
+    return out
 
 
 @pytest.mark.parametrize(
-    "model, match",
+    "body, extra, match",
     [
-        ("InputBufferModel", "graph input"),
-        ("AliasedBufferModel", "aliases"),
-        ("MismatchedBufferModel", "shape"),
-        ("StridedBufferModel", "contiguous"),
-        ("ScaledWriteModel", "block_scale"),
-        ("ChunkInputBufferModel", "not a fresh buffer"),
-        ("SlicedBaseModel", "not a fresh buffer"),
+        (_graph_input, (torch.empty(3, 2, 4),), "not a fresh buffer"),
+        (_chunk_of_empty, (), "not a fresh buffer"),
+        (_base_read_after, (), "aliases output"),
+        (_wrong_shape, (), "shape"),
+        (_strided, (), "contiguous"),
+        (_scaled, (), "output_scale"),
     ],
+    ids=["graph-input", "chunk", "aliased-base", "shape", "strided", "scaled"],
 )
-def test_import_fx_functionalize_rejects(functional_write, model, match):
+def test_import_fx_rejects_unsafe_attention(body, extra, match):
+    gm = _capture_attention(body, *extra)
     with pytest.raises(NotImplementedError, match=match):
-        import_fx(_capture(functional_write, model))
-
-
-def test_import_fx_functionalizes_output_passed_as_another_argument(functional_write):
-    result = import_fx(_capture(functional_write, "OutputAsDepModel"))
-    text = str(result.module)
-
-    assert result.module.operation.verify()
-    (line,) = (l for l in text.splitlines() if '"torch.kashi.write_functional"' in l)
-    empty = next(l for l in text.splitlines() if "torch.aten.empty.memory_format" in l)
-    # dep reads the buffer before the write; the result is what is returned.
-    assert _ssa_operands(line)[-1] == empty.split("=")[0].strip()
-    (ret,) = (l for l in text.splitlines() if l.strip().startswith("return"))
-    assert ret.split()[1] == line.split("=")[0].strip()
+        import_fx(gm)

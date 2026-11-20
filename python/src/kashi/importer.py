@@ -7,9 +7,34 @@ import torch
 from iree.compiler import ir
 from iree.compiler.extras.fx_importer import ContextCache, FxImporter, IrType
 from torch._library.fake_class_registry import FakeScriptObject
+from torch._library.opaque_object import get_opaque_type_name, register_opaque_type
+from torch._opaque_base import OpaqueBase
 from torch.utils import _pytree as pytree
 
-from kashi.functional import FunctionalForm, dummy_op, functional_form
+# vLLM's attention writes its result into ``output`` and returns nothing, which
+# value-semantic MLIR cannot express. ``import_fx`` replaces it with the
+# functional ``kashi::unified_attention``, which returns the result, and
+# ``rebuild_fx`` expands that back into the vLLM op writing a fresh buffer.
+_VLLM_ATTENTION = "vllm::unified_attention_with_output"
+_LIB = torch.library.Library("kashi", "FRAGMENT")
+
+
+class _LayerName(OpaqueBase):
+    """Names vLLM's opaque ``layer_name`` type in the schema below. Schemas
+    report every opaque type as ``PyObject``, which cannot be parsed back."""
+
+
+register_opaque_type(_LayerName, typ="reference")
+_LIB.define(
+    "unified_attention(Tensor query, Tensor key, Tensor value, "
+    f"{get_opaque_type_name(_LayerName)} layer_name, "
+    "Tensor? kv_cache_dummy_dep=None) -> Tensor"
+)
+
+
+@torch.library.register_fake("kashi::unified_attention", lib=_LIB)
+def _(query, key, value, layer_name, kv_cache_dummy_dep=None):
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
 @dataclass(frozen=True)
@@ -167,9 +192,8 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
             _resolve_packet(node)
             target = node.target
         if isinstance(target, torch._ops.OpOverload):
-            form = functional_form(target)
-            if form is not None:
-                _functionalize(graph, node, form)
+            if target._schema.name == _VLLM_ATTENTION:
+                _functionalize_attention(graph, node)
             return
         if target is operator.getitem:
             source, index = node.args
@@ -363,109 +387,53 @@ def _resolve_packet(node: torch.fx.Node) -> None:
     node.target = getattr(packet, overloads[0])
 
 
-def _functionalize(
-    graph: torch.fx.Graph, node: torch.fx.Node, form: FunctionalForm
-) -> None:
-    """Replace a destination-passing call with its functional dummy, whose
-    result later uses of the output buffer read instead. Rejects calls whose
-    write could be observed through anything other than that result."""
-    target = node.target
-    bound = _bind(target, node)
-    for argument in target._schema.arguments:
-        if (
-            argument.name != form.output
-            and argument.alias_info is not None
-            and argument.alias_info.is_write
-            and bound[argument.name] is not None
-        ):
-            raise NotImplementedError(
-                f"Cannot functionalize: mutated argument {argument.name} is not "
-                f"None: {node.format_node()}"
-            )
-    if node.users:
+def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+    """Replace vLLM's ``unified_attention_with_output`` call with
+    ``kashi.unified_attention``; later uses of ``output`` read its result.
+
+    Only safe when nothing else can observe the write: ``output`` must be a
+    contiguous, query-shaped view of a fresh ``empty`` that nothing reads
+    after the call through another alias.
+    """
+
+    def reject(reason):
         raise NotImplementedError(
-            f"Cannot functionalize a call with users: {node.format_node()}"
+            f"Cannot functionalize attention, {reason}: {node.format_node()}"
         )
 
-    output = bound[form.output]
-    out_val = output.meta.get("val")
-    like_val = _meta_val(bound[form.like])
-    if not isinstance(out_val, torch.Tensor) or not out_val.is_contiguous():
-        raise NotImplementedError(
-            f"Cannot functionalize: {form.output} is not a contiguous tensor: "
-            f"{node.format_node()}"
-        )
-    if (
-        not isinstance(like_val, torch.Tensor)
-        or out_val.shape != like_val.shape
-        or out_val.dtype != like_val.dtype
-    ):
-        raise NotImplementedError(
-            f"Cannot functionalize: {form.output} differs from {form.like} in "
-            f"shape or dtype: {node.format_node()}"
-        )
-
+    bound = torch.fx.operator_schemas.normalize_function(
+        node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
+    ).kwargs
+    output, query = bound["output"], bound["query"]
+    if bound["output_scale"] is not None or bound["output_block_scale"] is not None:
+        reject("output_scale and output_block_scale are unsupported")
+    out, q = output.meta["val"], query.meta["val"]
+    if not out.is_contiguous():
+        reject("output is not contiguous")
+    if (out.shape, out.dtype) != (q.shape, q.dtype):
+        reject("output and query differ in shape or dtype")
     base = output
-    while base.op == "call_function" and base.target is torch.ops.aten.view.default:
+    while base.target is torch.ops.aten.view.default:
         base = base.args[0]
-    if base.op == "placeholder":
-        raise NotImplementedError(
-            f"Cannot functionalize: {form.output} is a view of graph input "
-            f"{base.name}: {node.format_node()}"
-        )
     if base.target is not torch.ops.aten.empty.memory_format:
-        raise NotImplementedError(
-            f"Cannot functionalize: {form.output} is not a fresh buffer (an "
-            f"empty tensor or views of one), it comes from {base.name}: "
-            f"{node.format_node()}"
-        )
+        reject(f"output is not a fresh buffer (it comes from {base.name})")
+
     order = {n: i for i, n in enumerate(graph.nodes)}
-    at = order[node]
-    for alias in _derived_before(base, node, order):
-        if alias is output:
-            continue
-        if any(order[user] > at for user in alias.users):
-            raise NotImplementedError(
-                f"Cannot functionalize: {alias.name} aliases {form.output} and "
-                f"is used after the write: {node.format_node()}"
-            )
+    for alias in _derived_before(base, node, order) - {output}:
+        if any(order[user] > order[node] for user in alias.users):
+            reject(f"{alias.name} aliases output and is used after the call")
 
-    dummy = dummy_op(target, form)
-    args, kwargs = [], {}
-    for argument in dummy._schema.arguments:
-        if argument.kwarg_only:
-            kwargs[argument.name] = bound[argument.name]
-        else:
-            args.append(bound[argument.name])
-    later = [u for u in output.users if u is not node and order[u] > at]
+    later = [user for user in output.users if order[user] > order[node]]
     with graph.inserting_before(node):
-        new = graph.call_function(dummy, tuple(args), kwargs)
-    new.meta = dict(output.meta)
+        result = graph.call_function(
+            torch.ops.kashi.unified_attention.default,
+            (query, bound["key"], bound["value"], bound["layer_name"]),
+            {"kv_cache_dummy_dep": bound["kv_cache_dummy_dep"]},
+        )
+    result.meta = dict(output.meta)
     for user in later:
-        user.replace_input_with(output, new)
+        user.replace_input_with(output, result)
     graph.erase_node(node)
-
-
-def _bind(target: torch._ops.OpOverload, node: torch.fx.Node) -> dict:
-    """Argument name -> value for ``node``'s call, with defaults filled in."""
-    bound = {}
-    positional = list(node.args)
-    for argument in target._schema.arguments:
-        if not argument.kwarg_only and positional:
-            bound[argument.name] = positional.pop(0)
-        elif argument.name in node.kwargs:
-            bound[argument.name] = node.kwargs[argument.name]
-        elif argument.has_default_value():
-            bound[argument.name] = argument.default_value
-        else:
-            raise NotImplementedError(
-                f"Missing argument {argument.name}: {node.format_node()}"
-            )
-    return bound
-
-
-def _meta_val(value):
-    return value.meta.get("val") if isinstance(value, torch.fx.Node) else value
 
 
 def _derived_before(base: torch.fx.Node, call: torch.fx.Node, order) -> set:
