@@ -118,6 +118,28 @@ errors; neither mode silently falls back to the ordinary backend.
 The CUDA/PTX compilation test is skipped on macOS, and GPU execution tests run
 only when CUDA is available. Platform-independent IREE tests still run there.
 
+To check Qwen3 inference against uncompiled vLLM on a CUDA GPU, run:
+
+```sh
+pixi run --locked test-python -v python/tests/test_iree_qwen3_integration.py
+```
+
+The two cases exercise direct CUDA launches (`cuda`) and IREE VMFB execution
+(`iree`). They use the same seeded, offline, one-layer dummy Qwen3 model and
+prompts as the uncompiled reference, and check that IREE executes during each
+compiled graph call, including request prefill and decode. The assertions in
+`python/tests/test_iree_qwen3_integration.py` and `assert_outputs_match` in
+`python/tests/vllm_test_utils.py` compare generated token IDs exactly and the
+selected-token log-probabilities with `rtol=1e-4`, `atol=1e-5`. Pytest reports
+pass or failure; it does not print the compared values. This is coverage for
+that test model and those inputs, not a proof for every model or checkpoint.
+Without CUDA the cases are skipped. To test individual operations and mutation
+semantics against eager PyTorch, run:
+
+```sh
+pixi run --locked test-python -v python/tests/test_iree_execution.py
+```
+
 ## Tests
 
 The Pixi environment supplies PyTorch, IREE, vLLM, pytest, Catch2 v3, CMake, Ninja, nanobind, Python, and a C++ compiler. A GPU is not required on CPU platforms.
