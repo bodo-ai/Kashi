@@ -475,3 +475,44 @@ def test_decomposition_matches_vllm_kernel_on_cuda(case):
     assert len(kernel_out) == len(decomposed_out)
     for got, want in zip(decomposed_out, kernel_out, strict=True):
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+# --- Schema argument names differ between vLLM builds. ----------------------
+
+# vLLM's CPU build names the output buffer "out" where the CUDA build says
+# "result"; positions are the same. These copies use the CPU wheel's schemas.
+_CPU_SCHEMAS = torch.library.Library("kashi_cpu_schema", "DEF")
+for _schema in (
+    "rms_norm(Tensor(a!) out, Tensor input, Tensor? weight, float epsilon) -> ()",
+    "silu_and_mul(Tensor(a!) out, Tensor input) -> ()",
+):
+    _CPU_SCHEMAS.define(_schema)
+    _CPU_SCHEMAS.impl(_schema.split("(")[0], lambda *args: None, "Meta")
+
+
+@pytest.mark.parametrize("op", ["rms_norm", "silu_and_mul"])
+def test_rules_do_not_depend_on_schema_argument_names(op, monkeypatch):
+    import kashi.decompose
+
+    rules = dict(kashi.decompose._DECOMPOSITIONS)
+    rules[f"kashi_cpu_schema::{op}"] = rules[f"_C::{op}"]
+    monkeypatch.setattr(kashi.decompose, "_DECOMPOSITIONS", rules)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    target = getattr(torch.ops.kashi_cpu_schema, op).default
+    if op == "rms_norm":
+        out = _empty(graph, [3, 8])
+        graph.call_function(target, (out, x, None, EPS))
+    else:
+        out = _empty(graph, [3, 4])
+        graph.call_function(target, (out, x))
+    graph.output((out,))
+    x_val = torch.randn(3, 8)
+    gm = _decompose(_fake(graph, x_val))
+
+    (result,) = gm(x_val)
+    if op == "rms_norm":
+        expected = _ref_rms(x_val, None, EPS)
+    else:
+        expected = torch.nn.functional.silu(x_val[:, :4]) * x_val[:, 4:]
+    torch.testing.assert_close(result, expected)

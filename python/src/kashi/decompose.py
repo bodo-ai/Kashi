@@ -69,47 +69,46 @@ class _Emitter:
         return node
 
 
-_Rule = Callable[[_Emitter, dict], dict[torch.fx.Node, torch.fx.Node]]
+# Rules receive the call's arguments by position, with defaults filled in.
+# Argument names are not stable: vLLM's CPU build calls the output buffer
+# "out" where the CUDA build calls it "result".
+_Rule = Callable[[_Emitter, list], dict[torch.fx.Node, torch.fx.Node]]
 
 
-def _rms_norm(emit: _Emitter, a: dict) -> dict:
-    x = a["input"]
+def _rms_norm(emit: _Emitter, args: list) -> dict:
+    result, x, weight, epsilon = args
     normalized = [x.meta["val"].shape[-1]]
-    return {
-        a["result"]: emit(
-            aten.rms_norm.default, x, normalized, a["weight"], a["epsilon"]
-        )
-    }
+    return {result: emit(aten.rms_norm.default, x, normalized, weight, epsilon)}
 
 
-def _fused_add_rms_norm(emit: _Emitter, a: dict) -> dict:
-    x, residual = a["input"], a["residual"]
+def _fused_add_rms_norm(emit: _Emitter, args: list) -> dict:
+    x, residual, weight, epsilon = args
     summed = emit(aten.add.Tensor, x, residual)
     normalized = [x.meta["val"].shape[-1]]
     return {
-        x: emit(aten.rms_norm.default, summed, normalized, a["weight"], a["epsilon"]),
+        x: emit(aten.rms_norm.default, summed, normalized, weight, epsilon),
         residual: summed,
     }
 
 
-def _silu_and_mul(emit: _Emitter, a: dict) -> dict:
-    x = a["input"]
+def _silu_and_mul(emit: _Emitter, args: list) -> dict:
+    result, x = args
     half = x.meta["val"].shape[-1] // 2
     gate = emit(aten.slice.Tensor, x, -1, 0, half)
     up = emit(aten.slice.Tensor, x, -1, half, 2 * half)
-    return {a["result"]: emit(aten.mul.Tensor, emit(aten.silu.default, gate), up)}
+    return {result: emit(aten.mul.Tensor, emit(aten.silu.default, gate), up)}
 
 
-def _rotary_embedding(emit: _Emitter, a: dict) -> dict:
+def _rotary_embedding(emit: _Emitter, args: list) -> dict:
     """NeoX-style rotation over the full head, the only variant Qwen3 uses."""
-    head_size, cache = a["head_size"], a["cos_sin_cache"]
+    positions, query, key, head_size, cache, is_neox, rope_dim_offset, inverse = args
     problems = [
         message
         for failed, message in (
-            (not a["is_neox"], "is_neox=False"),
-            (a["rope_dim_offset"] != 0, f"rope_dim_offset={a['rope_dim_offset']}"),
-            (a["inverse"], "inverse=True"),
-            (a["key"] is None, "key=None"),
+            (not is_neox, "is_neox=False"),
+            (rope_dim_offset != 0, f"rope_dim_offset={rope_dim_offset}"),
+            (inverse, "inverse=True"),
+            (key is None, "key=None"),
             (
                 cache.meta["val"].shape[-1] != head_size,
                 "partial rotary (cos_sin_cache width != head_size)",
@@ -123,7 +122,7 @@ def _rotary_embedding(emit: _Emitter, a: dict) -> dict:
         )
 
     half = head_size // 2
-    cos_sin = emit(aten.index.Tensor, cache, [a["positions"]])
+    cos_sin = emit(aten.index.Tensor, cache, [positions])
     cos = emit(
         aten.unsqueeze.default, emit(aten.slice.Tensor, cos_sin, -1, 0, half), -2
     )
@@ -153,7 +152,7 @@ def _rotary_embedding(emit: _Emitter, a: dict) -> dict:
         rotated = emit(aten.cat.default, [first, second], -1)
         return emit(aten.view.default, rotated, [-1, *shape])
 
-    return {a["query"]: rotate(a["query"]), a["key"]: rotate(a["key"])}
+    return {query: rotate(query), key: rotate(key)}
 
 
 _DECOMPOSITIONS: dict[str, _Rule] = {
@@ -164,16 +163,16 @@ _DECOMPOSITIONS: dict[str, _Rule] = {
 }
 
 
-def _bind(node: torch.fx.Node) -> dict:
-    """Bind a call's arguments to schema names, filling in defaults."""
-    bound = {}
+def _bind(node: torch.fx.Node) -> list:
+    """Return a call's arguments in schema order, filling in defaults."""
+    bound = []
     for i, argument in enumerate(node.target._schema.arguments):
         if i < len(node.args):
-            bound[argument.name] = node.args[i]
+            bound.append(node.args[i])
         elif argument.name in node.kwargs:
-            bound[argument.name] = node.kwargs[argument.name]
+            bound.append(node.kwargs[argument.name])
         else:
-            bound[argument.name] = argument.default_value
+            bound.append(argument.default_value)
     return bound
 
 
