@@ -1,5 +1,7 @@
 """Opt-in decomposition of vLLM custom operators into ATen operators."""
 
+import sys
+
 import pytest
 import torch
 from fx_test_utils import RecordExamples
@@ -8,6 +10,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 pytest.importorskip("vllm._custom_ops")  # registers torch.ops._C
 
 from kashi.decompose import DECOMPOSED_FROM_KEY, decompose_custom_ops
+from kashi.importer import import_fx
+from kashi.iree_partition import partition_at_custom_ops
 
 aten = torch.ops.aten
 EPS = 1e-6
@@ -277,3 +281,90 @@ def test_unsupported_rotary_variants_raise(variant):
 
     with pytest.raises(NotImplementedError, match="rotary_embedding"):
         decompose_custom_ops(gm.graph)
+
+
+# --- Wiring: import_fx, MLIR locations, partitioning and compile_iree_fx. ---
+
+
+def _qwen_like_graph():
+    graph = torch.fx.Graph()
+    x, w = graph.placeholder("x"), graph.placeholder("w")
+    first, second = _empty(graph, [3, 8]), _empty(graph, [3, 8])
+    graph.call_function(torch.ops._C.rms_norm.default, (first, x, w, EPS))
+    graph.call_function(torch.ops._C.rms_norm.default, (second, first, w, EPS))
+    out = _empty(graph, [3, 4])
+    graph.call_function(torch.ops._C.silu_and_mul.default, (out, second))
+    graph.output((out,))
+    return _fake(graph, torch.randn(3, 8), torch.randn(8))
+
+
+def _main_operations(module):
+    (main,) = module.body.operations
+    return [op.operation for op in main.regions[0].blocks[0].operations]
+
+
+def test_import_tags_decomposed_ops_with_name_locations():
+    imported = import_fx(_qwen_like_graph(), decompose_custom_ops=True)
+
+    assert imported.module.operation.verify()
+    assert "torch.operator" not in str(imported.module)
+    locations = [
+        str(op.location)
+        for op in _main_operations(imported.module)
+        if op.name == "torch.aten.rms_norm"
+    ]
+    assert len(locations) == 2
+    assert {loc.split('"')[1] for loc in locations} == {
+        "kashi.decomposed:_C.rms_norm#0",
+        "kashi.decomposed:_C.rms_norm#1",
+    }
+    asm = imported.module.operation.get_asm(enable_debug_info=True)
+    assert '"kashi.decomposed:_C.silu_and_mul#0"' in asm
+
+
+def test_import_without_flag_keeps_custom_ops():
+    imported = import_fx(_qwen_like_graph())
+
+    asm = imported.module.operation.get_asm(enable_debug_info=True)
+    assert 'torch.operator "torch._C.rms_norm"' in asm
+    assert "kashi.decomposed" not in asm
+
+
+def test_decomposed_graph_is_a_single_iree_segment():
+    imported = import_fx(_qwen_like_graph(), decompose_custom_ops=True)
+
+    partition = partition_at_custom_ops(imported.module)
+
+    assert len(partition.segments) == 1  # one segment per custom op, plus one
+
+
+def test_compile_iree_fx_forwards_the_flag(monkeypatch, tmp_path):
+    import kashi.iree_backend
+
+    seen = {}
+
+    def record(gm, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop after import")
+
+    monkeypatch.setattr(kashi.iree_backend, "import_fx", record)
+    with pytest.raises(RuntimeError, match="stop after import"):
+        kashi.iree_backend.compile_iree_fx(
+            _qwen_like_graph(), output_dir=tmp_path, decompose_custom_ops=True
+        )
+    assert seen == {"decompose_custom_ops": True}
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="IREE CUDA compilation")
+def test_partitioned_artifact_keeps_tags(tmp_path):
+    from kashi.iree_backend import compile_iree_fx
+
+    result = compile_iree_fx(
+        _qwen_like_graph(),
+        output_dir=tmp_path,
+        cuda_target="sm_80",
+        decompose_custom_ops=True,
+    )
+
+    partitioned = (result.artifact_dir / "partitioned.mlir").read_text()
+    assert "kashi.decomposed:_C.rms_norm#0" in partitioned

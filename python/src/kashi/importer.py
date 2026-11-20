@@ -9,6 +9,8 @@ from iree.compiler.extras.fx_importer import ContextCache, FxImporter, IrType
 from torch._library.fake_class_registry import FakeScriptObject
 from torch.utils import _pytree as pytree
 
+from kashi import decompose
+
 
 @dataclass(frozen=True)
 class ImportedModule:
@@ -19,12 +21,17 @@ class ImportedModule:
     out_spec: pytree.TreeSpec
 
 
-def import_fx(gm: torch.fx.GraphModule) -> ImportedModule:
+def import_fx(
+    gm: torch.fx.GraphModule, *, decompose_custom_ops: bool = False
+) -> ImportedModule:
     """Import ``gm`` as a Torch-dialect MLIR module.
 
     The input graph is not modified; normalization runs on a structural copy.
+    With ``decompose_custom_ops``, supported vLLM custom ops are rewritten into
+    ATen ops whose MLIR locations name the call they came from (see
+    :mod:`kashi.decompose`).
     """
-    normalized = _normalize(gm)
+    normalized = _normalize(gm, decompose_custom_ops=decompose_custom_ops)
     (output,) = normalized.graph.find_nodes(op="output")
     # FxImporter represents FX graph outputs as a sequence of MLIR function results.
     # For example: x, (x,), and [x] all lower to the same `return %x` in MLIR.
@@ -56,6 +63,18 @@ class _OpaqueContextCache(ContextCache):
                 return IrType.parse("!torch.list<int>", self._c)
         return super().value_info_to_type(val, tensor_meta=tensor_meta, mutable=mutable)
 
+    def get_node_location(self, node):
+        """Wrap a decomposed op's location in a NameLoc naming its origin call."""
+        location = super().get_node_location(node)
+        tag = node.meta.get(decompose.DECOMPOSED_FROM_KEY)
+        if tag is None:
+            return location
+        return ir.Location.name(
+            f"kashi.decomposed:{tag}",
+            childLoc=location or ir.Location.unknown(self._c),
+            context=self._c,
+        )
+
 
 def _use_opaque_types(importer: FxImporter) -> None:
     """Adapter: install the opaque-aware cache on this importer only. Uses
@@ -65,7 +84,9 @@ def _use_opaque_types(importer: FxImporter) -> None:
     )
 
 
-def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def _normalize(
+    gm: torch.fx.GraphModule, *, decompose_custom_ops: bool = False
+) -> torch.fx.GraphModule:
     """Normalize a raw Dynamo FX graph into a form supported by FxImporter.
 
     FxImporter expects a functionalized graph consisting of ATen operators. Such graphs
@@ -85,6 +106,8 @@ def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         _normalize_meta(node)
         if node.op in ("call_function", "call_method"):
             _rewrite(graph, node)
+    if decompose_custom_ops:
+        decompose.decompose_custom_ops(graph)
 
     graph.lint()
     return torch.fx.GraphModule(gm, graph)

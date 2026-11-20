@@ -67,12 +67,20 @@ def _cuda_target(cuda_target: str | None) -> str:
     return f"sm_{major}{minor}"
 
 
+def _asm(module, with_locations: bool) -> str:
+    """Print a module, keeping locations only when they carry decomposition tags."""
+    if with_locations:
+        return module.operation.get_asm(enable_debug_info=True)
+    return str(module)
+
+
 def compile_iree_fx(
     gm: torch.fx.GraphModule,
     *,
     output_dir: str | os.PathLike,
     cuda_target: str | None = None,
     compiler: str | os.PathLike | None = None,
+    decompose_custom_ops: bool = False,
 ) -> IreeCompilation:
     """Compile an FX graph to CUDA PTX and reconstruct its opaque-kernel FX graph.
 
@@ -83,6 +91,9 @@ def compile_iree_fx(
             ``IREE_CUDA_TARGET`` or the current CUDA device's capability.
         compiler: Optional path to ``iree-compile``; by default use the IREE
             package's tool discovery.
+        decompose_custom_ops: Rewrite supported vLLM custom ops into ATen ops
+            before import. Their MLIR locations name the original call, and the
+            MLIR artifacts are written with locations so IREE sees them.
 
     Returns:
         The reassembled graph and paths to the flow IR and PTX artifacts. Kernel
@@ -92,7 +103,7 @@ def compile_iree_fx(
         NotImplementedError: If a segment cannot be represented or rebuilt.
         RuntimeError: If IREE compilation or its expected phase dump fails.
     """
-    imported = import_fx(gm)
+    imported = import_fx(gm, decompose_custom_ops=decompose_custom_ops)
     if not imported.module.operation.verify():
         raise RuntimeError(
             f"Verification failed for imported module:\n{imported.module}"
@@ -117,8 +128,10 @@ def compile_iree_fx(
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = Path(tempfile.mkdtemp(prefix="kashi-iree-", dir=output_dir))
     partitioned = artifact_dir / "partitioned.mlir"
-    partitioned.write_text(str(partition.module))
-    (artifact_dir / "driver.mlir").write_text(str(partition.driver))
+    partitioned.write_text(_asm(partition.module, decompose_custom_ops))
+    (artifact_dir / "driver.mlir").write_text(
+        _asm(partition.driver, decompose_custom_ops)
+    )
     phases_dir = artifact_dir / "phases"
     kernels_dir = artifact_dir / "kernel_files"
     command = [
