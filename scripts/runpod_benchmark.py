@@ -241,7 +241,8 @@ def main(argv=None):
                 api, (args.wait_for_capacity or 0) * 60, args.data_center, args.gpu
             )
             return run_benchmark(args, api, journal, account, gpu_id)
-    except (Exception, KeyboardInterrupt) as error:  # noqa: BLE001 (CLI exit code)
+    # This is the CLI boundary: report unexpected failures without a traceback.
+    except (Exception, KeyboardInterrupt) as error:  # noqa: BLE001
         print(f"error: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
 
@@ -296,7 +297,8 @@ def cleanup(api, journal, run_id, name, account, pod_id):
             journal.remove(run_id)
             print("Pod termination confirmed.")
             return True
-    except Exception as error:  # noqa: BLE001 (reported, then left unresolved)
+    # Keep the journal unresolved after any cleanup failure, including unexpected ones.
+    except Exception as error:  # noqa: BLE001
         print(f"Termination error: {error}", file=sys.stderr)
     report_unresolved(journal.records())
     return False

@@ -595,7 +595,8 @@ class Worker:
                     self.profile()
                 self.remaining()
                 status = "completed"
-        except Exception as exc:  # noqa: BLE001 (any failure ends the run as failed)
+        # Publish failure diagnostics and still run cleanup for unexpected errors.
+        except Exception as exc:  # noqa: BLE001
             self.error = self.clean(f"{type(exc).__name__}: {exc}")
             self.log(self.error)
         finally:
@@ -608,7 +609,8 @@ class Worker:
                     self.server_process.wait()
             try:
                 self.finalize(status)
-            except Exception as exc:  # noqa: BLE001 (reported as the final state)
+            # Artifact creation must leave a visible failed state for any error.
+            except Exception as exc:  # noqa: BLE001
                 self.set_state("failed", f"artifact creation failed: {self.clean(exc)}")
 
     def finalize(self, status):
