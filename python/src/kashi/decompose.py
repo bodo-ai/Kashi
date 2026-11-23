@@ -106,19 +106,22 @@ def _silu_and_mul(emit: _Emitter, args: list) -> dict:
 
 def _rotary_embedding(emit: _Emitter, args: list) -> dict:
     """_C.rotary_embedding(positions, query, key, head_size, cos_sin_cache, ...)
-    replaced with an explicit NeoX rotation of query and key, in place.
+        replaced with an explicit NeoX rotation of query and key, in place.
 
-    With h = head_size // 2, each row of cos_sin_cache is [cos | sin] (h each):
+        Matches vLLM's native implementation:
+    https://github.com/vllm-project/vllm/blob/v0.33.0rc3/vllm/model_executor/layers/rotary_embedding/base.py#L161-L201
 
-        cos = cos_sin_cache[positions, :h]       # [tokens, 1, h]
-        sin = cos_sin_cache[positions, h:]       # [tokens, 1, h]
+        With h = head_size // 2, each row of cos_sin_cache is [cos | sin] (h each):
 
-    and each head of x (query or key, viewed as [tokens, heads, head_size]) is
-    split into its first and second halves, x1 = x[..., :h], x2 = x[..., h:]:
+            cos = cos_sin_cache[positions, :h]       # [tokens, 1, h]
+            sin = cos_sin_cache[positions, h:]       # [tokens, 1, h]
 
-        x = cat(x1 * cos - x2 * sin,  x2 * cos + x1 * sin)
+        and each head of x (query or key, viewed as [tokens, heads, head_size]) is
+        split into its first and second halves, x1 = x[..., :h], x2 = x[..., h:]:
 
-    Only full-head NeoX rotation with a key (what Qwen3 uses) is supported.
+            x = cat(x1 * cos - x2 * sin,  x2 * cos + x1 * sin)
+
+        Only full-head NeoX rotation with a key (what Qwen3 uses) is supported.
     """
     positions, query, key, head_size, cache, is_neox, rope_dim_offset, inverse = args
     problems = [
