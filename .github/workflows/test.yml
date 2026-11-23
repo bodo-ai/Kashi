@@ -40,6 +40,8 @@ jobs:
         run: pixi run --locked lint
 
   test:
+    # Lint builds the editable package first, warming sccache for matching Linux compilations.
+    needs: lint
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
