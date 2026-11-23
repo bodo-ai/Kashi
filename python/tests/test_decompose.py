@@ -1,188 +1,289 @@
-"""Opt-in decomposition of vLLM custom operators into ATen operators."""
+"""Opt-in decomposition of vLLM custom operators into ATen operators.
 
-import operator
+Graphs are plain Python functions traced with ``make_fx`` on fake tensors.
+"""
+
 import sys
 
 import pytest
 import torch
-from fx_test_utils import RecordExamples
-from torch._subclasses.fake_tensor import FakeTensorMode
-
-pytest.importorskip("vllm._custom_ops")  # registers torch.ops._C
-
+import vllm._custom_ops  # noqa # registers torch.ops._C
 from kashi.decompose import DECOMPOSED_FROM_KEY, decompose_custom_ops
 from kashi.importer import import_fx
 from kashi.iree_partition import partition_at_custom_ops
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import make_fx
 
-aten = torch.ops.aten
+C = torch.ops._C
 EPS = 1e-6
+T, HEAD = 5, 16
 
 
-def _fake(graph, *inputs):
-    """Wrap ``graph`` in a module and record FakeTensor ``val`` metadata."""
-    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    with FakeTensorMode() as mode:
-        RecordExamples(gm, "val").run(*[mode.from_tensor(x) for x in inputs])
-    return gm
+def _trace(program, *inputs):
+    """Trace ``program`` into an ATen graph with FakeTensor ``val`` metadata."""
+    # The varargs wrapper stops make_fx from counting keyword-only parameters.
+    return make_fx(lambda *args: program(*args), tracing_mode="fake")(*inputs)
 
 
-def _decompose(gm):
+def _custom_ops(gm):
+    return [
+        n
+        for n in gm.graph.nodes
+        if isinstance(n.target, torch._ops.OpOverload) and n.target.namespace != "aten"
+    ]
+
+
+def _decompose(program, *inputs):
+    """Trace and decompose ``program``; a leftover ``_C`` op would run on CPU."""
+    gm = _trace(program, *inputs)
     decompose_custom_ops(gm.graph)
     gm.recompile()
+    assert not _custom_ops(gm)
     return gm
 
 
-def _is_c_op(node):
-    return node.op == "call_function" and str(node.target).startswith("_C.")
+# --- Programs shared by the CPU, wiring and CUDA parity tests. ---------------
 
 
-def _empty(graph, shape, dtype=torch.float32, device="cpu"):
-    return graph.call_function(
-        aten.empty.memory_format,
-        (shape,),
-        {"dtype": dtype, "device": torch.device(device)},
+def _rms_norm(x, w):
+    out = torch.empty_like(x)
+    C.rms_norm(out, x, w, EPS)
+    return out
+
+
+def _fused_add_rms_norm(x, res, w):
+    x, res = x.clone(), res.clone()
+    C.fused_add_rms_norm(x, res, w, EPS)
+    return x, res
+
+
+def _silu_and_mul(x):
+    out = x.new_empty(x.shape[0], x.shape[1] // 2)
+    C.silu_and_mul(out, x)
+    return out
+
+
+def _rope(
+    pos, q, k, cache, *, key=True, is_neox=True, rope_dim_offset=0, inverse=False
+):
+    q, k = q.clone(), (k.clone() if key else None)
+    C.rotary_embedding(pos, q, k, HEAD, cache, is_neox, rope_dim_offset, inverse)
+    return (q, k) if key else q
+
+
+def _two_norms_then_silu(x, w):
+    return _silu_and_mul(_rms_norm(_rms_norm(x, w), w))
+
+
+def _rope_inputs(cache_width=HEAD):
+    positions = torch.tensor([0, 3, 1, 9, 4])
+    return (
+        positions,
+        torch.randn(T, 2 * HEAD),
+        torch.randn(T, HEAD),
+        torch.randn(10, cache_width),
     )
 
 
-def _ref_rms(x, w, eps):
+# --- Independent references (vLLM's CUDA kernels cannot run on CPU). ---------
+
+
+def _ref_rms(x, w):
     x32 = x.float()
-    out = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-    out = out.to(x.dtype)
+    out = (x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + EPS)).to(x.dtype)
     return out if w is None else out * w
 
 
-def _tol(dtype):
-    return {"rtol": 2e-2, "atol": 2e-2} if dtype == torch.bfloat16 else {}
+def _ref_silu_and_mul(x):
+    half = x.shape[-1] // 2
+    return torch.nn.functional.silu(x[:, :half]) * x[:, half:]
 
 
-# --- _C.rms_norm and the shared rewriting machinery. ------------------------
+def _ref_rope(positions, x, cache):
+    cos, sin = (part.unsqueeze(-2) for part in cache[positions].chunk(2, -1))
+    x1, x2 = x.view(x.shape[0], -1, HEAD).chunk(2, -1)
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1).view(x.shape)
+
+
+# --- Numerics of each rule. ---------------------------------------------------
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("with_weight", [True, False])
-def test_rms_norm_result_reaches_later_reads(dtype, with_weight):
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    w = graph.placeholder("w")
-    out = _empty(graph, [3, 8], dtype)
-    graph.call_function(
-        torch.ops._C.rms_norm.default, (out, x, w if with_weight else None, EPS)
-    )
-    graph.output(graph.call_function(aten.neg.default, (out,)))
-    x_val, w_val = torch.randn(3, 8, dtype=dtype), torch.randn(8, dtype=dtype)
-    gm = _decompose(_fake(graph, x_val, w_val))
+def test_rms_norm(dtype, with_weight):
+    """Later reads see the normalized values in the input dtype, weight optional."""
+    x, w = torch.randn(3, 8, dtype=dtype), torch.randn(8, dtype=dtype)
+    gm = _decompose(lambda x, w: _rms_norm(x, w if with_weight else None), x, w)
 
-    assert not [n for n in gm.graph.nodes if _is_c_op(n)]
-    result = gm(x_val, w_val)
+    result = gm(x, w)
     assert result.dtype == dtype
-    expected = -_ref_rms(x_val, w_val if with_weight else None, EPS)
-    torch.testing.assert_close(result, expected, **_tol(dtype))
+    tol = {"rtol": 2e-2, "atol": 2e-2} if dtype == torch.bfloat16 else {}
+    torch.testing.assert_close(result, _ref_rms(x, w if with_weight else None), **tol)
+
+
+def test_fused_add_rms_norm_updates_both_buffers_in_order():
+    """Both buffers are updated for later reads; earlier reads keep old values."""
+
+    def program(x, y, res, w):
+        i, r = x.clone(), res.clone()
+        before = i * 2
+        C.fused_add_rms_norm(i, r, w, EPS)
+        i2 = y + i
+        C.fused_add_rms_norm(i2, r, w, EPS)
+        return before, i2, r
+
+    inputs = x, y, res, w = (
+        torch.randn(3, 8),
+        torch.randn(3, 8),
+        torch.randn(3, 8),
+        torch.randn(8),
+    )
+    before, i2, r = _decompose(program, *inputs)(*inputs)
+
+    r1 = x + res
+    r2 = y + _ref_rms(r1, w) + r1
+    torch.testing.assert_close(before, 2 * x)
+    torch.testing.assert_close(r, r2)
+    torch.testing.assert_close(i2, _ref_rms(r2, w))
+
+
+def test_silu_and_mul():
+    """Output is silu(first half) * second half."""
+    x = torch.randn(3, 8)
+    torch.testing.assert_close(_decompose(_silu_and_mul, x)(x), _ref_silu_and_mul(x))
+
+
+def test_rotary_embedding_neox():
+    """Query and key are both rotated by the cached cos/sin at ``positions``."""
+    inputs = pos, q, k, cache = _rope_inputs()
+    q_out, k_out = _decompose(_rope, *inputs)(*inputs)
+
+    torch.testing.assert_close(q_out, _ref_rope(pos, q, cache))
+    torch.testing.assert_close(k_out, _ref_rope(pos, k, cache))
+
+
+def test_rotary_views_keep_token_dim_symbolic():
+    """Reshapes use -1 for tokens so the traced token count isn't baked in."""
+    gm = _decompose(_rope, *_rope_inputs())
+
+    views = [n for n in gm.graph.nodes if n.target is torch.ops.aten.view.default]
+    assert views and all(n.args[1][0] == -1 for n in views)
+
+
+def test_rms_norm_then_rotary_through_views():
+    """Qwen3 q-norm: mutations through views reach reads through later views."""
+
+    def program(pos, q, k, cache, w):
+        per_head = q.view(-1, 2, HEAD)
+        normed = torch.empty_like(per_head)
+        C.rms_norm(normed, per_head, w, EPS)
+        flat = normed.view(-1, 2 * HEAD)
+        C.rotary_embedding(pos, flat, k.clone(), HEAD, cache, True)
+        return flat.view(-1, 2, HEAD)
+
+    inputs = pos, q, _, cache, w = (*_rope_inputs(), torch.randn(HEAD))
+    result = _decompose(program, *inputs)(*inputs)
+
+    normed = _ref_rms(q.view(T, 2, HEAD), w).view(T, 2 * HEAD)
+    torch.testing.assert_close(result, _ref_rope(pos, normed, cache).view(T, 2, HEAD))
+
+
+@pytest.mark.parametrize(
+    "variant, cache_width",
+    [
+        ({"is_neox": False}, HEAD),
+        ({"rope_dim_offset": 1}, HEAD),
+        ({"inverse": True}, HEAD),
+        ({"key": False}, HEAD),
+        ({}, HEAD // 2),  # partial rotary
+    ],
+    ids=["not_neox", "rope_dim_offset", "inverse", "no_key", "partial_rotary"],
+)
+def test_unsupported_rotary_variants_raise(variant, cache_width):
+    """Variants other than full-head NeoX with a key raise."""
+    gm = _trace(lambda *args: _rope(*args, **variant), *_rope_inputs(cache_width))
+
+    with pytest.raises(NotImplementedError, match="rotary_embedding"):
+        decompose_custom_ops(gm.graph)
+
+
+# --- Writes the rewrite cannot express. --------------------------------------
+
+
+def _writes_graph_input(out, x):
+    C.rms_norm(out, x, None, EPS)
+    return out
+
+
+def _writes_slice_of_graph_input(buf, x):
+    C.rms_norm(buf[:3], x, None, EPS)
+    return buf
+
+
+def _reads_view_base_after_write(x):
+    base = torch.empty_like(x).unsqueeze(0)
+    C.rms_norm(base.squeeze(0), x, None, EPS)
+    return -base
+
+
+def _reads_split_base_after_write(x, w):
+    qkv = x.clone()
+    q, _ = qkv.split([8, 8], -1)
+    C.rms_norm(q, q, w, EPS)
+    return -qkv
+
+
+@pytest.mark.parametrize(
+    "program, inputs, match",
+    [
+        (_writes_graph_input, (torch.empty(3, 8), torch.randn(3, 8)), "graph input"),
+        (
+            _writes_slice_of_graph_input,
+            (torch.empty(5, 8), torch.randn(3, 8)),
+            "graph input",
+        ),
+        (_reads_view_base_after_write, (torch.randn(3, 8),), "alias"),
+        (_reads_split_base_after_write, (torch.randn(3, 16), torch.randn(8)), "alias"),
+    ],
+    ids=["graph_input", "slice_of_graph_input", "view_base", "split_base"],
+)
+def test_unrepresentable_writes_raise(program, inputs, match):
+    """Writes visible to the caller or through another alias raise."""
+    gm = _trace(program, *inputs)
+
+    with pytest.raises(NotImplementedError, match=match):
+        decompose_custom_ops(gm.graph)
+
+
+# --- Tagging and graph hygiene. -----------------------------------------------
 
 
 def test_each_call_gets_its_own_tag():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    w = graph.placeholder("w")
-    first, second = _empty(graph, [3, 8]), _empty(graph, [3, 8])
-    graph.call_function(torch.ops._C.rms_norm.default, (first, x, w, EPS))
-    graph.call_function(torch.ops._C.rms_norm.default, (second, first, w, EPS))
-    graph.output((second,))
-    gm = _fake(graph, torch.randn(3, 8), torch.randn(8))
-    untouched = [n for n in gm.graph.nodes if not _is_c_op(n)]
-    _decompose(gm)
+    """Each call's nodes get a unique ``<op>#<n>`` tag; existing nodes don't."""
+    gm = _trace(_two_norms_then_silu, torch.randn(3, 8), torch.randn(8))
+    untouched = [n for n in gm.graph.nodes if n not in _custom_ops(gm)]
+    decompose_custom_ops(gm.graph)
 
     tags = {n.meta.get(DECOMPOSED_FROM_KEY) for n in gm.graph.nodes} - {None}
-    assert tags == {"_C.rms_norm#0", "_C.rms_norm#1"}
+    assert tags == {"_C.rms_norm#0", "_C.rms_norm#1", "_C.silu_and_mul#0"}
     assert all(DECOMPOSED_FROM_KEY not in n.meta for n in untouched)
 
 
-def test_mutating_a_graph_input_raises():
-    graph = torch.fx.Graph()
-    out = graph.placeholder("out")
-    x = graph.placeholder("x")
-    graph.call_function(torch.ops._C.rms_norm.default, (out, x, None, EPS))
-    graph.output((out,))
-    gm = _fake(graph, torch.empty(3, 8), torch.randn(3, 8))
-
-    with pytest.raises(NotImplementedError, match="graph input"):
-        decompose_custom_ops(gm.graph)
-
-
-def test_reading_base_of_mutated_view_after_call_raises():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    out = _empty(graph, [3, 8])
-    view = graph.call_function(aten.view.default, (out, [3, 8]))
-    graph.call_function(torch.ops._C.rms_norm.default, (view, x, None, EPS))
-    graph.output((graph.call_function(aten.neg.default, (out,)),))
-    gm = _fake(graph, torch.randn(3, 8))
-
-    with pytest.raises(NotImplementedError, match="alias"):
-        decompose_custom_ops(gm.graph)
-
-
-def test_mutating_a_slice_of_a_graph_input_raises():
-    graph = torch.fx.Graph()
-    buf, x = graph.placeholder("buf"), graph.placeholder("x")
-    out = graph.call_function(aten.slice.Tensor, (buf, 0, 0, 3))
-    graph.call_function(torch.ops._C.rms_norm.default, (out, x, None, EPS))
-    graph.output((out,))
-    gm = _fake(graph, torch.empty(5, 8), torch.randn(3, 8))
-
-    with pytest.raises(NotImplementedError, match="graph input"):
-        decompose_custom_ops(gm.graph)
-
-
-def test_reading_through_unsqueeze_alias_after_call_raises():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    u = graph.call_function(aten.unsqueeze.default, (_empty(graph, [3, 8]), 0))
-    out = graph.call_function(aten.squeeze.dim, (u, 0))
-    graph.call_function(torch.ops._C.rms_norm.default, (out, x, None, EPS))
-    graph.output((graph.call_function(aten.neg.default, (u,)),))
-    gm = _fake(graph, torch.randn(3, 8))
-
-    with pytest.raises(NotImplementedError, match="alias"):
-        decompose_custom_ops(gm.graph)
-
-
-def test_reading_split_base_after_call_raises():
-    graph = torch.fx.Graph()
-    x, w = graph.placeholder("x"), graph.placeholder("w")
-    qkv = graph.call_function(aten.clone.default, (x,))
-    parts = graph.call_function(aten.split_with_sizes.default, (qkv, [8, 8], -1))
-    q = graph.call_function(operator.getitem, (parts, 0))
-    graph.call_function(torch.ops._C.rms_norm.default, (q, q, w, EPS))
-    graph.output((graph.call_function(aten.neg.default, (qkv,)),))
-    gm = _fake(graph, torch.randn(3, 16), torch.randn(8))
-
-    with pytest.raises(NotImplementedError, match="alias"):
-        decompose_custom_ops(gm.graph)
-
-
 def test_uses_the_graph_fake_mode_inside_a_dynamo_backend():
-    """A Dynamo backend runs under a TracingContext whose fake mode is not the
-    one that produced the graph's example values."""
+    """Uses the graph's fake mode, not the Dynamo TracingContext's."""
     from torch._guards import TracingContext, tracing
 
-    graph = torch.fx.Graph()
-    x, w = graph.placeholder("x"), graph.placeholder("w")
-    out = _empty(graph, [3, 8])
-    graph.call_function(torch.ops._C.rms_norm.default, (out, x, w, EPS))
-    graph.output((out,))
-    gm = _fake(graph, torch.randn(3, 8), torch.randn(8))
+    gm = _trace(_rms_norm, torch.randn(3, 8), torch.randn(8))
 
     with tracing(TracingContext(FakeTensorMode())):
         decompose_custom_ops(gm.graph)
 
-    assert not [n for n in gm.graph.nodes if _is_c_op(n)]
+    assert not _custom_ops(gm)
 
 
 def test_graph_without_custom_ops_is_unchanged():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    graph.output((graph.call_function(aten.neg.default, (x,)),))
-    gm = _fake(graph, torch.randn(3))
+    """Graphs without custom ops are left untouched."""
+    gm = _trace(torch.neg, torch.randn(3))
     before = str(gm.graph)
 
     decompose_custom_ops(gm.graph)
@@ -190,213 +291,40 @@ def test_graph_without_custom_ops_is_unchanged():
     assert str(gm.graph) == before
 
 
-# --- _C.fused_add_rms_norm and _C.silu_and_mul. -----------------------------
+# --- Wiring: import_fx, MLIR locations, partitioning and compile_iree_fx. ----
 
 
-def test_fused_add_rms_norm_updates_input_and_residual():
-    graph = torch.fx.Graph()
-    x, res, w = (graph.placeholder(n) for n in ("x", "res", "w"))
-    i = graph.call_function(aten.clone.default, (x,))
-    r = graph.call_function(aten.clone.default, (res,))
-    pre = graph.call_function(aten.mul.Tensor, (i, 2.0))
-    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i, r, w, EPS))
-    graph.output((pre, i, r))
-    inputs = torch.randn(3, 8), torch.randn(3, 8), torch.randn(8)
-    x_val, res_val, w_val = inputs
-    gm = _decompose(_fake(graph, *inputs))
-
-    pre_out, i_out, r_out = gm(*inputs)
-    torch.testing.assert_close(pre_out, 2 * x_val)
-    torch.testing.assert_close(r_out, x_val + res_val)
-    torch.testing.assert_close(i_out, _ref_rms(x_val + res_val, w_val, EPS))
+def _import(decompose):
+    gm = _trace(_two_norms_then_silu, torch.randn(3, 8), torch.randn(8))
+    return import_fx(gm, decompose_custom_ops=decompose).module
 
 
-def test_chained_fused_add_rms_norm_threads_the_residual():
-    graph = torch.fx.Graph()
-    x, y, res, w = (graph.placeholder(n) for n in ("x", "y", "res", "w"))
-    i1 = graph.call_function(aten.clone.default, (x,))
-    r = graph.call_function(aten.clone.default, (res,))
-    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i1, r, w, EPS))
-    i2 = graph.call_function(aten.add.Tensor, (y, i1))
-    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i2, r, w, EPS))
-    graph.output((i2, r))
-    inputs = torch.randn(3, 8), torch.randn(3, 8), torch.randn(3, 8), torch.randn(8)
-    x_val, y_val, res_val, w_val = inputs
-    gm = _decompose(_fake(graph, *inputs))
+def test_import_turns_tags_into_name_locations():
+    """import_fx decomposes all custom ops and turns tags into NameLocs."""
+    module = _import(decompose=True)
 
-    r1 = x_val + res_val
-    r2 = (y_val + _ref_rms(r1, w_val, EPS)) + r1
-    i2_out, r_out = gm(*inputs)
-    torch.testing.assert_close(r_out, r2)
-    torch.testing.assert_close(i2_out, _ref_rms(r2, w_val, EPS))
-
-
-def test_silu_and_mul_writes_result():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    out = _empty(graph, [3, 4])
-    graph.call_function(torch.ops._C.silu_and_mul.default, (out, x))
-    graph.output((out,))
-    x_val = torch.randn(3, 8)
-    gm = _decompose(_fake(graph, x_val))
-
-    (result,) = gm(x_val)
-    expected = torch.nn.functional.silu(x_val[:, :4]) * x_val[:, 4:]
-    torch.testing.assert_close(result, expected)
-
-
-# --- _C.rotary_embedding (NeoX style only). ---------------------------------
-
-T, HEAD = 5, 16
-
-
-def _ref_rope(positions, x, head_size, cache):
-    cos, sin = (part.unsqueeze(-2) for part in cache[positions].chunk(2, -1))
-    x1, x2 = x.view(x.shape[0], -1, head_size).chunk(2, -1)
-    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), -1)
-    return rotated.view(x.shape)
-
-
-def _rope_inputs(cache_width=HEAD):
-    return (
-        torch.tensor([0, 3, 1, 9, 4]),
-        torch.randn(T, 2 * HEAD),
-        torch.randn(T, HEAD),
-        torch.randn(10, cache_width),
-    )
-
-
-def _rope_graph(*, key=True, is_neox=True, extra=()):
-    graph = torch.fx.Graph()
-    pos, qin, kin, cache = (graph.placeholder(n) for n in ("pos", "q", "k", "cache"))
-    q = graph.call_function(aten.clone.default, (qin,))
-    k = graph.call_function(aten.clone.default, (kin,)) if key else None
-    graph.call_function(
-        torch.ops._C.rotary_embedding.default,
-        (pos, q, k, HEAD, cache, is_neox, *extra),
-    )
-    graph.output((q, k) if key else (q,))
-    return graph
-
-
-def test_rotary_embedding_neox_matches_reference():
-    inputs = _rope_inputs()
-    pos, qin, kin, cache = inputs
-    gm = _decompose(_fake(_rope_graph(), *inputs))
-
-    q, k = gm(*inputs)
-    torch.testing.assert_close(q, _ref_rope(pos, qin, HEAD, cache))
-    torch.testing.assert_close(k, _ref_rope(pos, kin, HEAD, cache))
-
-
-def test_rotary_views_keep_token_dim_symbolic():
-    gm = _decompose(_fake(_rope_graph(), *_rope_inputs()))
-
-    views = [
-        n
-        for n in gm.graph.nodes
-        if n.target is aten.view.default and DECOMPOSED_FROM_KEY in n.meta
-    ]
-    assert views and all(n.args[1][0] == -1 for n in views)
-
-
-def test_qwen_rms_norm_then_rotary_chain():
-    graph = torch.fx.Graph()
-    pos, qin, kin, cache, w = (
-        graph.placeholder(n) for n in ("pos", "q", "k", "cache", "w")
-    )
-    qv = graph.call_function(aten.view.default, (qin, [T, 2, HEAD]))
-    out = _empty(graph, [T, 2, HEAD])
-    graph.call_function(torch.ops._C.rms_norm.default, (out, qv, w, EPS))
-    q1 = graph.call_function(aten.view.default, (out, [T, 2 * HEAD]))
-    k = graph.call_function(aten.clone.default, (kin,))
-    graph.call_function(
-        torch.ops._C.rotary_embedding.default, (pos, q1, k, HEAD, cache, True)
-    )
-    graph.output((graph.call_function(aten.view.default, (q1, [-1, 2, HEAD])),))
-    inputs = (*_rope_inputs(), torch.randn(HEAD))
-    pos_val, q_val, _, cache_val, w_val = inputs
-    gm = _decompose(_fake(graph, *inputs))
-
-    (query,) = gm(*inputs)
-    normed = _ref_rms(q_val.view(T, 2, HEAD), w_val, EPS).view(T, 2 * HEAD)
-    expected = _ref_rope(pos_val, normed, HEAD, cache_val).view(-1, 2, HEAD)
-    torch.testing.assert_close(query, expected)
-
-
-@pytest.mark.parametrize(
-    "variant",
-    ["not_neox", "rope_dim_offset", "inverse", "no_key", "partial_rotary"],
-)
-def test_unsupported_rotary_variants_raise(variant):
-    graph = _rope_graph(
-        key=variant != "no_key",
-        is_neox=variant != "not_neox",
-        extra={"rope_dim_offset": (1, False), "inverse": (0, True)}.get(variant, ()),
-    )
-    width = HEAD // 2 if variant == "partial_rotary" else HEAD
-    gm = _fake(graph, *_rope_inputs(width))
-
-    with pytest.raises(NotImplementedError, match="rotary_embedding"):
-        decompose_custom_ops(gm.graph)
-
-
-# --- Wiring: import_fx, MLIR locations, partitioning and compile_iree_fx. ---
-
-
-def _qwen_like_graph():
-    graph = torch.fx.Graph()
-    x, w = graph.placeholder("x"), graph.placeholder("w")
-    first, second = _empty(graph, [3, 8]), _empty(graph, [3, 8])
-    graph.call_function(torch.ops._C.rms_norm.default, (first, x, w, EPS))
-    graph.call_function(torch.ops._C.rms_norm.default, (second, first, w, EPS))
-    out = _empty(graph, [3, 4])
-    graph.call_function(torch.ops._C.silu_and_mul.default, (out, second))
-    graph.output((out,))
-    return _fake(graph, torch.randn(3, 8), torch.randn(8))
-
-
-def _main_operations(module):
-    (main,) = module.body.operations
-    return [op.operation for op in main.regions[0].blocks[0].operations]
-
-
-def test_import_tags_decomposed_ops_with_name_locations():
-    imported = import_fx(_qwen_like_graph(), decompose_custom_ops=True)
-
-    assert imported.module.operation.verify()
-    assert "torch.operator" not in str(imported.module)
-    locations = [
-        str(op.location)
-        for op in _main_operations(imported.module)
-        if op.name == "torch.aten.rms_norm"
-    ]
-    assert len(locations) == 2
-    assert {loc.split('"')[1] for loc in locations} == {
-        "kashi.decomposed:_C.rms_norm#0",
-        "kashi.decomposed:_C.rms_norm#1",
-    }
-    asm = imported.module.operation.get_asm(enable_debug_info=True)
-    assert '"kashi.decomposed:_C.silu_and_mul#0"' in asm
+    assert module.operation.verify()
+    asm = module.operation.get_asm(enable_debug_info=True)
+    assert "torch.operator" not in asm
+    for tag in ("_C.rms_norm#0", "_C.rms_norm#1", "_C.silu_and_mul#0"):
+        assert f'"kashi.decomposed:{tag}"' in asm
 
 
 def test_import_without_flag_keeps_custom_ops():
-    imported = import_fx(_qwen_like_graph())
+    """Decomposition is opt-in."""
+    asm = _import(decompose=False).operation.get_asm(enable_debug_info=True)
 
-    asm = imported.module.operation.get_asm(enable_debug_info=True)
     assert 'torch.operator "torch._C.rms_norm"' in asm
     assert "kashi.decomposed" not in asm
 
 
 def test_decomposed_graph_is_a_single_iree_segment():
-    imported = import_fx(_qwen_like_graph(), decompose_custom_ops=True)
-
-    partition = partition_at_custom_ops(imported.module)
-
-    assert len(partition.segments) == 1  # one segment per custom op, plus one
+    """With no custom ops left, IREE gets one segment."""
+    assert len(partition_at_custom_ops(_import(decompose=True)).segments) == 1
 
 
 def test_compile_iree_fx_forwards_the_flag(monkeypatch, tmp_path):
+    """compile_iree_fx passes ``decompose_custom_ops`` to import_fx."""
     import kashi.iree_backend
 
     seen = {}
@@ -406,78 +334,55 @@ def test_compile_iree_fx_forwards_the_flag(monkeypatch, tmp_path):
         raise RuntimeError("stop after import")
 
     monkeypatch.setattr(kashi.iree_backend, "import_fx", record)
+    gm = _trace(_rms_norm, torch.randn(3, 8), torch.randn(8))
     with pytest.raises(RuntimeError, match="stop after import"):
         kashi.iree_backend.compile_iree_fx(
-            _qwen_like_graph(), output_dir=tmp_path, decompose_custom_ops=True
+            gm, output_dir=tmp_path, decompose_custom_ops=True
         )
     assert seen == {"decompose_custom_ops": True}
 
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="IREE CUDA compilation")
 def test_partitioned_artifact_keeps_tags(tmp_path):
+    """Tags survive the IREE pipeline into ``partitioned.mlir``."""
     from kashi.iree_backend import compile_iree_fx
 
+    gm = _trace(_two_norms_then_silu, torch.randn(3, 8), torch.randn(8))
     result = compile_iree_fx(
-        _qwen_like_graph(),
-        output_dir=tmp_path,
-        cuda_target="sm_80",
-        decompose_custom_ops=True,
+        gm, output_dir=tmp_path, cuda_target="sm_80", decompose_custom_ops=True
     )
 
     partitioned = (result.artifact_dir / "partitioned.mlir").read_text()
     assert "kashi.decomposed:_C.rms_norm#0" in partitioned
 
 
-# --- Parity with vLLM's real kernels (CUDA only). ---------------------------
-
-
-def _cuda_case(name):
-    """Build ``name``'s graph with CUDA buffers and matching CUDA inputs."""
-    graph = torch.fx.Graph()
-    if name == "rotary_embedding":
-        return _rope_graph(), [t.cuda() for t in _rope_inputs()]
-    if name == "silu_and_mul":
-        x = graph.placeholder("x")
-        out = _empty(graph, [3, 4], device="cuda")
-        graph.call_function(torch.ops._C.silu_and_mul.default, (out, x))
-        graph.output((out,))
-        return graph, [torch.randn(3, 8, device="cuda")]
-    x, w = graph.placeholder("x"), graph.placeholder("w")
-    if name == "rms_norm":
-        out = _empty(graph, [3, 8], device="cuda")
-        graph.call_function(torch.ops._C.rms_norm.default, (out, x, w, EPS))
-        graph.output((out,))
-        return graph, [torch.randn(3, 8, device="cuda"), torch.randn(8, device="cuda")]
-    res = graph.placeholder("res")
-    i = graph.call_function(aten.clone.default, (x,))
-    r = graph.call_function(aten.clone.default, (res,))
-    graph.call_function(torch.ops._C.fused_add_rms_norm.default, (i, r, w, EPS))
-    graph.output((i, r))
-    return graph, [
-        torch.randn(3, 8, device="cuda"),
-        torch.randn(8, device="cuda"),
-        torch.randn(3, 8, device="cuda"),
-    ]
+# --- Parity with vLLM's real kernels (CUDA only). -----------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM _C kernels need CUDA")
 @pytest.mark.parametrize(
-    "case", ["rms_norm", "fused_add_rms_norm", "silu_and_mul", "rotary_embedding"]
+    "program, inputs",
+    [
+        (_rms_norm, lambda: (torch.randn(3, 8), torch.randn(8))),
+        (
+            _fused_add_rms_norm,
+            lambda: (torch.randn(3, 8), torch.randn(3, 8), torch.randn(8)),
+        ),
+        (_silu_and_mul, lambda: (torch.randn(3, 8),)),
+        (_rope, _rope_inputs),
+    ],
+    ids=["rms_norm", "fused_add_rms_norm", "silu_and_mul", "rotary_embedding"],
 )
-def test_decomposition_matches_vllm_kernel_on_cuda(case):
-    graph, inputs = _cuda_case(case)
-    kernel = torch.fx.GraphModule(torch.nn.Module(), graph)
-    decomposed = _decompose(_fake(_cuda_case(case)[0], *inputs))
+def test_decomposition_matches_vllm_kernel_on_cuda(program, inputs):
+    """Decomposition matches vLLM's real kernel."""
+    inputs = [t.cuda() for t in inputs()]
 
-    kernel_out = kernel(*[t.clone() for t in inputs])
-    decomposed_out = decomposed(*[t.clone() for t in inputs])
-
-    assert len(kernel_out) == len(decomposed_out)
-    for got, want in zip(decomposed_out, kernel_out, strict=True):
-        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        _decompose(program, *inputs)(*inputs), program(*inputs), rtol=1e-4, atol=1e-4
+    )
 
 
-# --- Schema argument names differ between vLLM builds. ----------------------
+# --- Schema argument names differ between vLLM builds. ------------------------
 
 # vLLM's CPU build names the output buffer "out" where the CUDA build says
 # "result"; positions are the same. These copies use the CPU wheel's schemas.
@@ -492,27 +397,19 @@ for _schema in (
 
 @pytest.mark.parametrize("op", ["rms_norm", "silu_and_mul"])
 def test_rules_do_not_depend_on_schema_argument_names(op, monkeypatch):
+    """Rules bind by position, so CPU (``out``) and CUDA (``result``) builds work."""
     import kashi.decompose
 
     rules = dict(kashi.decompose._DECOMPOSITIONS)
     rules[f"kashi_cpu_schema::{op}"] = rules[f"_C::{op}"]
     monkeypatch.setattr(kashi.decompose, "_DECOMPOSITIONS", rules)
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    target = getattr(torch.ops.kashi_cpu_schema, op).default
-    if op == "rms_norm":
-        out = _empty(graph, [3, 8])
-        graph.call_function(target, (out, x, None, EPS))
-    else:
-        out = _empty(graph, [3, 4])
-        graph.call_function(target, (out, x))
-    graph.output((out,))
-    x_val = torch.randn(3, 8)
-    gm = _decompose(_fake(graph, x_val))
+    monkeypatch.setitem(globals(), "C", torch.ops.kashi_cpu_schema)
+    x = torch.randn(3, 8)
 
-    (result,) = gm(x_val)
     if op == "rms_norm":
-        expected = _ref_rms(x_val, None, EPS)
+        gm = _decompose(lambda x: _rms_norm(x, None), x)
+        torch.testing.assert_close(gm(x), _ref_rms(x, None))
     else:
-        expected = torch.nn.functional.silu(x_val[:, :4]) * x_val[:, 4:]
-    torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(
+            _decompose(_silu_and_mul, x)(x), _ref_silu_and_mul(x)
+        )

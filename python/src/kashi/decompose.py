@@ -76,12 +76,16 @@ _Rule = Callable[[_Emitter, list], dict[torch.fx.Node, torch.fx.Node]]
 
 
 def _rms_norm(emit: _Emitter, args: list) -> dict:
+    """_C.rms_norm(result, x, weight, eps) replaced with aten rms_norm."""
     result, x, weight, epsilon = args
     normalized = [x.meta["val"].shape[-1]]
     return {result: emit(aten.rms_norm.default, x, normalized, weight, epsilon)}
 
 
 def _fused_add_rms_norm(emit: _Emitter, args: list) -> dict:
+    """_C.fused_add_rms_norm(x, residual, weight, eps) replaced with
+    residual = x + residual, then residual = rms_norm(residual, weight, eps).
+    """
     x, residual, weight, epsilon = args
     summed = emit(aten.add.Tensor, x, residual)
     normalized = [x.meta["val"].shape[-1]]
@@ -92,6 +96,7 @@ def _fused_add_rms_norm(emit: _Emitter, args: list) -> dict:
 
 
 def _silu_and_mul(emit: _Emitter, args: list) -> dict:
+    """_C.silu_and_mul(result, x) replaced with silu(x[..., :d]) * x[..., d:]."""
     result, x = args
     half = x.meta["val"].shape[-1] // 2
     gate = emit(aten.slice.Tensor, x, -1, 0, half)
@@ -100,7 +105,21 @@ def _silu_and_mul(emit: _Emitter, args: list) -> dict:
 
 
 def _rotary_embedding(emit: _Emitter, args: list) -> dict:
-    """NeoX-style rotation over the full head, the only variant Qwen3 uses."""
+    """_C.rotary_embedding(positions, query, key, head_size, cos_sin_cache, ...)
+    replaced with an explicit NeoX rotation of query and key, in place.
+
+    With h = head_size // 2, each row of cos_sin_cache is [cos | sin] (h each):
+
+        cos = cos_sin_cache[positions, :h]       # [tokens, 1, h]
+        sin = cos_sin_cache[positions, h:]       # [tokens, 1, h]
+
+    and each head of x (query or key, viewed as [tokens, heads, head_size]) is
+    split into its first and second halves, x1 = x[..., :h], x2 = x[..., h:]:
+
+        x = cat(x1 * cos - x2 * sin,  x2 * cos + x1 * sin)
+
+    Only full-head NeoX rotation with a key (what Qwen3 uses) is supported.
+    """
     positions, query, key, head_size, cache, is_neox, rope_dim_offset, inverse = args
     problems = [
         message
@@ -121,6 +140,8 @@ def _rotary_embedding(emit: _Emitter, args: list) -> dict:
             f"unsupported _C.rotary_embedding: {', '.join(problems)}"
         )
 
+    # cos, sin = cos_sin_cache[positions] split into [:h] and [h:], with a heads
+    # dimension added so they broadcast over every head.
     half = head_size // 2
     cos_sin = emit(aten.index.Tensor, cache, [positions])
     cos = emit(
@@ -136,9 +157,11 @@ def _rotary_embedding(emit: _Emitter, args: list) -> dict:
         # The token dimension stays -1 so a symbolic token count is never baked in.
         shape = list(x.meta["val"].shape[1:])
         heads = math.prod(shape) // head_size
+        # x as [tokens, heads, head_size], then x1 = x[..., :h], x2 = x[..., h:].
         heads_view = emit(aten.view.default, x, [-1, heads, head_size])
         x1 = emit(aten.slice.Tensor, heads_view, -1, 0, half)
         x2 = emit(aten.slice.Tensor, heads_view, -1, half, head_size)
+        # first = x1 * cos - x2 * sin, second = x2 * cos + x1 * sin.
         first = emit(
             aten.sub.Tensor,
             emit(aten.mul.Tensor, x1, cos),
@@ -149,6 +172,7 @@ def _rotary_embedding(emit: _Emitter, args: list) -> dict:
             emit(aten.mul.Tensor, x2, cos),
             emit(aten.mul.Tensor, x1, sin),
         )
+        # x = cat(first, second), back in x's original shape.
         rotated = emit(aten.cat.default, [first, second], -1)
         return emit(aten.view.default, rotated, [-1, *shape])
 
@@ -203,9 +227,8 @@ def _check_aliases(mutated, op, tag, position, op_position):
 def decompose_custom_ops(graph: torch.fx.Graph) -> None:
     """Rewrite supported vLLM custom ops in a normalized graph, in place.
 
-    The graph must already contain ATen ``OpOverload`` targets with
-    ``meta["val"]`` on every value node, as produced by the importer's
-    normalization.
+    The graph must already contain ATen ``OpOverload`` targets with ``meta["val"]`` on
+    every value node, as produced by the importer's normalization.
     """
     position = {node: i for i, node in enumerate(graph.nodes)}
     counts = Counter()
