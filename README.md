@@ -159,6 +159,15 @@ test command configures and builds its own tree on each run. Until genuine
 C++ tests are added, it reports `no native tests yet` rather than claiming
 that an empty suite passed.
 
+Linux CPU CI sets `TRITON_INTERPRET=1` for the Python coverage run because
+vLLM's Triton CPU sampler can fail with an illegal instruction on some CI
+processors. The vLLM Qwen3 parity test still runs, but this job does not test
+Triton's native CPU JIT. In a Linux CPU Pixi environment, reproduce that test:
+
+```sh
+TRITON_INTERPRET=1 pixi run --locked test-python python/tests/test_qwen3_integration.py
+```
+
 For native test selection, first run `pixi run test-cpp` to configure and
 build, then use `pixi run ctest --test-dir build/test-cpp -C Debug -R '<test-name>'
 --output-on-failure --no-tests=error`.
