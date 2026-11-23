@@ -13,10 +13,10 @@ NB_MODULE(_native, m) {
   m.def(
       "compile_iree",
       [](const std::string &assembly, std::filesystem::path artifactDir,
-         std::string target, std::optional<std::string> cudaTarget) {
-        return kashi::compileIree(
-            assembly,
-            {std::move(artifactDir), std::move(target), std::move(cudaTarget)});
+         const std::string &target, std::optional<std::string> cudaTarget) {
+        return kashi::compileIree(assembly, {std::move(artifactDir),
+                                             kashi::parseIreeBackend(target),
+                                             std::move(cudaTarget)});
       },
       "Compile Torch MLIR and return the original tensor device.",
       nb::arg("assembly"), nb::arg("artifact_dir"), nb::kw_only(),

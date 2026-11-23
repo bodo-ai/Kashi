@@ -66,6 +66,7 @@ target_link_libraries(kashi_core PRIVATE
   iree::hal::utils::executable_header
   iree::compiler::Dialect::VM::Target::Bytecode
   iree::schemas::cuda_executable_def_c_fbs
+  iree::schemas::executable_debug_info_c_fbs
   iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR)
 set(KASHI_IREE_INCLUDE_DIRS
   "${KASHI_IREE_SOURCE_DIR}/compiler/bindings/c"
@@ -137,7 +138,8 @@ if(KASHI_BUILD_TESTS)
       kashi_core Catch2::Catch2WithMain
       iree::compiler::Dialect::HAL::IR
       iree::compiler::Utils
-      iree::schemas::cuda_executable_def_c_fbs)
+      iree::schemas::cuda_executable_def_c_fbs
+      iree::schemas::executable_debug_info_c_fbs)
     if(IREE_TARGET_BACKEND_CUDA)
       target_compile_definitions(kashi_native_tests PRIVATE KASHI_TEST_CUDA_CODEGEN)
     endif()

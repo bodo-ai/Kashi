@@ -29,6 +29,7 @@
 
 namespace {
 namespace fs = std::filesystem;
+using kashi::IreeBackend;
 
 struct Artifacts {
   fs::path directory =
@@ -60,7 +61,7 @@ module {
 }
 )mlir";
 
-#ifdef KASHI_TEST_CUDA_CODEGEN
+#if defined(KASHI_TEST_CUDA_CODEGEN) || defined(__linux__)
 constexpr auto twoSegments = R"mlir(
 module {
   func.func @main(%x: !torch.vtensor<[1024],f32>) -> !torch.vtensor<[1024],f32> {
@@ -72,15 +73,58 @@ module {
 }
 )mlir";
 #endif
+
+mlir::OwningOpRef<mlir::ModuleOp> makeCudaExecutable(mlir::MLIRContext &context,
+                                                     std::string_view ptx,
+                                                     uint32_t ordinal) {
+  namespace HAL = mlir::iree_compiler::IREE::HAL;
+  using mlir::iree_compiler::FlatbufferBuilder;
+  context.loadDialect<HAL::HALDialect>();
+  mlir::OpBuilder builder(&context);
+  auto loc = builder.getUnknownLoc();
+  mlir::OwningOpRef<mlir::ModuleOp> module(mlir::ModuleOp::create(loc));
+  builder.setInsertionPointToStart(module->getBody());
+  auto executable = HAL::ExecutableOp::create(builder, loc, "linked");
+  builder.setInsertionPointToStart(&executable.getBlock());
+
+  FlatbufferBuilder fb;
+  REQUIRE(iree_hal_cuda_ExecutableDef_start_as_root(fb) == 0);
+  auto image = iree_hal_cuda_ModuleDef_create(fb, fb.createString(ptx));
+  auto kernel = fb.createString("kernel");
+  auto name = fb.createString("stable");
+  iree_hal_cuda_BlockDims_t dims{1, 1, 1};
+  // Omit optional offsets rather than passing null offsets to create().
+  REQUIRE(iree_hal_cuda_ExportDef_start(fb) == 0);
+  REQUIRE(iree_hal_cuda_ExportDef_module_ordinal_add(fb, ordinal) == 0);
+  REQUIRE(iree_hal_cuda_ExportDef_kernel_name_add(fb, kernel) == 0);
+  REQUIRE(iree_hal_cuda_ExportDef_block_dims_add(fb, &dims) == 0);
+  REQUIRE(iree_hal_cuda_ExportDef_export_name_add(fb, name) == 0);
+  auto entry = iree_hal_cuda_ExportDef_end(fb);
+  REQUIRE(image != 0);
+  REQUIRE(entry != 0);
+  auto modules = fb.createOffsetVec({image});
+  auto exports = fb.createOffsetVec({entry});
+  REQUIRE(iree_hal_cuda_ExecutableDef_modules_add(fb, modules) == 0);
+  REQUIRE(iree_hal_cuda_ExecutableDef_exports_add(fb, exports) == 0);
+  REQUIRE(iree_hal_cuda_ExecutableDef_end_as_root(fb) != 0);
+  HAL::ExecutableBinaryOp::create(
+      builder, loc, "cuda", builder.getStringAttr("cuda-nvptx-fb"),
+      fb.getHeaderPrefixedBufferAttr(
+          &context, iree_hal_cuda_ExecutableDef_file_identifier, 0));
+  return module;
+}
+
 } // namespace
 
 // Test that resuming at typed checkpoints is byte-for-byte transparent.
 TEST_CASE("Typed checkpoint probes preserve VMVX compilation output") {
   Artifacts split;
   Artifacts uninterrupted;
-  kashi::compileIreeForTesting(fixture, {split.directory, "vmvx", {}},
+  kashi::compileIreeForTesting(fixture,
+                               {split.directory, IreeBackend::VMVX, {}},
                                kashi::IreeTestPipeline::Checkpoints);
-  kashi::compileIreeForTesting(fixture, {uninterrupted.directory, "vmvx", {}},
+  kashi::compileIreeForTesting(fixture,
+                               {uninterrupted.directory, IreeBackend::VMVX, {}},
                                kashi::IreeTestPipeline::Uninterrupted);
   REQUIRE(split.read("module.vmfb") == uninterrupted.read("module.vmfb"));
   REQUIRE(split.read("flow.mlir").find("flow.dispatch") != std::string::npos);
@@ -90,10 +134,10 @@ TEST_CASE("Typed checkpoint probes preserve VMVX compilation output") {
 TEST_CASE("A Flow pass failure does not poison the next embedded invocation") {
   Artifacts failed;
   Artifacts healthy;
-  REQUIRE_THROWS_WITH(
-      kashi::compileIreeForTesting(fixture, {failed.directory, "vmvx", {}},
-                                   kashi::IreeTestPipeline::FailAtFlow),
-      Catch::Matchers::ContainsSubstring("pass at flow"));
+  REQUIRE_THROWS_WITH(kashi::compileIreeForTesting(
+                          fixture, {failed.directory, IreeBackend::VMVX, {}},
+                          kashi::IreeTestPipeline::FailAtFlow),
+                      Catch::Matchers::ContainsSubstring("pass at flow"));
   const auto log = failed.read("iree-compile.log");
   const auto message = log.find("Kashi Flow probe failure");
   REQUIRE(message != std::string::npos);
@@ -101,53 +145,27 @@ TEST_CASE("A Flow pass failure does not poison the next embedded invocation") {
   const auto lineStart =
       previousLine == std::string::npos ? 0 : previousLine + 1;
   REQUIRE(log.compare(lineStart, 7, "error: ") == 0);
-  REQUIRE_FALSE(fs::exists(failed.directory / "module.vmfb"));
-  kashi::compileIree(fixture, {healthy.directory, "vmvx", {}});
+  REQUIRE(!fs::exists(failed.directory / "module.vmfb"));
+  kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
   REQUIRE(healthy.read("module.vmfb").size() > 0);
 }
 
-// Exercise the exact image-count boundary using a serialized CUDA export.
-TEST_CASE("CUDA manifest validates serialized export module ordinals") {
-  namespace HAL = mlir::iree_compiler::IREE::HAL;
-  using mlir::iree_compiler::FlatbufferBuilder;
-
-  constexpr char ptx[] = ".visible .entry kernel() { ret; }\n";
-  for (uint32_t ordinal : {0u, 1u}) {
-    CAPTURE(ordinal);
+TEST_CASE("CUDA manifest resolves entries in the selected serialized image") {
+  constexpr auto entry = ".visible .entry/* split */\n kernel() { ret; }\n";
+  struct Scenario {
+    std::string_view ptx;
+    uint32_t ordinal;
+    bool resolves;
+  };
+  for (const auto &[ptx, ordinal, resolves] :
+       {Scenario{entry, 0, true}, Scenario{entry, 1, false},
+        Scenario{"/* .entry kernel() */\n.entry other() { ret; }\n", 0, false},
+        Scenario{".file 1 \"a .entry kernel() b\"\n", 0, false},
+        Scenario{".entrypoint kernel() { ret; }\n", 0, false}}) {
+    CAPTURE(ptx, ordinal);
     Artifacts artifacts;
     mlir::MLIRContext context;
-    context.loadDialect<HAL::HALDialect>();
-    mlir::OpBuilder builder(&context);
-    auto loc = builder.getUnknownLoc();
-    mlir::OwningOpRef<mlir::ModuleOp> module(mlir::ModuleOp::create(loc));
-    builder.setInsertionPointToStart(module->getBody());
-    auto executable = HAL::ExecutableOp::create(builder, loc, "linked");
-    builder.setInsertionPointToStart(&executable.getBlock());
-
-    FlatbufferBuilder fb;
-    REQUIRE(iree_hal_cuda_ExecutableDef_start_as_root(fb) == 0);
-    auto image = iree_hal_cuda_ModuleDef_create(fb, fb.createString(ptx));
-    auto kernel = fb.createString("kernel");
-    auto name = fb.createString("stable");
-    iree_hal_cuda_BlockDims_t dims{1, 1, 1};
-    // Omit optional offsets rather than passing null offsets to create().
-    REQUIRE(iree_hal_cuda_ExportDef_start(fb) == 0);
-    REQUIRE(iree_hal_cuda_ExportDef_module_ordinal_add(fb, ordinal) == 0);
-    REQUIRE(iree_hal_cuda_ExportDef_kernel_name_add(fb, kernel) == 0);
-    REQUIRE(iree_hal_cuda_ExportDef_block_dims_add(fb, &dims) == 0);
-    REQUIRE(iree_hal_cuda_ExportDef_export_name_add(fb, name) == 0);
-    auto entry = iree_hal_cuda_ExportDef_end(fb);
-    REQUIRE(image != 0);
-    REQUIRE(entry != 0);
-    auto modules = fb.createOffsetVec({image});
-    auto exports = fb.createOffsetVec({entry});
-    REQUIRE(iree_hal_cuda_ExecutableDef_modules_add(fb, modules) == 0);
-    REQUIRE(iree_hal_cuda_ExecutableDef_exports_add(fb, exports) == 0);
-    REQUIRE(iree_hal_cuda_ExecutableDef_end_as_root(fb) != 0);
-    HAL::ExecutableBinaryOp::create(
-        builder, loc, "cuda", builder.getStringAttr("cuda-nvptx-fb"),
-        fb.getHeaderPrefixedBufferAttr(
-            &context, iree_hal_cuda_ExecutableDef_file_identifier, 0));
+    auto module = makeCudaExecutable(context, ptx, ordinal);
 
     std::string diagnostic;
     mlir::ScopedDiagnosticHandler handler(
@@ -156,14 +174,14 @@ TEST_CASE("CUDA manifest validates serialized export module ordinals") {
         *module, artifacts.directory, {{"original", "exported", "stable"}});
     REQUIRE(artifacts.read("kernel_0.ptx") == ptx);
     auto manifest = artifacts.directory / "kernel_manifest.json";
-    if (ordinal == 0) {
+    if (resolves) {
       REQUIRE(mlir::succeeded(result));
       REQUIRE(diagnostic.empty());
       REQUIRE(fs::exists(manifest));
     } else {
       REQUIRE(mlir::failed(result));
       REQUIRE(diagnostic == "serialized CUDA export has no matching PTX entry");
-      REQUIRE_FALSE(fs::exists(manifest));
+      REQUIRE(!fs::exists(manifest));
     }
   }
 }
@@ -174,13 +192,13 @@ TEST_CASE("A forked child cannot use or shut down the parent compiler") {
   Artifacts warm;
   Artifacts child;
   Artifacts healthy;
-  kashi::compileIree(twoSegments, {warm.directory, "vmvx", {}});
+  kashi::compileIree(twoSegments, {warm.directory, IreeBackend::VMVX, {}});
   const pid_t pid = fork();
   REQUIRE(pid >= 0);
   if (pid == 0) {
     alarm(5);
     try {
-      kashi::compileIree(twoSegments, {child.directory, "vmvx", {}});
+      kashi::compileIree(twoSegments, {child.directory, IreeBackend::VMVX, {}});
     } catch (const std::runtime_error &error) {
       std::exit(std::string_view(error.what()).find("spawn or exec") ==
                 std::string_view::npos);
@@ -191,7 +209,7 @@ TEST_CASE("A forked child cannot use or shut down the parent compiler") {
   REQUIRE(waitpid(pid, &status, 0) == pid);
   REQUIRE(WIFEXITED(status));
   REQUIRE(WEXITSTATUS(status) == 0);
-  kashi::compileIree(fixture, {healthy.directory, "vmvx", {}});
+  kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
   REQUIRE(healthy.read("module.vmfb").size() > 0);
 }
 
@@ -204,12 +222,12 @@ TEST_CASE("Compiler artifact write errors are recoverable") {
     Artifacts broken;
     fs::create_symlink("/dev/full", broken.directory / file);
     REQUIRE_THROWS_WITH(
-        kashi::compileIree(fixture, {broken.directory, "vmvx", {}}),
+        kashi::compileIree(fixture, {broken.directory, IreeBackend::VMVX, {}}),
         Catch::Matchers::ContainsSubstring(stage));
     REQUIRE(broken.read("iree-compile.log").find(stage) != std::string::npos);
     REQUIRE(fs::exists(broken.directory / "driver.mlir"));
     Artifacts healthy;
-    kashi::compileIree(fixture, {healthy.directory, "vmvx", {}});
+    kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
     REQUIRE(healthy.read("module.vmfb").size() > 0);
   }
 }
@@ -219,7 +237,7 @@ TEST_CASE("Compiler artifact writes preserve the host signal handler") {
   struct sigaction before, after;
   REQUIRE(sigaction(SIGTERM, nullptr, &before) == 0);
   Artifacts artifacts;
-  kashi::compileIree(fixture, {artifacts.directory, "vmvx", {}});
+  kashi::compileIree(fixture, {artifacts.directory, IreeBackend::VMVX, {}});
   REQUIRE(sigaction(SIGTERM, nullptr, &after) == 0);
   REQUIRE(after.sa_flags == before.sa_flags);
   if (before.sa_flags & SA_SIGINFO)
@@ -233,7 +251,8 @@ TEST_CASE("Compiler errors identify an unwritable diagnostic log") {
   Artifacts artifacts;
   fs::create_symlink("/dev/full", artifacts.directory / "iree-compile.log");
   REQUIRE_THROWS_WITH(
-      kashi::compileIree("module { invalid", {artifacts.directory, "vmvx", {}}),
+      kashi::compileIree("module { invalid",
+                         {artifacts.directory, IreeBackend::VMVX, {}}),
       Catch::Matchers::ContainsSubstring(
           "parse failed; cannot write diagnostic log"));
 }
@@ -243,7 +262,8 @@ TEST_CASE("Compiler errors identify an unwritable diagnostic log") {
 // Colliding local names must link to distinct entries.
 TEST_CASE("CUDA checkpoints preserve colliding Flow export identities") {
   Artifacts split;
-  kashi::compileIreeForTesting(twoSegments, {split.directory, "cuda", "sm_80"},
+  kashi::compileIreeForTesting(twoSegments,
+                               {split.directory, IreeBackend::CUDA, "sm_80"},
                                kashi::IreeTestPipeline::Checkpoints);
   auto flow = split.read("flow.mlir");
   auto first = flow.find("func.func @shared_kernel");

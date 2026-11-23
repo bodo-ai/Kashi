@@ -3,6 +3,7 @@
 #include "kashi/iree_partition.h"
 
 #include <atomic>
+#include <cassert>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -15,31 +16,57 @@
 #include "iree/compiler/embedding_api.h"
 #include "iree/compiler/mlir_interop.h"
 #include "mlir/CAPI/IR.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace kashi {
 namespace {
 using namespace mlir;
+using llvm::StringLiteral;
 namespace fs = std::filesystem;
 
-template <typename T, void (*Destroy)(T *)>
-using Handle = std::unique_ptr<T, decltype(Destroy)>;
+template <auto Destroy> struct Deleter {
+  template <typename T> void operator()(T *handle) const { Destroy(handle); }
+};
 
-// Set before entering the static initializer: a fork can inherit its guard
-// while another thread holds it, as well as an initialized LLVM worker pool.
+template <typename T, void (*Destroy)(T *)>
+using Handle = std::unique_ptr<T, Deleter<Destroy>>;
+using Session = Handle<iree_compiler_session_t, ireeCompilerSessionDestroy>;
+using Source = Handle<iree_compiler_source_t, ireeCompilerSourceDestroy>;
+using InvocationHandle =
+    Handle<iree_compiler_invocation_t, ireeCompilerInvocationDestroy>;
+using CompilerError = Handle<iree_compiler_error_t, ireeCompilerErrorDestroy>;
+
+// Claim the process before touching the local static guard: a child could
+// otherwise block on a guard held by a parent thread during fork.
 static_assert(std::atomic<pid_t>::is_always_lock_free);
 std::atomic<pid_t> compilerOwner{0};
 
 struct CompilerRuntime {
-  /// Initialize the private compiler before any session is created.
   CompilerRuntime() { ireeCompilerGlobalInitialize(); }
-  /// Only the initializing process can safely join the compiler's workers.
   ~CompilerRuntime() {
+    // IREE's GlobalInit owns the LLVM pool shared by the MLIR sessions.
+    // Global shutdown destroys the pool and joins its threads; only the
+    // initializing process has those workers.
     if (compilerOwner.load(std::memory_order_relaxed) == getpid())
       ireeCompilerGlobalShutdown();
   }
 };
+
+void initializeCompiler() {
+  const pid_t pid = getpid();
+  pid_t owner = 0;
+  if (!compilerOwner.compare_exchange_strong(owner, pid,
+                                             std::memory_order_relaxed) &&
+      owner != pid)
+    throw std::runtime_error(
+        "cannot use an inherited IREE compiler after fork; use spawn or exec");
+  static const CompilerRuntime runtime;
+}
 
 struct Diagnostics {
   /// Open the log before any invocation can emit diagnostics.
@@ -52,7 +79,8 @@ struct Diagnostics {
   std::ofstream log;
   std::mutex mutex;
 
-  // Compiler worker threads may deliver diagnostics concurrently.
+  // The embedding API allows callbacks from any thread until invocation
+  // destruction. Serialize complete records and writes in fail() to the log.
   static void receive(iree_compiler_diagnostic_severity_t severity,
                       const char *text, size_t size, void *data) {
     auto &self = *static_cast<Diagnostics *>(data);
@@ -64,35 +92,164 @@ struct Diagnostics {
 
   /// Record a stage failure and throw without obscuring its exception category.
   template <typename Error = std::runtime_error>
-  [[noreturn]] void fail(const std::string &stage,
-                         const char *message = nullptr) {
+  [[noreturn]] void
+  fail(const llvm::Twine &stage,
+       std::optional<std::string_view> message = std::nullopt) {
+    const std::string failure = ("IREE " + stage + " failed").str();
     std::lock_guard lock(mutex);
-    log << "IREE " << stage << " failed";
+    log << failure;
     if (message)
-      log << ": " << message;
+      log << ": " << *message;
     log << '\n' << std::flush;
-    throw Error("IREE " + stage + " failed; " +
+    throw Error(failure + "; " +
                 (log ? "see " : "cannot write diagnostic log ") +
                 path.string());
   }
 
   /// Consume an embedding API error and translate it into a stage failure.
-  void check(iree_compiler_error_t *error, const std::string &stage) {
-    Handle<iree_compiler_error_t, ireeCompilerErrorDestroy> scoped(
-        error, ireeCompilerErrorDestroy);
+  void check(CompilerError error, const llvm::Twine &stage) {
     if (error)
-      fail(stage, ireeCompilerErrorGetMessage(error));
+      fail(stage, ireeCompilerErrorGetMessage(error.get()));
   }
+
+  template <typename Error = std::runtime_error, typename T>
+  T require(FailureOr<T> result, const llvm::Twine &stage) {
+    if (failed(result))
+      fail<Error>(stage);
+    // Keep the MLIR predicate: FailureOr hides std::optional::has_value().
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    return std::move(*result);
+  }
+};
+
+struct BackendConfig {
+  IreeBackend backend;
+  std::string_view name;
+  StringLiteral deviceFlag;
+  std::optional<StringLiteral> architectureFlag;
+  llvm::ArrayRef<StringLiteral> extraFlags;
+};
+
+constexpr StringLiteral cudaExtraFlags[] = {"--iree-cuda-use-ptxas=false"};
+constexpr BackendConfig backendConfigs[] = {
+    {IreeBackend::CUDA, "cuda", "--iree-hal-target-device=cuda",
+     StringLiteral("--iree-cuda-target="), cudaExtraFlags},
+    {IreeBackend::VMVX,
+     "vmvx",
+     "--iree-hal-target-backends=vmvx",
+     std::nullopt,
+     {}},
+};
+
+// Used only with StringLiteral flags and IREE's literal phase names. The
+// embedding API accepts nul-terminated strings, not pointer/length pairs.
+const char *terminatedData(llvm::StringRef literal) {
+  assert(literal.data()[literal.size()] == '\0');
+  return literal.data();
+}
+
+const BackendConfig &getBackendConfig(const IreeCompileOptions &options,
+                                      Diagnostics &diagnostics) {
+  for (const auto &config : backendConfigs) {
+    if (options.target == config.backend)
+      return config;
+  }
+  diagnostics.fail("configuration", "expected target cuda or vmvx");
+}
+
+Session createSession(const BackendConfig &backend,
+                      const std::optional<std::string> &architecture,
+                      Diagnostics &diagnostics) {
+  // The private compiler lacks a host HAL driver for constant evaluation.
+  llvm::SmallVector<const char *, 6> flags = {"--iree-plugin=kashi",
+                                              "--iree-input-type=torch",
+                                              "--iree-opt-const-eval=false"};
+  flags.push_back(terminatedData(backend.deviceFlag));
+  llvm::SmallString<32> archFlag;
+  if (backend.architectureFlag && architecture) {
+    archFlag += *backend.architectureFlag;
+    archFlag += *architecture;
+    flags.push_back(archFlag.c_str());
+  } else if (backend.architectureFlag || architecture) {
+    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
+  }
+  for (StringLiteral flag : backend.extraFlags)
+    flags.push_back(terminatedData(flag));
+  Session session(ireeCompilerSessionCreate());
+  diagnostics.check(
+      CompilerError(ireeCompilerSessionSetFlags(
+          session.get(), static_cast<int>(flags.size()), flags.data())),
+      "configuration");
+  return session;
+}
+
+Source wrapSource(const Session &session, const std::string &assembly,
+                  Diagnostics &diagnostics) {
+  iree_compiler_source_t *wrapped = nullptr;
+  CompilerError error(ireeCompilerSourceWrapBuffer(
+      session.get(), "torch.mlir", assembly.c_str(), assembly.size() + 1, true,
+      &wrapped));
+  Source source(wrapped);
+  diagnostics.check(std::move(error), "source");
+  return source;
+}
+
+class Invocation {
+public:
+  Invocation(const Session &session, Diagnostics &diagnostics)
+      : diagnostics(diagnostics),
+        handle(ireeCompilerInvocationCreate(session.get())) {
+    ireeCompilerInvocationEnableCallbackDiagnostics(
+        handle.get(), 0, Diagnostics::receive, &diagnostics);
+  }
+
+  void parse(const Source &source) {
+    if (!ireeCompilerInvocationParseSource(handle.get(), source.get()))
+      diagnostics.fail("parse");
+  }
+
+  OwningOpRef<ModuleOp> takeModule() {
+    return OwningOpRef<ModuleOp>(cast<ModuleOp>(
+        unwrap(ireeCompilerInvocationExportStealModule(handle.get()))));
+  }
+
+  void putModule(OwningOpRef<ModuleOp> module, llvm::StringRef stage) {
+    if (!ireeCompilerInvocationImportStealModule(
+            handle.get(), wrap(module.release().getOperation())))
+      diagnostics.fail(stage);
+  }
+
+  // Phase names are null-terminated literals from IREE's phase enumeration.
+  void lowerTo(llvm::StringRef to) {
+    ireeCompilerInvocationSetCompileFromPhase(handle.get(),
+                                              terminatedData(nextPhase));
+    ireeCompilerInvocationSetCompileToPhase(handle.get(), terminatedData(to));
+    if (!ireeCompilerInvocationPipeline(handle.get(),
+                                        IREE_COMPILER_PIPELINE_STD))
+      diagnostics.fail("compile through " + to);
+    nextPhase = to;
+  }
+
+  void runPasses(llvm::StringRef checkpoint, llvm::StringLiteral pipeline) {
+    if (!ireeCompilerInvocationRunPassPipeline(handle.get(),
+                                               terminatedData(pipeline)))
+      diagnostics.fail("pass at " + checkpoint);
+  }
+
+private:
+  Diagnostics &diagnostics;
+  InvocationHandle handle;
+  llvm::StringRef nextPhase = "start";
 };
 
 /// Write an artifact directly and remove it if emission or close fails.
 template <typename Emit>
 void writeArtifact(const fs::path &path, Diagnostics &diagnostics,
-                   const std::string &stage, Emit emit) {
+                   const llvm::Twine &stage, Emit emit) {
   std::error_code error;
   llvm::raw_fd_ostream out(path.string(), error);
   if (error)
-    diagnostics.fail(stage, error.message().c_str());
+    diagnostics.fail(stage, error.message());
   // A buffered write may first fail on close. Clear that error before the
   // LLVM stream destructor can turn it into a fatal usage error.
   const auto result = emit(out);
@@ -100,10 +257,11 @@ void writeArtifact(const fs::path &path, Diagnostics &diagnostics,
   error = out.error();
   if (failed(result) || error) {
     out.clear_error();
-    // Do not register a process-wide signal handler to remove this file.
     std::error_code ignored;
     fs::remove(path, ignored);
-    diagnostics.fail(stage, error ? error.message().c_str() : nullptr);
+    if (error)
+      diagnostics.fail(stage, error.message());
+    diagnostics.fail(stage);
   }
 }
 
@@ -118,180 +276,153 @@ void writeModule(ModuleOp module, const fs::path &path,
                 });
 }
 
-/// Partition and lower a Torch module in one private IREE invocation.
-std::optional<std::string>
-compile(const std::string &assembly, const IreeCompileOptions &options,
-        std::optional<IreeTestPipeline> testPipeline) {
-  const pid_t pid = getpid();
-  pid_t owner = 0;
-  if (!compilerOwner.compare_exchange_strong(owner, pid,
-                                             std::memory_order_relaxed) &&
-      owner != pid)
-    throw std::runtime_error(
-        "cannot use an inherited IREE compiler after fork; use spawn or exec");
-  static const CompilerRuntime runtime;
-  fs::path dir = fs::absolute(options.artifactDir);
-  Diagnostics diagnostics(dir / "iree-compile.log");
-  const bool cuda = options.target == "cuda";
-  if (!cuda && options.target != "vmvx")
-    diagnostics.fail("configuration", "expected target cuda or vmvx");
-  if (cuda != options.cudaTarget.has_value())
-    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
-
-  Handle<iree_compiler_session_t, ireeCompilerSessionDestroy> session(
-      ireeCompilerSessionCreate(), ireeCompilerSessionDestroy);
-  const char *backend = cuda ? "--iree-hal-target-device=cuda"
-                             : "--iree-hal-target-backends=vmvx";
-  llvm::SmallString<32> arch("--iree-cuda-target=");
-  if (options.cudaTarget)
-    arch += *options.cudaTarget;
-  // The private compiler does not ship a host HAL driver for constant
-  // evaluation.
-  const char *flags[] = {"--iree-plugin=kashi",
-                         "--iree-input-type=torch",
-                         "--iree-opt-const-eval=false",
-                         backend,
-                         arch.c_str(),
-                         "--iree-cuda-use-ptxas=false"};
-  diagnostics.check(
-      ireeCompilerSessionSetFlags(session.get(), cuda ? 6 : 4, flags),
-      "configuration");
-
-  iree_compiler_source_t *wrapped = nullptr;
-  auto *sourceError = ireeCompilerSourceWrapBuffer(
-      session.get(), "torch.mlir", assembly.c_str(), assembly.size() + 1, true,
-      &wrapped);
-  Handle<iree_compiler_source_t, ireeCompilerSourceDestroy> source(
-      wrapped, ireeCompilerSourceDestroy);
-  diagnostics.check(sourceError, "source");
-  Handle<iree_compiler_invocation_t, ireeCompilerInvocationDestroy> invocation(
-      ireeCompilerInvocationCreate(session.get()),
-      ireeCompilerInvocationDestroy);
-  auto *inv = invocation.get();
-  ireeCompilerInvocationEnableCallbackDiagnostics(inv, 0, Diagnostics::receive,
-                                                  &diagnostics);
-  if (!ireeCompilerInvocationParseSource(inv, source.get()))
-    diagnostics.fail("parse");
-  OwningOpRef<ModuleOp> original(
-      cast<ModuleOp>(unwrap(ireeCompilerInvocationExportStealModule(inv))));
-  auto partitionResult = partitionTorchModule(*original);
-  if (failed(partitionResult))
-    diagnostics.fail<UnsupportedPartition>("partition");
-  // Clang-tidy does not recognize MLIR's failed() check on FailureOr.
-  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-  auto &partition = *partitionResult;
+std::optional<std::string> partitionInput(Invocation &invocation,
+                                          const fs::path &dir,
+                                          Diagnostics &diagnostics) {
+  auto original = invocation.takeModule();
+  auto partition = diagnostics.require<UnsupportedPartition>(
+      partitionTorchModule(*original), "partition");
   writeModule(*partition.segments, dir / "partitioned.mlir", diagnostics);
   writeModule(*partition.driver, dir / "driver.mlir", diagnostics);
-  if (!ireeCompilerInvocationImportStealModule(
-          inv, wrap(partition.segments.release().getOperation())))
-    diagnostics.fail("verify partitioned module");
+  invocation.putModule(std::move(partition.segments),
+                       "verify partitioned module");
+  return std::move(partition.sourceDevice);
+}
 
-  auto run = [&](const char *from, const char *to) {
-    ireeCompilerInvocationSetCompileFromPhase(inv, from);
-    ireeCompilerInvocationSetCompileToPhase(inv, to);
-    if (!ireeCompilerInvocationPipeline(inv, IREE_COMPILER_PIPELINE_STD))
-      diagnostics.fail(std::string("compile through ") + to);
-  };
-  auto passes = [&](const char *checkpoint, const char *pipeline) {
-    if (!ireeCompilerInvocationRunPassPipeline(inv, pipeline))
-      diagnostics.fail(std::string("pass at ") + checkpoint);
-  };
+using Phase = mlir::iree_compiler::IREEVMPipelinePhase;
 
-  using Phase = mlir::iree_compiler::IREEVMPipelinePhase;
+std::optional<StringLiteral>
+checkpointPasses(Phase phase, IreeBackend backend,
+                 std::optional<IreeTestPipeline> testPipeline) {
   const bool probes = testPipeline == IreeTestPipeline::Checkpoints;
-  const bool split = testPipeline != IreeTestPipeline::Uninterrupted;
-  const char *from = "start";
-  std::vector<KernelIdentity> identities;
-  auto takeModule = [&] {
-    return OwningOpRef<ModuleOp>(
-        cast<ModuleOp>(unwrap(ireeCompilerInvocationExportStealModule(inv))));
-  };
-  auto putModule = [&](OwningOpRef<ModuleOp> module, const char *stage) {
-    if (!ireeCompilerInvocationImportStealModule(
-            inv, wrap(module.release().getOperation())))
-      diagnostics.fail(stage);
-  };
+  const bool cuda = backend == IreeBackend::CUDA;
+  switch (phase) {
+  case Phase::Start:
+    if (probes)
+      return StringLiteral("kashi-verify-segments,kashi-probe-torch");
+    return StringLiteral("kashi-verify-segments");
+  case Phase::Flow:
+    if (testPipeline == IreeTestPipeline::FailAtFlow)
+      return StringLiteral("kashi-fail-flow-probe");
+    if (probes && cuda)
+      return StringLiteral("kashi-probe-flow,kashi-collide-flow-functions");
+    if (probes)
+      return StringLiteral("kashi-probe-flow");
+    break;
+  case Phase::ExecutableConfigurations:
+    if (probes && cuda)
+      return StringLiteral("kashi-probe-configurations");
+    break;
+  case Phase::ExecutableTargets:
+    // The API appends to the root pass manager. Wrap only nested operations:
+    // an outer builtin.module would skip the root module.
+    if (probes && cuda)
+      return StringLiteral(
+          "hal.executable(hal.executable.variant(builtin.module("
+          "kashi-probe-nvvm)))");
+    break;
+  case Phase::VM:
+    if (probes)
+      return StringLiteral("kashi-probe-vm");
+    break;
+  default:
+    break;
+  }
+  return std::nullopt;
+}
 
-  // The invocation API appends to its existing root pass manager. Wrap only
-  // nested operations: an outer builtin.module would skip the root module.
+std::vector<KernelIdentity> captureFlow(Invocation &invocation,
+                                        const fs::path &dir,
+                                        IreeBackend backend,
+                                        Diagnostics &diagnostics) {
+  auto flow = invocation.takeModule();
+  writeArtifact(dir / "flow.mlir", diagnostics, "write Flow snapshot",
+                [&](llvm::raw_ostream &out) {
+                  flow->print(out);
+                  return success();
+                });
+  std::vector<KernelIdentity> identities;
+  if (backend == IreeBackend::CUDA)
+    identities = diagnostics.require(identifyCudaKernels(*flow),
+                                     "identify Flow exports");
+  invocation.putModule(std::move(flow), "verify Flow checkpoint");
+  return identities;
+}
+
+void emitCudaManifest(Invocation &invocation, const fs::path &dir,
+                      const std::vector<KernelIdentity> &identities,
+                      Diagnostics &diagnostics) {
+  auto hal = invocation.takeModule();
+  if (failed(writeCudaManifest(*hal, dir, identities)))
+    diagnostics.fail("resolve linked CUDA exports");
+  invocation.putModule(std::move(hal), "verify linked HAL module");
+}
+
+void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
+                          IreeBackend backend,
+                          std::optional<IreeTestPipeline> testPipeline,
+                          Diagnostics &diagnostics) {
+  const bool split = testPipeline != IreeTestPipeline::Uninterrupted;
+  std::vector<KernelIdentity> identities;
   mlir::iree_compiler::enumerateIREEVMPipelinePhases(
-      [&](Phase phase, StringRef name, StringRef) {
-        const char *pipeline = nullptr;
-        switch (phase) {
-        case Phase::Start:
-          pipeline = probes ? "kashi-verify-segments,kashi-probe-torch"
-                            : "kashi-verify-segments";
-          break;
-        case Phase::Flow:
-          if (testPipeline == IreeTestPipeline::FailAtFlow)
-            pipeline = "kashi-fail-flow-probe";
-          else if (probes)
-            pipeline = cuda ? "kashi-probe-flow,kashi-collide-flow-functions"
-                            : "kashi-probe-flow";
-          break;
-        case Phase::ExecutableConfigurations:
-          if (probes && cuda)
-            pipeline = "kashi-probe-configurations";
-          break;
-        case Phase::ExecutableTargets:
-          if (probes && cuda)
-            pipeline = "hal.executable(hal.executable.variant(builtin.module("
-                       "kashi-probe-nvvm)))";
-          break;
-        case Phase::VM:
-          if (probes)
-            pipeline = "kashi-probe-vm";
-          break;
-        default:
-          break;
-        }
+      [&](Phase phase, llvm::StringRef name, llvm::StringRef) {
+        const auto pipeline = checkpointPasses(phase, backend, testPipeline);
         const bool snapshot = split && phase == Phase::Flow;
-        const bool manifest = split && cuda && phase == Phase::HAL;
+        const bool manifest =
+            split && backend == IreeBackend::CUDA && phase == Phase::HAL;
         if (!pipeline && !snapshot && !manifest)
           return;
-        if (phase != Phase::Start) {
-          run(from, name.data());
-          from = name.data();
-        }
+        if (phase != Phase::Start)
+          invocation.lowerTo(name);
         if (pipeline)
-          passes(name.data(), pipeline);
-        if (snapshot) {
-          auto flow = takeModule();
-          writeArtifact(dir / "flow.mlir", diagnostics, "write Flow snapshot",
-                        [&](llvm::raw_ostream &out) {
-                          flow->print(out);
-                          return success();
-                        });
-          if (cuda) {
-            auto result = identifyCudaKernels(*flow);
-            if (failed(result))
-              diagnostics.fail("identify Flow exports");
-            identities = std::move(*result);
-          }
-          putModule(std::move(flow), "verify Flow checkpoint");
-        }
-        if (manifest) {
-          auto hal = takeModule();
-          if (failed(writeCudaManifest(*hal, dir, identities)))
-            diagnostics.fail("resolve linked CUDA exports");
-          putModule(std::move(hal), "verify linked HAL module");
-        }
+          invocation.runPasses(name, *pipeline);
+        if (snapshot)
+          identities = captureFlow(invocation, dir, backend, diagnostics);
+        if (manifest)
+          emitCudaManifest(invocation, dir, identities, diagnostics);
       });
-  // Finish lowering after the last requested checkpoint. The uninterrupted
-  // test has only the start verifier, so it lowers from start to end here.
-  run(from, "end");
-  auto vm = takeModule();
+  invocation.lowerTo("end");
+}
+
+void serializeVmModule(ModuleOp module, const fs::path &dir,
+                       Diagnostics &diagnostics) {
   // No session VM or bytecode flags are overridden, so the pinned
   // serializer's defaults match the invocation's options.
   writeArtifact(
       dir / "module.vmfb", diagnostics, "serialize VM bytecode",
       [&](llvm::raw_ostream &out) {
         return mlir::iree_compiler::IREE::VM::translateModuleToBytecode(
-            *vm, {}, {}, out);
+            module, {}, {}, out);
       });
-  return std::move(partition.sourceDevice);
+}
+
+/// Partition and lower a Torch module in one private IREE invocation.
+std::optional<std::string>
+compile(const std::string &assembly, const IreeCompileOptions &options,
+        std::optional<IreeTestPipeline> testPipeline) {
+  initializeCompiler();
+  const fs::path dir = fs::absolute(options.artifactDir);
+  Diagnostics diagnostics(dir / "iree-compile.log");
+  const auto &backend = getBackendConfig(options, diagnostics);
+  const auto session = createSession(backend, options.cudaTarget, diagnostics);
+  const auto source = wrapSource(session, assembly, diagnostics);
+  Invocation invocation(session, diagnostics);
+  invocation.parse(source);
+  auto sourceDevice = partitionInput(invocation, dir, diagnostics);
+  lowerWithCheckpoints(invocation, dir, backend.backend, testPipeline,
+                       diagnostics);
+  serializeVmModule(*invocation.takeModule(), dir, diagnostics);
+  return sourceDevice;
 }
 } // namespace
+
+std::optional<IreeBackend> parseIreeBackend(std::string_view target) {
+  for (const auto &config : backendConfigs) {
+    if (config.name == target)
+      return config.backend;
+  }
+  return std::nullopt;
+}
 
 /// Compile with production checkpoints and return the original source device.
 std::optional<std::string> compileIree(const std::string &assembly,

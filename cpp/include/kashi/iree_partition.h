@@ -13,7 +13,9 @@ struct Partition {
   std::optional<std::string> sourceDevice;
 };
 
-// Constructs both modules in the source context without modifying the source.
+// Outlines Torch runs between custom ops and builds a driver that calls them
+// in source order. Both modules use the source context; the source is
+// unchanged.
 mlir::FailureOr<Partition> partitionTorchModule(mlir::ModuleOp source);
 
 } // namespace kashi

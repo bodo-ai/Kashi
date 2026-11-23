@@ -1,4 +1,7 @@
 add_library(kashi_iree_plugin STATIC "${CMAKE_CURRENT_LIST_DIR}/registration.cpp")
+if(KASHI_LINT)
+  set_property(TARGET kashi_iree_plugin PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
+endif()
 # The bundled IREE compiler and MLIR are built without C++ RTTI.
 target_compile_options(kashi_iree_plugin PRIVATE -fno-rtti)
 target_link_libraries(kashi_iree_plugin PRIVATE
