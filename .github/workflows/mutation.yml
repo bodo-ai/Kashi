@@ -10,6 +10,8 @@ permissions:
 jobs:
   mutation:
     runs-on: ubuntu-24.04
+    env:
+      KASHI_DISABLE_CUDA: "1"
     steps:
       - name: Initialize diagnostics
         run: printf 'Mutation job diagnostics\n' > "$RUNNER_TEMP/mutation.log"

@@ -60,7 +60,7 @@ module {
 }
 )mlir";
 
-#ifdef __linux__
+#ifdef KASHI_TEST_CUDA_CODEGEN
 constexpr auto twoSegments = R"mlir(
 module {
   func.func @main(%x: !torch.vtensor<[1024],f32>) -> !torch.vtensor<[1024],f32> {
@@ -237,7 +237,9 @@ TEST_CASE("Compiler errors identify an unwritable diagnostic log") {
       Catch::Matchers::ContainsSubstring(
           "parse failed; cannot write diagnostic log"));
 }
+#endif
 
+#ifdef KASHI_TEST_CUDA_CODEGEN
 // Colliding local names must link to distinct entries.
 TEST_CASE("CUDA checkpoints preserve colliding Flow export identities") {
   Artifacts split;

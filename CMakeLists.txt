@@ -108,7 +108,7 @@ install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/mlir/LICENSE.TX
   DESTINATION kashi/licenses RENAME MLIR.txt)
 install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/flatcc/LICENSE"
   DESTINATION kashi/licenses RENAME FlatCC.txt)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(IREE_TARGET_BACKEND_CUDA)
   find_file(KASHI_CUDA_NOTICE NAMES EULA.txt LICENSE
     HINTS "$ENV{IREE_CUDA_DEPS_DIR}" "${CUDAToolkit_BIN_DIR}/.."
     NO_DEFAULT_PATH REQUIRED)
@@ -138,6 +138,9 @@ if(KASHI_BUILD_TESTS)
       iree::compiler::Dialect::HAL::IR
       iree::compiler::Utils
       iree::schemas::cuda_executable_def_c_fbs)
+    if(IREE_TARGET_BACKEND_CUDA)
+      target_compile_definitions(kashi_native_tests PRIVATE KASHI_TEST_CUDA_CODEGEN)
+    endif()
     if(KASHI_LINT)
       set_property(TARGET kashi_native_tests PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
     endif()

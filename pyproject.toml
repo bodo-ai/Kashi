@@ -76,7 +76,8 @@ lint-cpp = '''
 bash -c 'set -e
 nanobind_dir=$(python -m nanobind --cmake_dir)
 cmake -S . -B build/lint-cpp -G Ninja \
-    -DCMAKE_CXX_COMPILER=clang++ -DKASHI_BUILD_TESTS=ON -DKASHI_LINT=ON \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DKASHI_BUILD_TESTS=ON -DKASHI_LINT=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
     -Dnanobind_DIR="$nanobind_dir" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
