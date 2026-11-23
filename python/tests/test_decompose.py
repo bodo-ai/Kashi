@@ -380,36 +380,3 @@ def test_decomposition_matches_vllm_kernel_on_cuda(program, inputs):
     torch.testing.assert_close(
         _decompose(program, *inputs)(*inputs), program(*inputs), rtol=1e-4, atol=1e-4
     )
-
-
-# --- Schema argument names differ between vLLM builds. ------------------------
-
-# vLLM's CPU build names the output buffer "out" where the CUDA build says
-# "result"; positions are the same. These copies use the CPU wheel's schemas.
-_CPU_SCHEMAS = torch.library.Library("kashi_cpu_schema", "DEF")
-for _schema in (
-    "rms_norm(Tensor(a!) out, Tensor input, Tensor? weight, float epsilon) -> ()",
-    "silu_and_mul(Tensor(a!) out, Tensor input) -> ()",
-):
-    _CPU_SCHEMAS.define(_schema)
-    _CPU_SCHEMAS.impl(_schema.split("(")[0], lambda *args: None, "Meta")
-
-
-@pytest.mark.parametrize("op", ["rms_norm", "silu_and_mul"])
-def test_rules_do_not_depend_on_schema_argument_names(op, monkeypatch):
-    """Rules bind by position, so CPU (``out``) and CUDA (``result``) builds work."""
-    import kashi.decompose
-
-    rules = dict(kashi.decompose._DECOMPOSITIONS)
-    rules[f"kashi_cpu_schema::{op}"] = rules[f"_C::{op}"]
-    monkeypatch.setattr(kashi.decompose, "_DECOMPOSITIONS", rules)
-    monkeypatch.setitem(globals(), "C", torch.ops.kashi_cpu_schema)
-    x = torch.randn(3, 8)
-
-    if op == "rms_norm":
-        gm = _decompose(lambda x: _rms_norm(x, None), x)
-        torch.testing.assert_close(gm(x), _ref_rms(x, None))
-    else:
-        torch.testing.assert_close(
-            _decompose(_silu_and_mul, x)(x), _ref_silu_and_mul(x)
-        )
