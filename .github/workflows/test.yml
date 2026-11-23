@@ -21,7 +21,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
           pixi-version: v0.82.0
-          run-install: false
+          locked: true
       - name: Check Python and C++
         run: pixi run --locked lint
 
@@ -49,9 +49,9 @@ jobs:
         id: pixi
         with:
           pixi-version: v0.82.0
-          run-install: false
-      - name: Install locked environment
-        run: pixi install --locked
+          locked: true
+          environments: ${{ runner.os == 'Linux' && 'default cpp-coverage' || 'default' }}
+          cache-key: pixi-test-
       - name: Python tests
         if: runner.os != 'Linux'
         run: pixi run --locked test-python

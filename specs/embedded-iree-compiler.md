@@ -2,7 +2,7 @@
 
 ## Goal and scope
 
-Stack PR #23 on PR #20. Run typed Kashi C++ passes at IREE's named MLIR phase boundaries in process. Build against pinned, unmodified IREE and keep the stock IREE wheel for Python bindings.
+Replace the Python compiler pipeline introduced in PR #20. Run typed Kashi C++ passes at IREE's named MLIR phase boundaries in process. Build against pinned, unmodified IREE and keep the stock IREE wheel for Python bindings.
 
 Keep FX import and reassembly in Python; move MLIR partitioning to C++. Preserve custom-op order, mutation semantics, segment signatures, and the output pytree. Kernel targets remain opaque; default TorchDynamo and vLLM behavior is unchanged.
 
@@ -14,7 +14,7 @@ Keep FX import and reassembly in Python; move MLIR partitioning to C++. Preserve
 
 ## Branch integration
 
-Rebase the #23 topic onto the actual #20 head and set #20's branch as the stacked PR base. Preserve main's already-landed changes and drop duplicate RunPod edits rather than replaying them. Replace `specs/native-mlir-passes.md` from #23 with this specification; #20 has no corresponding spec to remove. Carry forward #23's native build/test conventions, platform export isolation, and typed pass coverage where applicable. Remove the standalone SDK provisioning and cache, `run_passes` Python and C++ interfaces, arbitrary textual pass pipeline, and native-to-Python transformed-module bridge; there is no compatibility shim. Replace #20's compiler path override, tool lookup, subprocess and subprocess-only failure tests with the embedded path. Do not modify or retarget #20.
+With PR #20 merged into main, `compile_iree_fx` uses the embedded compiler exclusively. The Python partitioner, compiler path override, tool lookup, and subprocess are removed. Tests for partitioning exercise the native path through the Python binding; FX reassembly remains in Python.
 
 ## Compilation contract
 

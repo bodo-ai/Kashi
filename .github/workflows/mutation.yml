@@ -44,9 +44,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
           pixi-version: v0.82.0
-          run-install: false
-      - name: Install locked environment
-        run: pixi install --locked
+          locked: true
       - name: Run mutation tests
         shell: bash
         env:
