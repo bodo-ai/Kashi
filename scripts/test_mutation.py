@@ -466,8 +466,6 @@ def main():
             [
                 runner,
                 "--allow-surviving",
-                # Let the fork regression's five-second child alarm fail the
-                # test before Mull classifies a deadlock mutant as a timeout.
                 "--minimum-timeout",
                 "8000",
                 "--reporters",

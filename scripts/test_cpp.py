@@ -108,7 +108,7 @@ def main() -> int:
                 *cmake_args,
                 "-DKASHI_BUILD_TESTS=ON",
                 "-DKASHI_MUTATION=OFF",
-                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_BUILD_TYPE=Debug",
                 f"-DPython_EXECUTABLE={sys.executable}",
                 f"-Dnanobind_DIR={nanobind_dir}",
                 f"-DCMAKE_PREFIX_PATH={sys.prefix}",
@@ -116,12 +116,12 @@ def main() -> int:
             check=True,
         )
         subprocess.run(
-            ["cmake", "--build", str(build_dir), "--config", "Release"],
+            ["cmake", "--build", str(build_dir), "--config", "Debug"],
             check=True,
             env=build_env,
         )
 
-        ctest = ["ctest", "--test-dir", str(build_dir), "-C", "Release"]
+        ctest = ["ctest", "--test-dir", str(build_dir), "-C", "Debug"]
         discovery = subprocess.run(
             [*ctest, "--show-only=json-v1"],
             check=True,
