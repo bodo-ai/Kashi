@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   mutation:
     runs-on: ubuntu-24.04
@@ -19,6 +22,16 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // Expose the cache endpoint and job-scoped token to Pixi's sccache.
+            // GitHub provides them to this action, not to the later shell steps.
+            for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              core.exportVariable(name, process.env[name] || '');
+            }
+      - name: Enable mold
+        run: echo 'CMAKE_LINKER_TYPE=MOLD' >> "$GITHUB_ENV"
       - name: Install pinned Clang and Mull
         shell: bash
         run: |

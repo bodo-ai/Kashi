@@ -8,6 +8,7 @@ permissions:
 
 env:
   CMAKE_BUILD_PARALLEL_LEVEL: 4
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   lint:
@@ -17,6 +18,19 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - &sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Expose the cache endpoint and job-scoped token to Pixi's sccache.
+            // GitHub provides them to this action, not to the later shell steps.
+            for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              core.exportVariable(name, process.env[name] || '');
+            }
+      - &mold
+        name: Enable mold on Linux
+        if: runner.os == 'Linux'
+        run: echo 'CMAKE_LINKER_TYPE=MOLD' >> "$GITHUB_ENV"
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
           pixi-version: v0.82.0
@@ -25,6 +39,8 @@ jobs:
         run: pixi run --locked lint
 
   test:
+    # Lint builds the editable package first, warming sccache for matching Linux compilations.
+    needs: lint
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -44,6 +60,8 @@ jobs:
           persist-credentials: false
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
+      - *sccache
+      - *mold
       - uses: prefix-dev/setup-pixi@v0.11.3
         id: pixi
         with:
