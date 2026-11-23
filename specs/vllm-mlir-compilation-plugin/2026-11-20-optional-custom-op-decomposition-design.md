@@ -18,7 +18,6 @@ used to be one `_C.rms_norm`".
 
 - An opt-in switch, off by default:
   - `compile_iree_fx(..., decompose_custom_ops=False)`
-  - `--decompose-custom-ops` on the script
 - Decompose exactly these ops, as they appear in Qwen3-0.6B:
 
   | Custom op | Schema (mutated args marked `!`) | Replacement |
@@ -83,8 +82,7 @@ the tag survives into flow IR.
 
 `compile_iree_fx(gm, *, ..., decompose_custom_ops: bool = False)` passes the
 flag to `import_fx(gm, *, decompose_custom_ops=False)`, which passes it to
-`_normalize`. The script adds a `--decompose-custom-ops` store_true flag and
-forwards it from `iree_backend`.
+`_normalize`.
 
 ### Rewrite (FX, inside `_normalize`)
 
@@ -152,9 +150,6 @@ node's location. That's fine; only real compute ops need to carry the tag.
 - Alias guard: a graph that reads the base of a mutated view after the op
   raises `NotImplementedError`.
 - Flag off: existing tests pass unchanged.
-- End to end (GPU): run `compile_qwen3_iree.py --decompose-custom-ops`. The
-  partitioned MLIR should contain only the two vLLM attention ops as
-  `torch.operator`, and IREE compilation should succeed.
 
 ## Builder's calls (not decided with the user)
 
