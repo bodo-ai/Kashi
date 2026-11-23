@@ -2,14 +2,12 @@
 #include "kashi/cuda_manifest.h"
 #include "kashi/iree_partition.h"
 
-#include <atomic>
 #include <cassert>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
-#include <unistd.h>
 
 #include "iree/compiler/Dialect/VM/Target/Bytecode/BytecodeModuleTarget.h"
 #include "iree/compiler/Pipelines/Pipelines.h"
@@ -41,32 +39,10 @@ using InvocationHandle =
     Handle<iree_compiler_invocation_t, ireeCompilerInvocationDestroy>;
 using CompilerError = Handle<iree_compiler_error_t, ireeCompilerErrorDestroy>;
 
-// Claim the process before touching the local static guard: a child could
-// otherwise block on a guard held by a parent thread during fork.
-static_assert(std::atomic<pid_t>::is_always_lock_free);
-std::atomic<pid_t> compilerOwner{0};
-
 struct CompilerRuntime {
   CompilerRuntime() { ireeCompilerGlobalInitialize(); }
-  ~CompilerRuntime() {
-    // IREE's GlobalInit owns the LLVM pool shared by the MLIR sessions.
-    // Global shutdown destroys the pool and joins its threads; only the
-    // initializing process has those workers.
-    if (compilerOwner.load(std::memory_order_relaxed) == getpid())
-      ireeCompilerGlobalShutdown();
-  }
+  ~CompilerRuntime() { ireeCompilerGlobalShutdown(); }
 };
-
-void initializeCompiler() {
-  const pid_t pid = getpid();
-  pid_t owner = 0;
-  if (!compilerOwner.compare_exchange_strong(owner, pid,
-                                             std::memory_order_relaxed) &&
-      owner != pid)
-    throw std::runtime_error(
-        "cannot use an inherited IREE compiler after fork; use spawn or exec");
-  static const CompilerRuntime runtime;
-}
 
 struct Diagnostics {
   /// Open the log before any invocation can emit diagnostics.
@@ -400,7 +376,7 @@ void serializeVmModule(ModuleOp module, const fs::path &dir,
 std::optional<std::string>
 compile(const std::string &assembly, const IreeCompileOptions &options,
         std::optional<IreeTestPipeline> testPipeline) {
-  initializeCompiler();
+  static const CompilerRuntime runtime;
   const fs::path dir = fs::absolute(options.artifactDir);
   Diagnostics diagnostics(dir / "iree-compile.log");
   const auto &backend = getBackendConfig(options, diagnostics);

@@ -11,10 +11,7 @@
 #include <utility>
 
 #ifdef __linux__
-#include <cstdlib>
 #include <signal.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #endif
 
 #include <catch2/catch_test_macros.hpp>
@@ -61,7 +58,7 @@ module {
 }
 )mlir";
 
-#if defined(KASHI_TEST_CUDA_CODEGEN) || defined(__linux__)
+#ifdef KASHI_TEST_CUDA_CODEGEN
 constexpr auto twoSegments = R"mlir(
 module {
   func.func @main(%x: !torch.vtensor<[1024],f32>) -> !torch.vtensor<[1024],f32> {
@@ -187,32 +184,6 @@ TEST_CASE("CUDA manifest resolves entries in the selected serialized image") {
 }
 
 #ifdef __linux__
-// Exit normally in the child so the test also exercises static destruction.
-TEST_CASE("A forked child cannot use or shut down the parent compiler") {
-  Artifacts warm;
-  Artifacts child;
-  Artifacts healthy;
-  kashi::compileIree(twoSegments, {warm.directory, IreeBackend::VMVX, {}});
-  const pid_t pid = fork();
-  REQUIRE(pid >= 0);
-  if (pid == 0) {
-    alarm(5);
-    try {
-      kashi::compileIree(twoSegments, {child.directory, IreeBackend::VMVX, {}});
-    } catch (const std::runtime_error &error) {
-      std::exit(std::string_view(error.what()).find("spawn or exec") ==
-                std::string_view::npos);
-    }
-    std::exit(2);
-  }
-  int status;
-  REQUIRE(waitpid(pid, &status, 0) == pid);
-  REQUIRE(WIFEXITED(status));
-  REQUIRE(WEXITSTATUS(status) == 0);
-  kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
-  REQUIRE(healthy.read("module.vmfb").size() > 0);
-}
-
 // Force real write failures at the Flow snapshot and VM bytecode stages.
 TEST_CASE("Compiler artifact write errors are recoverable") {
   for (const auto &[file, stage] :

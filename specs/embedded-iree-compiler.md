@@ -23,6 +23,10 @@ With PR #20 merged into main, `compile_iree_fx` uses the embedded compiler exclu
 3. Use a fresh session and invocation per call, release the GIL during native work, and capture diagnostics in `iree-compile.log`. Errors identify the failing stage and retain available artifacts. No subprocess, global CLI configuration, or fallback. CUDA emits PTX without `ptxas`; VMVX remains available for portable smoke tests.
 4. Python reads the driver, authoritative Flow snapshot, and kernel manifest and rebuilds FX with the original pytree. Preserve existing artifact fields and the readable PTX listing.
 
+Forking after the embedded compiler initializes is unsupported unless the
+child immediately calls `exec`. Use the `spawn` start method for Python
+multiprocessing after compilation.
+
 ### Pass placement without patches
 
 Statically register Kashi C++ passes and dialects using IREE's out-of-tree plugin mechanism. Run IREE's standard pipeline up to each requested checkpoint with `ireeCompilerInvocationSetCompileToPhase`, run the registered passes on the same invocation, then resume with `ireeCompilerInvocationSetCompileFromPhase` set to that checkpoint. Use implementation-owned pass pipelines through the invocation API, not user-supplied strings. Split only where passes or artifact inspection require it. No serialization or new context between phases. Save the authoritative Flow snapshot after any Flow checkpoint passes.
