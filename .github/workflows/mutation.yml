@@ -58,6 +58,13 @@ jobs:
         with:
           pixi-version: v0.82.0
           locked: true
+          run-install: false
+      - name: Install mutation build dependencies
+        id: mutation-dependencies
+        # The editable Python package would build a second, incompatible IREE.
+        run: >-
+          pixi install --locked --only python --only cmake --only ninja --only sccache
+          --only catch2 --only nanobind --only mold --only cxx-compiler
       - name: Run mutation tests
         shell: bash
         env:
