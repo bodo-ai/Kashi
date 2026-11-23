@@ -117,7 +117,10 @@ def rebuild_fx(
             results = _call(graph, op, name, operands, max_results=1, min_results=1)
         elif name == "torch.operator":
             qualified = ir.StringAttr(op.attributes["name"]).value
-            results = _call(graph, op, qualified, operands, max_results=1)
+            if qualified == "torch.kashi.unified_attention":
+                results = _expand_attention(graph, op, operands)
+            else:
+                results = _call(graph, op, qualified, operands, max_results=1)
         elif name == "func.call" and segment_handlers is not None:
             callee = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
             if callee not in segment_handlers:
@@ -206,6 +209,28 @@ def _call(graph, op, name, operands, *, max_results, min_results=0):
             args.append(value)
     node = graph.call_function(target, tuple(args), kwargs)
     return [node] if num_results else []
+
+
+def _expand_attention(graph, op, operands):
+    """Expand ``kashi.unified_attention`` (see ``import_fx``) back into vLLM's
+    ``unified_attention_with_output`` writing a fresh buffer, the result."""
+    target = _resolve(op, "torch.vllm.unified_attention_with_output")
+    if len(op.results) != 1 or len(operands) != 5:
+        raise _error(
+            op,
+            f"expected 1 result and 5 operands, found {len(op.results)} "
+            f"and {len(operands)}",
+        )
+    query, key, value, layer_name, dep = operands
+    output = graph.call_function(
+        torch.ops.aten.empty_like.default,
+        (query,),
+        {"memory_format": torch.contiguous_format},
+    )
+    graph.call_function(
+        target, (query, key, value, output, layer_name), {"kv_cache_dummy_dep": dep}
+    )
+    return [output]
 
 
 def _output(op, operands, out_spec):

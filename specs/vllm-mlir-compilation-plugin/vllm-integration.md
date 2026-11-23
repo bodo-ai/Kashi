@@ -59,7 +59,7 @@ Environment facts the tests must account for:
 
 ### Non-goals
 
-- Functionalization, mutation or aliasing semantics of vLLM ops. The rebuilt graph keeps SSA references, so `output` written by attention is the same FX node later viewed. Nothing models the write.
+- Functionalization, mutation or aliasing semantics of vLLM ops. The rebuilt graph keeps SSA references, so `output` written by attention is the same FX node later viewed. Nothing models the write. Exception: `unified_attention_with_output` is represented functionally in the imported MLIR; see [Functional Attention](functional-attention.md).
 - Serializable callables / vLLM AOT compile (tests disable it).
 - `STOCK_TORCH_COMPILE` and `VLLM_COMPILE` modes; Inductor.
 - The `inputs_embeds` branch.

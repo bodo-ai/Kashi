@@ -1,7 +1,7 @@
 """A ``torch.compile`` backend that wraps ``compile_fx`` and records what it does.
 
 Each :class:`BackendSpy` records every graph it receives together with the
-callable ``compile_fx`` returned. For graphs with an ``input_ids`` input (vLLM
+callable ``compile_fx`` returned and the text of the graph's imported MLIR. For graphs with an ``input_ids`` input (vLLM
 models), it also records the token count of every invocation.
 
 vLLM loads backends by qualified name, so a module-level instance is exposed
@@ -9,6 +9,7 @@ through :func:`spy_compile_fx`; pass :data:`VLLM_BACKEND` as the backend name.
 """
 
 from kashi.backend import compile_fx
+from kashi.importer import import_fx
 
 
 def _input_ids_index(gm):
@@ -20,17 +21,21 @@ def _input_ids_index(gm):
 
 
 class BackendSpy:
-    """Backend recording ``(gm, compiled_fn)`` pairs and per-call token counts."""
+    """Backend recording ``(gm, compiled_fn)`` pairs, imported MLIR text and
+    per-call token counts."""
 
     def __init__(self):
         self.calls = []
+        self.modules = []
         self.token_counts = []
 
     def clear(self):
         self.calls.clear()
+        self.modules.clear()
         self.token_counts.clear()
 
     def __call__(self, gm, example_inputs):
+        self.modules.append(str(import_fx(gm).module))
         fn = compile_fx(gm, example_inputs)
         self.calls.append((gm, fn))
         input_index = _input_ids_index(gm)

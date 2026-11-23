@@ -68,6 +68,11 @@ def test_vllm_matches_uncompiled_vllm(simple_vllm_model_dir):
     # tokens) and for decode (one token per prompt).
     assert {14, 2} <= set(VLLM_SPY.token_counts)
 
+    # The imported MLIR represents attention functionally.
+    (text,) = VLLM_SPY.modules
+    assert 'torch.operator "torch.kashi.unified_attention"' in text
+    assert "unified_attention_with_output" not in text
+
     vllm_ops = torch.ops.vllm
     assert _vllm_attention_targets(gm) == [
         vllm_ops.unified_kv_cache_update,
