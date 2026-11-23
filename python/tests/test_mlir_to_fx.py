@@ -2,6 +2,7 @@ import operator
 
 import pytest
 import torch
+import vllm.model_executor.layers.attention.attention  # noqa: F401 (torch.ops.vllm)
 from fx_test_utils import call_targets
 from iree.compiler import ir
 from kashi.mlir_to_fx import rebuild_fx
@@ -416,3 +417,41 @@ def test_rebuild_rejects_unresolvable_operator(test_ops, name, match):
         NotImplementedError, match=rf"Unsupported MLIR op torch\.operator.*{match}"
     ):
         rebuild_fx(_with_operator(name))
+
+
+# --- kashi.unified_attention expands to vLLM attention. ---------------------
+
+ATTENTION = """
+func.func @main(%arg0: !torch.vtensor<[3,2,4],f32>, %arg1: !torch.vtensor<[3,2,4],f32>, %arg2: !torch.vtensor<[3,2,4],f32>, %arg3: !torch.any, %arg4: !torch.vtensor<[0],f32>) -> !torch.vtensor<[3,2,4],f32> {
+  %0 = torch.operator "torch.kashi.unified_attention"(%arg0, %arg1, %arg2, %arg3, %arg4) : (!torch.vtensor<[3,2,4],f32>, !torch.vtensor<[3,2,4],f32>, !torch.vtensor<[3,2,4],f32>, !torch.any, !torch.vtensor<[0],f32>) -> !torch.vtensor<[3,2,4],f32>
+  return %0 : !torch.vtensor<[3,2,4],f32>
+}
+"""
+
+
+def test_rebuild_expands_unified_attention():
+    gm = rebuild_fx(_parse(ATTENTION))
+
+    query, key, value, layer_name, dep = gm.graph.find_nodes(op="placeholder")
+    empty, attention = _call_nodes(gm)
+    assert (empty.target, empty.args, empty.kwargs) == (
+        torch.ops.aten.empty_like.default,
+        (query,),
+        {"memory_format": torch.contiguous_format},
+    )
+    assert (attention.target, attention.args, attention.kwargs) == (
+        torch.ops.vllm.unified_attention_with_output.default,
+        (query, key, value, empty, layer_name),
+        {"kv_cache_dummy_dep": dep},
+    )
+    (output,) = gm.graph.find_nodes(op="output")
+    assert output.args[0] is empty
+
+
+def test_rebuild_unified_attention_requires_one_result():
+    src = ATTENTION.replace("%0 = torch.operator", "torch.operator").replace(
+        "!torch.vtensor<[0],f32>) -> !torch.vtensor<[3,2,4],f32>\n  return %0",
+        "!torch.vtensor<[0],f32>) -> ()\n  return %arg0",
+    )
+    with pytest.raises(NotImplementedError, match="expected 1 result .*found 0"):
+        rebuild_fx(_parse(src))

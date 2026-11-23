@@ -3,6 +3,7 @@ import re
 
 import pytest
 import torch
+import vllm.model_executor.layers.attention.attention  # noqa: F401 (torch.ops.vllm)
 from kashi.importer import import_fx
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils import _pytree as pytree
@@ -274,3 +275,189 @@ def test_import_fx_opaque_hook_is_not_global():
     except NotImplementedError:
         pass
     assert fx_importer.ContextCache.value_info_to_type is before
+
+
+# --- vLLM attention is imported in functional form. -------------------------
+
+ATTENTION = torch.ops.vllm.unified_attention_with_output
+KV_UPDATE = torch.ops.vllm.unified_kv_cache_update
+
+
+class _StopCapture(Exception):
+    pass
+
+
+def _capture_attention(body, *extra):
+    """Capture ``body(q, k, v, layer_name, *extra)`` with Dynamo without running
+    it: real vLLM attention needs vLLM's forward context."""
+    from vllm.utils.torch_utils import LayerName
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_name = LayerName("layer.0")
+
+        def forward(self, q, k, v, *extra):
+            return body(q, k, v, self.layer_name, *extra)
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        raise _StopCapture
+
+    torch._dynamo.reset()
+    q, k, v = (torch.randn(3, 2, 4) for _ in range(3))
+    with pytest.raises(Exception, match="_StopCapture"):
+        torch.compile(Model(), backend=backend, fullgraph=True)(q, k, v, *extra)
+    (gm,) = graphs
+    return gm
+
+
+def _attention_lines(text):
+    return [l for l in text.splitlines() if '"torch.kashi.unified_attention"' in l]
+
+
+def _ssa_operands(line):
+    return re.search(r"\((.*?)\)\s*:", line).group(1).split(", ")
+
+
+def _result(line):
+    return line.split("=")[0].strip()
+
+
+def _returned(text):
+    (ret,) = (l for l in text.splitlines() if l.strip().startswith("return"))
+    return ret.split()[1]
+
+
+def _vllm_attention(q, k, v, name):
+    dep = KV_UPDATE(k, v, name)
+    out = torch.empty(6, 4).view(3, 2, 4)
+    ATTENTION(q, k, v, out, name, kv_cache_dummy_dep=dep)
+    return out.view(3, 8)
+
+
+def test_import_fx_functionalizes_vllm_attention():
+    gm = _capture_attention(_vllm_attention)
+    result = import_fx(gm)
+    text = str(result.module)
+
+    assert result.module.operation.verify()
+    assert "unified_attention_with_output" not in text
+    (line,) = _attention_lines(text)
+    assert line.rstrip().endswith("-> !torch.vtensor<[3,2,4],f32>")
+    kv_update = next(l for l in text.splitlines() if "unified_kv_cache_update" in l)
+    # query, key, value, layer_name, kv_cache_dummy_dep
+    operands = _ssa_operands(line)
+    assert len(operands) == 5 and operands[-1] == _result(kv_update)
+    assert re.search(rf"torch\.aten\.view {re.escape(_result(line))},", text)
+    # The input graph is untouched.
+    assert gm.graph.find_nodes(op="call_function", target=ATTENTION)
+
+
+def test_import_fx_removes_dead_attention_buffer():
+    text = str(import_fx(_capture_attention(_vllm_attention)).module)
+
+    # The empty/view that fed output are dead once attention returns its result.
+    assert "torch.aten.empty.memory_format" not in text
+
+
+def _unused_kv_update(q, k, v, name):
+    KV_UPDATE(k, v, name)
+    q.view(3, 8)  # dead ATen op
+    return q
+
+
+def test_import_fx_keeps_unused_custom_ops():
+    text = str(import_fx(_capture_attention(_unused_kv_update)).module)
+
+    # The KV-cache write is a side effect its schema does not declare.
+    assert 'torch.operator "torch.vllm.unified_kv_cache_update"' in text
+    assert "torch.aten.view" not in text
+
+
+def _two_layers(q, k, v, name):
+    a = torch.empty(3, 2, 4)
+    ATTENTION(q, k, v, a, name)
+    b = torch.empty(3, 2, 4)
+    ATTENTION(a, k, v, b, name, kv_cache_dummy_dep=a)
+    return b
+
+
+def test_import_fx_functionalizes_each_attention_call():
+    text = str(import_fx(_capture_attention(_two_layers)).module)
+
+    first, second = _attention_lines(text)
+    operands = _ssa_operands(second)
+    assert operands[0] == operands[-1] == _result(first)
+    assert _returned(text) == _result(second)
+
+
+def _output_as_dep(q, k, v, name):
+    out = torch.empty(3, 2, 4)
+    ATTENTION(q, k, v, out, name, kv_cache_dummy_dep=out)
+    return out
+
+
+def test_import_fx_functionalizes_attention_with_output_as_dep():
+    text = str(import_fx(_capture_attention(_output_as_dep)).module)
+
+    (line,) = _attention_lines(text)
+    empty = next(l for l in text.splitlines() if "torch.aten.empty.memory_format" in l)
+    # The dependency reads the buffer before the write; the result is returned.
+    assert _ssa_operands(line)[-1] == _result(empty)
+    assert _returned(text) == _result(line)
+
+
+def _graph_input(q, k, v, name, buf):
+    ATTENTION(q, k, v, buf, name)
+    return buf
+
+
+def _chunk_of_empty(q, k, v, name):
+    out = torch.empty(6, 2, 4).chunk(2)[0]
+    ATTENTION(q, k, v, out, name)
+    return out
+
+
+def _base_read_after(q, k, v, name):
+    base = torch.empty(6, 4)
+    ATTENTION(q, k, v, base.view(3, 2, 4), name)
+    return base
+
+
+def _wrong_shape(q, k, v, name):
+    out = torch.empty(3, 8)
+    ATTENTION(q, k, v, out, name)
+    return out
+
+
+def _strided(q, k, v, name):
+    out = torch.ops.aten.transpose.int(torch.empty(2, 3, 4), 0, 1)
+    ATTENTION(q, k, v, out, name)
+    return out
+
+
+def _scaled(q, k, v, name):
+    out = torch.empty(3, 2, 4)
+    ATTENTION(q, k, v, out, name, output_scale=q)
+    return out
+
+
+@pytest.mark.parametrize(
+    "body, extra, match",
+    [
+        (_graph_input, (torch.empty(3, 2, 4),), "not a fresh buffer"),
+        (_chunk_of_empty, (), "not a fresh buffer"),
+        (_base_read_after, (), "aliases output"),
+        (_wrong_shape, (), "shape"),
+        (_strided, (), "contiguous"),
+        (_scaled, (), "output_scale"),
+    ],
+    ids=["graph-input", "chunk", "aliased-base", "shape", "strided", "scaled"],
+)
+def test_import_fx_rejects_unsafe_attention(body, extra, match):
+    gm = _capture_attention(body, *extra)
+    with pytest.raises(NotImplementedError, match=match):
+        import_fx(gm)
