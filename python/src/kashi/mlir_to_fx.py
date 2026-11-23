@@ -1,6 +1,7 @@
 """MLIR to FX reconstruction for Torch-dialect modules produced by ``import_fx``."""
 
 import operator
+from collections.abc import Callable, Mapping
 
 import torch
 from iree.compiler import ir
@@ -73,7 +74,10 @@ def _decode(argument, value, op):
 
 
 def rebuild_fx(
-    module: ir.Module, out_spec: pytree.TreeSpec | None = None
+    module: ir.Module,
+    out_spec: pytree.TreeSpec | None = None,
+    *,
+    segment_handlers: Mapping[str, Callable] | None = None,
 ) -> torch.fx.GraphModule:
     """Reconstruct an executable FX graph from a Torch-dialect MLIR module.
 
@@ -83,8 +87,12 @@ def rebuild_fx(
 
     *out_spec* restores the original FX output structure (e.g. x vs. (x,)). Without it,
     results are returned as a tuple unless there is exactly one.
+    *segment_handlers* maps private ``func.call`` targets to callables that
+    splice a compiled segment into the graph and return its result values.
+    Such a graph may contain opaque, non-executable kernel calls. ``module``
+    is not modified.
     """
-    block = _main_block(module)
+    block = _main_block(module, allow_declarations=segment_handlers is not None)
     graph = torch.fx.Graph()
     values = {}
 
@@ -110,6 +118,16 @@ def rebuild_fx(
         elif name == "torch.operator":
             qualified = ir.StringAttr(op.attributes["name"]).value
             results = _call(graph, op, qualified, operands, max_results=1)
+        elif name == "func.call" and segment_handlers is not None:
+            callee = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+            if callee not in segment_handlers:
+                raise _error(op, f"no compiled segment handler for @{callee}")
+            results = segment_handlers[callee](graph, operands)
+            if len(results) != len(op.results):
+                raise _error(
+                    op,
+                    f"@{callee} returned {len(results)} values for {len(op.results)} results",
+                )
         else:
             raise _error(op, "unsupported operation")
         for result, value in zip(op.results, results, strict=True):
@@ -119,31 +137,34 @@ def rebuild_fx(
     return torch.fx.GraphModule(torch.nn.Module(), graph)
 
 
-def _main_block(module: ir.Module) -> ir.Block:
-    """Extract the single block of the main function.
-
-    Only straight-line programs with the following structure are supported:
-
-        module {
-            func.func @main(<args>) -> <result_types> {
-                <ops>
-                return <results>
-            }
-        }
-    """
+def _main_block(module: ir.Module, *, allow_declarations: bool = False) -> ir.Block:
+    """Find the entry block, allowing private segment declarations for drivers."""
     ops = list(module.body.operations)
+    functions = [op for op in ops if op.operation.name == "func.func"]
+    mains = [
+        op
+        for op in functions
+        if ir.StringAttr(op.attributes["sym_name"]).value == "main"
+    ]
+    declarations = [op for op in functions if op not in mains]
     if (
-        len(ops) != 1
-        or ops[0].operation.name != "func.func"
-        or ir.StringAttr(ops[0].attributes["sym_name"]).value != "main"
+        len(functions) != len(ops)
+        or len(mains) != 1
+        or (declarations and not allow_declarations)
+        or any(
+            "sym_visibility" not in op.attributes
+            or ir.StringAttr(op.attributes["sym_visibility"]).value != "private"
+            or len(op.regions[0].blocks) != 0
+            for op in declarations
+        )
     ):
         raise NotImplementedError(
             "Expected a module containing exactly one func.func @main"
         )
-    (region,) = ops[0].regions
+    (region,) = mains[0].regions
     blocks = list(region.blocks)
     if len(blocks) != 1:
-        raise _error(ops[0], f"expected 1 block, found {len(blocks)}")
+        raise _error(mains[0], f"expected 1 block, found {len(blocks)}")
     return blocks[0]
 
 
