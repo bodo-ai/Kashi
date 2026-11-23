@@ -79,13 +79,15 @@ check-format-cpp = '''bash -c 'find cpp -type f \( -name "*.cpp" -o -name "*.cc"
 lint-cpp = '''
 bash -c 'set -e
 nanobind_dir=$(python -m nanobind --cmake_dir)
-cmake -S . -B build/lint-cpp -G Ninja \
+build_dir=${KASHI_LINT_BUILD_DIR:-build/lint-cpp}
+cmake -S . -B "$build_dir" -G Ninja \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
     -DKASHI_BUILD_TESTS=ON -DKASHI_LINT=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+    -DPython3_EXECUTABLE="$CONDA_PREFIX/bin/python" \
     -Dnanobind_DIR="$nanobind_dir" -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
-cmake --build build/lint-cpp'
+cmake --build "$build_dir"'
 '''
 lint = { depends-on = ["check-format-python", "lint-python", "check-format-cpp", "lint-cpp"] }
 

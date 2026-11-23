@@ -1,9 +1,10 @@
 #include "kashi/iree_compiler.h"
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/filesystem.h>
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/string.h>
+// These headers provide nanobind type-caster specializations, not named APIs.
+#include <nanobind/stl/filesystem.h> // IWYU pragma: keep
+#include <nanobind/stl/optional.h>   // IWYU pragma: keep
+#include <nanobind/stl/string.h>     // IWYU pragma: keep
 
 /// Define the private Python interface to the embedded IREE compiler.
 NB_MODULE(_native, m) {

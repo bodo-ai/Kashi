@@ -36,11 +36,15 @@ struct VerifySegments final
   }
 };
 
+// Test-only op: constructing it and recognizing its C++ type checks that the
+// private plugin actually registered operations in the invocation's context,
+// not just the dialect namespace. It carries no compiler data and is erased
+// by ProbeTorch before lowering resumes.
 class ProbeOp final : public Op<ProbeOp> {
 public:
   using Op::Op;
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ProbeOp)
-  /// Name the temporary operation used to verify typed dialect registration.
+  /// Name the temporary operation.
   static StringRef getOperationName() { return "kashi.probe"; }
   /// The probe has no attributes and carries no compilation state.
   static ArrayRef<StringRef> getAttributeNames() { return {}; }
@@ -58,6 +62,8 @@ public:
   static StringRef getDialectNamespace() { return "kashi"; }
 };
 
+// The remaining passes are test-only. The embedding code selects them through
+// IreeTestPipeline; normal compilation runs only VerifySegments.
 template <typename Derived, typename OpType>
 struct Probe : PassWrapper<Derived, OperationPass<ModuleOp>> {
 private:
@@ -77,6 +83,8 @@ public:
   }
 };
 
+// Verify that the start checkpoint exposes typed Torch IR before IREE lowers
+// it, and that the same invocation can construct a registered Kashi op.
 struct ProbeTorch final : Probe<ProbeTorch, torch::Torch::AtenReluOp> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ProbeTorch)
   /// Identify the typed Torch probe run before input lowering.
@@ -101,14 +109,17 @@ struct ProbeTorch final : Probe<ProbeTorch, torch::Torch::AtenReluOp> {
   }
 };
 
+// Verify that the Flow checkpoint exposes typed dispatches before Stream
+// lowering, rather than merely accepting the registered pass name.
 struct ProbeFlow final : Probe<ProbeFlow, IREE::Flow::DispatchOp> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ProbeFlow)
   /// Identify the dispatch probe run before Stream lowering.
   StringRef getArgument() const override { return "kashi-probe-flow"; }
 };
 
-// Give independent executables the same local function name before linking.
-// Their original Flow export names and dispatch references remain different.
+// Exercise the CUDA manifest join with two executable-local functions named
+// alike. Leave the Flow export and dispatch names intact so the test can
+// verify that both original dispatch targets map to distinct linked entries.
 struct CollideFlowFunctions final
     : PassWrapper<CollideFlowFunctions, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CollideFlowFunctions)

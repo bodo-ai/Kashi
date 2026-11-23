@@ -48,8 +48,12 @@ runs the same command on pushes and pull requests.
 
 Ruff handles Python formatting and linting. C++ uses clang-format with
 LLVM style and clang-tidy on the project targets in `build/lint-cpp/`.
-Clang-tidy checks headers included by those targets and treats reported
-warnings as errors.
+Clang-tidy reports unused direct C++ includes, checks project headers included
+by those targets, and treats reported warnings as errors.
+Run `pixi install --locked` before using the hooks; they use the installed tools.
+The `clang-tidy` pre-commit hook runs the same CMake lint task on C++ changes.
+The first run builds the pinned IREE dependencies; later runs reuse that build.
+Set `KASHI_LINT_BUILD_DIR` to reuse an existing compatible Ninja build.
 
 ## Qwen3 with vLLM
 

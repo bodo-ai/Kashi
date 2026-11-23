@@ -31,9 +31,10 @@ LogicalResult writeFile(OpState op, const std::filesystem::path &path,
                         llvm::function_ref<void(llvm::raw_ostream &)> write) {
   std::error_code error;
   llvm::raw_fd_ostream out(path.string(), error);
-  if (error)
+  if (error) {
     return op.emitError("cannot open ")
            << path.string() << ": " << error.message();
+  }
   write(out);
   out.close();
   if (out.has_error()) {

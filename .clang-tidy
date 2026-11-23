@@ -1,5 +1,6 @@
-Checks: '-*,clang-analyzer-*,bugprone-*,readability-function-size'
+Checks: '-*,clang-analyzer-*,bugprone-*,misc-include-cleaner,readability-function-size'
 WarningsAsErrors: '*'
 HeaderFilterRegex: '(^|/)cpp/'
 CheckOptions:
+  misc-include-cleaner.MissingIncludes: false
   readability-function-size.LineThreshold: 65

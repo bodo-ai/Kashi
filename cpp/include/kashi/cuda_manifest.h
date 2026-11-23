@@ -19,9 +19,11 @@ struct KernelIdentity {
   llvm::StringRef stableName;
 };
 
-// Preserve the original Flow keys, then rename functions and exports so those
-// keys can still be resolved after CUDA linking merges executable namespaces.
-// Call only after saving the original Flow snapshot.
+// For each dispatch target (Flow executable symbol + export symbol), record
+// the original pair and assign a unique name to the function and export so
+// the kernel is still identifiable after CUDA links the executables together.
+// Save flow.mlir first: FX reassembly reads the original references from that
+// file and uses them as manifest keys. Only the in-memory IR is renamed.
 mlir::FailureOr<std::vector<KernelIdentity>>
 identifyCudaKernels(mlir::ModuleOp module);
 

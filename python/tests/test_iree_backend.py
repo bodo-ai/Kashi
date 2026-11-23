@@ -73,7 +73,10 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(
     from kashi.iree_backend import compile_iree_fx
     from kashi.iree_reassembly import IreeKernel
 
-    monkeypatch.setenv("PATH", "")
+    # Compilation must not depend on finding iree-compile or ptxas on PATH.
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
 
     compiled = compile_iree_fx(
         _graph_with_mutating_boundary(), output_dir=tmp_path, cuda_target="sm_80"
@@ -102,6 +105,7 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(
         assert re.search(
             rf"\.entry\s+{re.escape(kernel['entry'])}\s*\(", path.read_text()
         )
+        assert node.meta["iree_ptx_file"] == path
         assert node.meta["iree_ptx_entry"] == kernel["entry"]
         assert kernel["entry"] != node.target.export
     assert len(linked_files) == 1 and len(kernels) >= 2

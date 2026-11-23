@@ -1,3 +1,11 @@
+// Split the single-block Torch @main at torch.operator boundaries. Outline
+// each nonempty run into a compilable function: SSA uses determine its ordered
+// inputs and outputs, and needed constants are cloned into the function.
+// Build a separate driver for FX reassembly by replaying the source order,
+// replacing each outlined run with a call and leaving custom ops in place.
+// Remap call results to their original SSA values so later calls and custom
+// ops consume the same values as before partitioning.
+
 #include "kashi/iree_partition.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"

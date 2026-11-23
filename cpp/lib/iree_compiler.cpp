@@ -55,8 +55,9 @@ struct Diagnostics {
   std::ofstream log;
   std::mutex mutex;
 
-  // The embedding API allows callbacks from any thread until invocation
-  // destruction. Serialize complete records and writes in fail() to the log.
+  // IREE may deliver diagnostics from worker threads. Keep each record intact
+  // and prevent concurrent writes to this invocation's stream, including
+  // writes from fail(). This does not lock or serialize compilation.
   static void receive(iree_compiler_diagnostic_severity_t severity,
                       const char *text, size_t size, void *data) {
     auto &self = *static_cast<Diagnostics *>(data);
@@ -84,8 +85,9 @@ struct Diagnostics {
 
   /// Consume an embedding API error and translate it into a stage failure.
   void check(CompilerError error, const llvm::Twine &stage) {
-    if (error)
+    if (error) {
       fail(stage, ireeCompilerErrorGetMessage(error.get()));
+    }
   }
 
   template <typename Error = std::runtime_error, typename T>
@@ -136,7 +138,9 @@ const BackendConfig &getBackendConfig(const IreeCompileOptions &options,
 Session createSession(const BackendConfig &backend,
                       const std::optional<std::string> &architecture,
                       Diagnostics &diagnostics) {
-  // The private compiler lacks a host HAL driver for constant evaluation.
+  // Keep the embedded pipeline from running IREE's JIT of constant
+  // initializers on the host. This disables runtime-backed evaluation via
+  // the local-task CPU driver, not ordinary IR constant folding.
   llvm::SmallVector<const char *, 6> flags = {"--iree-plugin=kashi",
                                               "--iree-input-type=torch",
                                               "--iree-opt-const-eval=false"};
@@ -224,8 +228,9 @@ void writeArtifact(const fs::path &path, Diagnostics &diagnostics,
                    const llvm::Twine &stage, Emit emit) {
   std::error_code error;
   llvm::raw_fd_ostream out(path.string(), error);
-  if (error)
+  if (error) {
     diagnostics.fail(stage, error.message());
+  }
   // A buffered write may first fail on close. Clear that error before the
   // LLVM stream destructor can turn it into a fatal usage error.
   const auto result = emit(out);
@@ -235,8 +240,9 @@ void writeArtifact(const fs::path &path, Diagnostics &diagnostics,
     out.clear_error();
     std::error_code ignored;
     fs::remove(path, ignored);
-    if (error)
+    if (error) {
       diagnostics.fail(stage, error.message());
+    }
     diagnostics.fail(stage);
   }
 }
@@ -312,6 +318,8 @@ std::vector<KernelIdentity> captureFlow(Invocation &invocation,
                                         IreeBackend backend,
                                         Diagnostics &diagnostics) {
   auto flow = invocation.takeModule();
+  // FX reassembly reads dispatch references from this snapshot. Save it before
+  // renaming the in-memory symbols so those references match the manifest keys.
   writeArtifact(dir / "flow.mlir", diagnostics, "write Flow snapshot",
                 [&](llvm::raw_ostream &out) {
                   flow->print(out);

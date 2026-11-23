@@ -68,6 +68,24 @@ def _cuda_target(cuda_target: str | None) -> str:
     return f"sm_{major}{minor}"
 
 
+def _annotate_ptx_metadata(
+    graph: torch.fx.GraphModule,
+    artifact_dir: Path,
+    manifest: dict[str, dict[str, dict[str, str]]],
+) -> None:
+    """Attach the linked PTX image and entry to each opaque kernel call."""
+    for node in graph.graph.nodes:
+        target = node.target
+        if not isinstance(target, IreeKernel):
+            continue
+        try:
+            kernel = manifest[target.executable][target.export]
+        except KeyError as error:
+            raise RuntimeError(f"Missing linked CUDA kernel: {target}") from error
+        node.meta["iree_ptx_file"] = artifact_dir / kernel["file"]
+        node.meta["iree_ptx_entry"] = kernel["entry"]
+
+
 def compile_iree_fx(
     gm: torch.fx.GraphModule,
     *,
@@ -121,16 +139,7 @@ def compile_iree_fx(
     handlers = flow_segment_handlers(flow_ir.read_text(), device=device)
     driver = ir.Module.parse((artifact_dir / "driver.mlir").read_text(), ir.Context())
     graph = rebuild_fx(driver, imported.out_spec, segment_handlers=handlers)
-    for node in graph.graph.nodes:
-        if isinstance(node.target, IreeKernel):
-            try:
-                kernel = manifest[node.target.executable][node.target.export]
-            except KeyError as error:
-                raise RuntimeError(
-                    f"Missing linked CUDA kernel: {node.target}"
-                ) from error
-            node.meta["iree_ptx_file"] = artifact_dir / kernel["file"]
-            node.meta["iree_ptx_entry"] = kernel["entry"]
+    _annotate_ptx_metadata(graph, artifact_dir, manifest)
     return IreeCompilation(
         graph, artifact_dir, flow_ir, ptx_files, kernels_ptx, kernel_manifest
     )
