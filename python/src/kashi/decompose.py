@@ -84,7 +84,7 @@ def _rms_norm(emit: _Emitter, args: list) -> dict:
 
 def _fused_add_rms_norm(emit: _Emitter, args: list) -> dict:
     """_C.fused_add_rms_norm(x, residual, weight, eps) replaced with
-    residual = x + residual, then residual = rms_norm(residual, weight, eps).
+    summed = x + residual, then normed = rms_norm(summed, weight, eps).
     """
     x, residual, weight, epsilon = args
     summed = emit(aten.add.Tensor, x, residual)
