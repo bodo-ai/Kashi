@@ -1,4 +1,4 @@
-"""Package a Release Ninja build of Kashi's pinned IREE dependency for macOS arm64."""
+"""Package a Release Ninja build of Kashi's pinned IREE dependency."""
 
 import argparse
 import os
@@ -22,15 +22,63 @@ def rule(graph, pattern):
     return dict(re.findall(r"^  (\w+) = (.*)$", match[1], re.MULTILINE))
 
 
-def copy_headers(source, destination):
+def copy_headers(source, destination, excluded_dir):
     for folder, dirs, files in os.walk(source):
-        dirs[:] = [name for name in dirs if name not in {".git", "CMakeFiles"}]
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in {".git", "CMakeFiles"}
+            and Path(folder) / name != excluded_dir
+        ]
         for name in files:
             path = Path(folder) / name
             if path.suffix in HEADER_SUFFIXES or name.startswith(("LICENSE", "NOTICE")):
                 output = destination / path.relative_to(source)
                 output.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, output)
+
+
+def platform_metadata(build, native):
+    module = next(build.glob("_native*.so"))
+    with module.open("rb") as stream:
+        header = stream.read(20)
+    if header.startswith(b"\x7fELF"):
+        # ELF64 little-endian, EM_X86_64.
+        if header[4:6] != b"\x02\x01" or header[18:20] != b"\x3e\x00":
+            raise ValueError("Linux SDK packaging requires an x86-64 build")
+        return "Linux", "x86_64", None
+    flags = shlex.split(native.get("ARCH_FLAGS", ""))
+    architectures = [flags[i + 1] for i, flag in enumerate(flags) if flag == "-arch"]
+    if architectures != ["arm64"] or "-bundle" not in native.get("LINK_FLAGS", ""):
+        raise ValueError("Expected macOS arm64 or Linux x86-64")
+    metadata = subprocess.check_output(
+        ["xcrun", "vtool", "-show-build", module], text=True
+    )
+    deployment = re.search(r"^\s*minos\s+(\S+)", metadata, re.MULTILINE)[1]
+    return "Darwin", "arm64", deployment
+
+
+def system_library(item, dependencies):
+    name = Path(item).name
+    if name == "liblzma.tbd":
+        dependencies[name] = "find_library(KASHI_SDK_LZMA NAMES lzma REQUIRED)"
+        return "${KASHI_SDK_LZMA}"
+    if Path(item).is_absolute() and re.fullmatch(
+        r"lib[\w+.-]+\.(?:a|so(?:\.[\d.]+)?)", name
+    ):
+        variable = "KASHI_SDK_" + re.sub(r"\W", "_", name)
+        # Look up the same library filename (including any SONAME), never the
+        # producer's sysroot path or a different shared/static variant.
+        dependencies[name] = (
+            f'find_file({variable} NAMES "{name}" '
+            "HINTS ${CMAKE_LIBRARY_PATH} ${CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES} "
+            "${CMAKE_C_IMPLICIT_LINK_DIRECTORIES} "
+            "PATHS ENV CONDA_PREFIX PATH_SUFFIXES lib lib64 REQUIRED)"
+        )
+        return "${" + variable + "}"
+    if re.fullmatch(r"-l[\w+.-]+|-pthread", item):
+        return item
+    raise ValueError(f"Unrecognized link dependency: {item}")
 
 
 def package(build, output):
@@ -47,18 +95,17 @@ def package(build, output):
     ):
         raise ValueError("Expected a Release Ninja source build")
     if (
-        cache.get("KashiIree_DIR")
+        cache.get("KASHI_IREE_SDK_DIR")
         or cache.get("KASHI_MUTATION") == "ON"
         or cache.get("KASHI_COVERAGE") == "ON"
     ):
         raise ValueError("Build the SDK from an uninstrumented source build")
     graph = (build / "build.ninja").read_text()
     native = rule(graph, r"_native\S*\.so: CXX_MODULE_LIBRARY_LINKER_")
-    if shlex.split(native.get("ARCH_FLAGS", ""))[:2] != [
-        "-arch",
-        "arm64",
-    ] or "-bundle" not in native.get("LINK_FLAGS", ""):
-        raise ValueError("SDK packaging currently supports macOS arm64 only")
+    system, arch, deployment = platform_metadata(build, native)
+    cuda = cache["IREE_TARGET_BACKEND_CUDA"]
+    if cuda not in {"ON", "OFF"} or (cuda == "ON" and system != "Linux"):
+        raise ValueError(f"Unexpected CUDA setting for {system}: {cuda}")
     core = rule(graph, r"CMakeFiles/kashi_core.dir/.*iree_partition\.cpp\.o: ")
     compiler_plugin = rule(
         graph, r"iree/.*kashi_iree_plugin.dir/.*registration\.cpp\.o: "
@@ -78,24 +125,29 @@ def package(build, output):
     revision = subprocess.check_output(
         ["git", "-C", source, "rev-parse", "HEAD"], text=True
     ).strip()
-    module = next(build.glob("_native*.so"))
-    metadata = subprocess.check_output(
-        ["xcrun", "vtool", "-show-build", module], text=True
-    )
-    deployment = re.search(r"^\s*minos\s+(\S+)", metadata, re.MULTILINE)[1]
 
+    cuda_notice = Path(cache["KASHI_CUDA_NOTICE"]) if cuda == "ON" else None
+    cuda_toolkit = cuda_notice.parent if cuda_notice else None
     with tempfile.TemporaryDirectory(prefix="kashi-sdk-") as temp:
         stage = Path(temp) / "iree-sdk"
         roots = {source: "source", generated: "generated"}
         for root, name in roots.items():
-            copy_headers(root, stage / name)
+            copy_headers(root, stage / name, cuda_toolkit)
+        if cuda_notice:
+            notice = stage / "licenses/CUDA.txt"
+            notice.parent.mkdir()
+            shutil.copy2(cuda_notice, notice)
         config = [
             "include_guard(GLOBAL)",
             f'set(KASHI_SDK_IREE_REVISION "{revision}")',
-            f'set(KASHI_SDK_MACOS_DEPLOYMENT_TARGET "{deployment}")',
+            f'set(KASHI_SDK_SYSTEM "{system}")',
+            f'set(KASHI_SDK_ARCH "{arch}")',
+            f'set(KASHI_SDK_CUDA "{cuda}")',
             'set(KASHI_IREE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/source")',
-            "find_library(KASHI_SDK_LZMA NAMES lzma REQUIRED)",
         ]
+        if deployment:
+            config.append(f'set(KASHI_SDK_MACOS_DEPLOYMENT_TARGET "{deployment}")')
+        dependencies = {}
         for name, compile_rule in (
             ("core", core),
             ("plugin", compiler_plugin),
@@ -135,6 +187,10 @@ def package(build, output):
                 f"target_link_libraries(KashiIree::{name} INTERFACE",
             ]
             for item in shlex.split(link_rule["LINK_LIBRARIES"]):
+                # CMake derives a new runtime search path from the resolved
+                # shared libraries; never preserve the producer's RPATH.
+                if item.startswith("-Wl,-rpath,"):
+                    continue
                 if item in {PLUGIN, "libkashi_core.a", "libnanobind-static.a"} or Path(
                     item
                 ).name.startswith("libCatch2"):
@@ -145,13 +201,11 @@ def package(build, output):
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(build / item, destination)
                     config.append(f'  "${{CMAKE_CURRENT_LIST_DIR}}/{item}"')
-                elif item.endswith("/liblzma.tbd"):
-                    config.append('  "${KASHI_SDK_LZMA}"')
-                elif item == "-lm":
-                    config.append("  -lm")
                 else:
-                    raise ValueError(f"Unrecognized link dependency: {item}")
+                    dependency = system_library(item, dependencies)
+                    config.append(f'  "{dependency}"')
             config.append(")")
+        config[1:1] = dependencies.values()
         (stage / "KashiIreeConfig.cmake").write_text("\n".join(config) + "\n")
         output.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(

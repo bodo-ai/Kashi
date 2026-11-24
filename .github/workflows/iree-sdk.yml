@@ -1,0 +1,73 @@
+name: IREE SDK archives
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            disable-cuda: '1'
+          - backend: cuda
+            disable-cuda: '0'
+    env:
+      KASHI_DISABLE_CUDA: ${{ matrix.disable-cuda }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          pixi-version: v0.82.0
+          run-install: false
+      - name: Install native build dependencies
+        run: >-
+          pixi install --locked --only python --only cmake --only ninja
+          --only catch2 --only nanobind --only cxx-compiler --only clangxx
+          --only mold
+      - name: Build, package, and verify SDK
+        env:
+          CMAKE_LINKER_TYPE: MOLD
+          SDK_BACKEND: ${{ matrix.backend }}
+        run: |
+          pixi run --locked --no-install bash -eu <<'SH'
+          archive="build/kashi-iree-sdk-linux-x86_64-${SDK_BACKEND}.tar.zst"
+          configure() {
+            cmake -S . -B "$1" -G Ninja \
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_BUILD_TYPE=Release -DKASHI_BUILD_TESTS=ON \
+              -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+              -Dnanobind_DIR="$(python -m nanobind --cmake_dir)" -DKASHI_IREE_SDK_DIR="$2"
+          }
+          configure build/sdk-producer ''
+          cmake --build build/sdk-producer --target _native kashi_native_tests
+          python scripts/package_iree_sdk.py build/sdk-producer "$archive"
+          (cd build && sha256sum "${archive##*/}" > "${archive##*/}.sha256")
+          mkdir -p build/sdk-extract
+          tar --zstd -xf "$archive" -C build/sdk-extract
+          # Remove the producer tree so it cannot hide stale references into the build.
+          rm -rf build/sdk-producer
+          configure build/sdk-consumer "$PWD/build/sdk-extract/iree-sdk"
+          cmake --build build/sdk-consumer --target _native kashi_native_tests
+          ctest --test-dir build/sdk-consumer --output-on-failure
+          PYTHONPATH="$PWD/build/sdk-consumer" python -c 'import _native'
+          cmake --install build/sdk-consumer --prefix "$PWD/build/sdk-install"
+          if [ "$SDK_BACKEND" = cuda ]; then
+            test -s build/sdk-install/kashi/licenses/CUDA.txt
+          fi
+          SH
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iree-sdk-linux-x86_64-${{ matrix.backend }}
+          path: build/kashi-iree-sdk-linux-x86_64-${{ matrix.backend }}.tar.zst*
+          compression-level: 0
+          if-no-files-found: error
