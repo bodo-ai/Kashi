@@ -4,51 +4,7 @@ if(NOT DEFINED CMAKE_LINKER_TYPE AND DEFINED ENV{CMAKE_LINKER_TYPE})
 endif()
 project(kashi LANGUAGES C CXX)
 
-if(NOT DEFINED CMAKE_C_COMPILER_LAUNCHER OR NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
-  find_program(KASHI_SCCACHE NAMES sccache)
-  if(KASHI_SCCACHE)
-    foreach(lang IN ITEMS C CXX)
-      if(NOT DEFINED CMAKE_${lang}_COMPILER_LAUNCHER)
-        set(CMAKE_${lang}_COMPILER_LAUNCHER "${KASHI_SCCACHE}")
-      endif()
-    endforeach()
-  endif()
-endif()
-
-option(KASHI_BUILD_TESTS "Build the native Catch2 tests" OFF)
-option(KASHI_MUTATION "Instrument project native code for Mull" OFF)
-option(KASHI_LINT "Run clang-tidy on project C++ sources" OFF)
-option(KASHI_COVERAGE "Instrument native tests for LLVM coverage" OFF)
-set(KASHI_MULL_PLUGIN "" CACHE FILEPATH "Mull LLVM frontend plugin")
-set(KASHI_MULL_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/mull.yml" CACHE FILEPATH "Mull mutation policy")
-
-if(KASHI_MUTATION)
-  if(NOT KASHI_BUILD_TESTS)
-    message(FATAL_ERROR "KASHI_MUTATION requires KASHI_BUILD_TESTS=ON")
-  endif()
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "KASHI_MUTATION requires Clang")
-  endif()
-  if(NOT IS_ABSOLUTE "${KASHI_MULL_PLUGIN}"
-     OR NOT EXISTS "${KASHI_MULL_PLUGIN}"
-     OR IS_DIRECTORY "${KASHI_MULL_PLUGIN}")
-    message(FATAL_ERROR "KASHI_MULL_PLUGIN must name an existing plugin file")
-  endif()
-endif()
-
-if(KASHI_LINT)
-  find_program(KASHI_CLANG_TIDY NAMES clang-tidy REQUIRED)
-endif()
-
-if(KASHI_COVERAGE)
-  if(NOT KASHI_BUILD_TESTS OR KASHI_MUTATION)
-    message(FATAL_ERROR "KASHI_COVERAGE requires tests and cannot be combined with Mull")
-  endif()
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "KASHI_COVERAGE requires Clang")
-  endif()
-  set(KASHI_COVERAGE_FLAGS -fprofile-instr-generate -fcoverage-mapping)
-endif()
+include(cmake/KashiBuildOptions.cmake)
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -56,52 +12,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(NB_HAS_MTLS_GNU2 OFF)
 endif()
 find_package(nanobind CONFIG REQUIRED)
-set(KASHI_IREE_REVISION 5332c68297a68fafd596277d7686f91009ebf1cb)
-set(KASHI_ENABLE_CUDA OFF)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT KASHI_MUTATION
-   AND NOT "$ENV{KASHI_DISABLE_CUDA}" STREQUAL "1")
-  set(KASHI_ENABLE_CUDA ON)
-endif()
-set(KASHI_IREE_SDK_DIR "$ENV{KASHI_IREE_SDK_DIR}" CACHE PATH "Extracted IREE SDK directory")
-set(_published_sdk_default OFF)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
-  set(_published_sdk_default ON)
-elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND
-       CMAKE_SYSTEM_VERSION VERSION_GREATER_EQUAL 25 AND
-       (NOT CMAKE_OSX_ARCHITECTURES OR CMAKE_OSX_ARCHITECTURES STREQUAL "arm64") AND
-       (NOT CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL 26))
-  # Darwin 25 is macOS 26, the minimum deployment target of the published SDK.
-  set(_published_sdk_default ON)
-endif()
-option(KASHI_USE_PUBLISHED_IREE_SDK "Download the pinned IREE SDK instead of building from source" ${_published_sdk_default})
-if(KASHI_USE_PUBLISHED_IREE_SDK AND NOT KASHI_IREE_SDK_DIR)
-  include(cmake/KashiIreeSdk.cmake)
-  kashi_fetch_iree_sdk(KASHI_IREE_SDK_DIR)
-endif()
-if(KASHI_IREE_SDK_DIR)
-  if(APPLE AND CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
-    message(FATAL_ERROR "The macOS IREE SDK requires an arm64-only build")
-  endif()
-  set(KashiIree_DIR "${KASHI_IREE_SDK_DIR}")
-  find_package(KashiIree CONFIG REQUIRED PATHS "${KASHI_IREE_SDK_DIR}" NO_DEFAULT_PATH)
-  if(NOT KASHI_SDK_IREE_REVISION STREQUAL KASHI_IREE_REVISION)
-    message(FATAL_ERROR "IREE SDK revision ${KASHI_SDK_IREE_REVISION} does not match ${KASHI_IREE_REVISION}")
-  endif()
-  if(NOT KASHI_SDK_SYSTEM STREQUAL CMAKE_SYSTEM_NAME OR
-     NOT KASHI_SDK_ARCH STREQUAL CMAKE_SYSTEM_PROCESSOR)
-    message(FATAL_ERROR "IREE SDK targets ${KASHI_SDK_SYSTEM}/${KASHI_SDK_ARCH}; expected ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}")
-  endif()
-  if(NOT KASHI_SDK_CUDA STREQUAL KASHI_ENABLE_CUDA)
-    message(FATAL_ERROR "IREE SDK CUDA=${KASHI_SDK_CUDA}; this build requests CUDA=${KASHI_ENABLE_CUDA} (see KASHI_DISABLE_CUDA)")
-  endif()
-  set(IREE_TARGET_BACKEND_CUDA "${KASHI_SDK_CUDA}")
-  if(CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS KASHI_SDK_MACOS_DEPLOYMENT_TARGET)
-    message(FATAL_ERROR "IREE SDK requires macOS ${KASHI_SDK_MACOS_DEPLOYMENT_TARGET} or later")
-  endif()
-  include(cpp/plugin/iree_compiler_plugin.cmake)
-else()
-  include(cmake/KashiIree.cmake)
-endif()
+include(cmake/KashiIreeSetup.cmake)
 
 set(KASHI_LIB_SOURCES
   cpp/lib/cuda_manifest.cpp
@@ -152,87 +63,8 @@ if(KASHI_COVERAGE)
   target_link_options(kashi_core INTERFACE -fprofile-instr-generate)
 endif()
 
-nanobind_add_module(_native cpp/bindings/module.cpp)
-target_link_libraries(_native PRIVATE kashi_core)
-if(KASHI_IREE_SDK_DIR)
-  target_link_libraries(_native PRIVATE kashi_iree_plugin KashiIree::native_link)
-endif()
-if(APPLE)
-  target_link_options(_native PRIVATE "LINKER:-exported_symbol,_PyInit__native")
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(exports "${CMAKE_CURRENT_BINARY_DIR}/_native.exports")
-  file(GENERATE OUTPUT "${exports}" CONTENT "{ global: PyInit__native; local: *; };\n")
-  target_link_options(_native PRIVATE "LINKER:--version-script=${exports}")
-  set_property(TARGET _native APPEND PROPERTY LINK_DEPENDS "${exports}")
-else()
-  message(FATAL_ERROR "The private compiler supports Linux and macOS")
-endif()
-if(KASHI_LINT)
-  set_property(TARGET _native PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
-endif()
-install(TARGETS _native LIBRARY DESTINATION kashi RUNTIME DESTINATION kashi)
-install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/mlir/LICENSE.TXT"
-  DESTINATION kashi/licenses RENAME MLIR.txt)
-install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/flatcc/LICENSE"
-  DESTINATION kashi/licenses RENAME FlatCC.txt)
-if(IREE_TARGET_BACKEND_CUDA)
-  if(KASHI_IREE_SDK_DIR)
-    set(KASHI_CUDA_NOTICE "${KASHI_IREE_SDK_DIR}/licenses/CUDA.txt")
-  else()
-    find_file(KASHI_CUDA_NOTICE NAMES EULA.txt LICENSE
-      HINTS "$ENV{IREE_CUDA_DEPS_DIR}" "${CUDAToolkit_BIN_DIR}/.."
-      NO_DEFAULT_PATH REQUIRED)
-  endif()
-  install(FILES "${KASHI_CUDA_NOTICE}" DESTINATION kashi/licenses RENAME CUDA.txt)
-endif()
-install(FILES "${KASHI_IREE_SOURCE_DIR}/LICENSE" DESTINATION kashi/licenses RENAME IREE.txt)
-install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/llvm/LICENSE.TXT"
-  DESTINATION kashi/licenses RENAME LLVM.txt)
-install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/torch-mlir/LICENSE"
-  DESTINATION kashi/licenses RENAME Torch-MLIR.txt)
+include(cmake/KashiPythonExtension.cmake)
 
 if(KASHI_BUILD_TESTS)
-  enable_testing()
-  find_package(Catch2 3 CONFIG REQUIRED)
-  list(APPEND CMAKE_MODULE_PATH "${Catch2_DIR}")
-  include(Catch)
-
-  file(GLOB_RECURSE KASHI_TEST_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cxx")
-  if(KASHI_TEST_SOURCES)
-    add_executable(kashi_native_tests ${KASHI_TEST_SOURCES})
-    if(KASHI_IREE_SDK_DIR)
-      target_link_libraries(kashi_native_tests PRIVATE
-        kashi_core Catch2::Catch2WithMain kashi_iree_plugin KashiIree::tests KashiIree::test_link)
-    else()
-      target_include_directories(kashi_native_tests SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
-      target_link_libraries(kashi_native_tests PRIVATE
-        kashi_core Catch2::Catch2WithMain
-        iree::compiler::Dialect::HAL::IR
-        iree::compiler::Utils
-        iree::schemas::cuda_executable_def_c_fbs
-        iree::schemas::executable_debug_info_c_fbs)
-    endif()
-    if(IREE_TARGET_BACKEND_CUDA)
-      target_compile_definitions(kashi_native_tests PRIVATE KASHI_TEST_CUDA_CODEGEN)
-    endif()
-    if(KASHI_LINT)
-      set_property(TARGET kashi_native_tests PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
-    endif()
-    if(KASHI_MUTATION)
-      # The Mull policy excludes test sources while permitting inline project headers.
-      target_compile_options(kashi_native_tests PRIVATE
-        -O0 -g -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
-      set_property(SOURCE ${KASHI_TEST_SOURCES} APPEND PROPERTY OBJECT_DEPENDS
-        "${KASHI_MULL_CONFIG};${KASHI_MULL_PLUGIN}")
-    endif()
-    if(KASHI_COVERAGE)
-      # Instrument test translation units for coverage of inline project headers.
-      target_compile_options(kashi_native_tests PRIVATE ${KASHI_COVERAGE_FLAGS})
-      target_link_options(kashi_native_tests PRIVATE -fprofile-instr-generate)
-    endif()
-    catch_discover_tests(kashi_native_tests)
-  endif()
+  include(cmake/KashiNativeTests.cmake)
 endif()
