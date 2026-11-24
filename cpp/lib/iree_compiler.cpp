@@ -3,6 +3,25 @@
 // for Python to rebuild FX. At selected phase boundaries we run registered
 // Kashi passes and capture artifacts, then resume on the same invocation
 // without serializing IR between phases.
+//
+//   Python: import FX as Torch MLIR
+//                  |
+//                  v
+//   Native: parse and partition --------------------> driver MLIR ---+
+//                  |                                                 |
+//           segment module                                           |
+//                  v                                                 |
+//   +--> IREE: lower to next checkpoint                              |
+//   |              |                                                 |
+//   |              v                                                 |
+//   |    Run checkpointPasses() <--- static Kashi plugin             |
+//   |              |                 registers pass names            |
+//   |              v                                                 |
+//   |    Capture artifacts as needed --> Flow MLIR and CUDA PTX      |
+//   |              |                     manifest -------------------+
+//   +------ resume from this phase                                   |
+//                                                                    v
+//                                                        Python: rebuild FX
 
 #include "kashi/iree_compiler.h"
 #include "kashi/cuda_manifest.h"
