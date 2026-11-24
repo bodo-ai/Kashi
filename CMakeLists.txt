@@ -56,7 +56,25 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(NB_HAS_MTLS_GNU2 OFF)
 endif()
 find_package(nanobind CONFIG REQUIRED)
-include(cmake/KashiIree.cmake)
+set(KASHI_IREE_REVISION 5332c68297a68fafd596277d7686f91009ebf1cb)
+set(KASHI_IREE_SDK_DIR "$ENV{KASHI_IREE_SDK_DIR}" CACHE PATH "Extracted IREE SDK directory")
+if(KASHI_IREE_SDK_DIR)
+  if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR
+     (CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+    message(FATAL_ERROR "The IREE SDK currently supports macOS arm64 only")
+  endif()
+  set(KashiIree_DIR "${KASHI_IREE_SDK_DIR}")
+  find_package(KashiIree CONFIG REQUIRED PATHS "${KASHI_IREE_SDK_DIR}" NO_DEFAULT_PATH)
+  if(NOT KASHI_SDK_IREE_REVISION STREQUAL KASHI_IREE_REVISION)
+    message(FATAL_ERROR "IREE SDK revision ${KASHI_SDK_IREE_REVISION} does not match ${KASHI_IREE_REVISION}")
+  endif()
+  if(CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS KASHI_SDK_MACOS_DEPLOYMENT_TARGET)
+    message(FATAL_ERROR "IREE SDK requires macOS ${KASHI_SDK_MACOS_DEPLOYMENT_TARGET} or later")
+  endif()
+  include(cpp/plugin/iree_compiler_plugin.cmake)
+else()
+  include(cmake/KashiIree.cmake)
+endif()
 
 set(KASHI_LIB_SOURCES
   cpp/lib/cuda_manifest.cpp
@@ -74,23 +92,26 @@ if(KASHI_LINT)
 endif()
 target_include_directories(kashi_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include")
 target_compile_features(kashi_core PUBLIC cxx_std_17)
-target_link_libraries(kashi_core PRIVATE
-  iree::compiler::API::StaticImpl
-  iree::compiler::Dialect::Flow::IR
-  iree::compiler::Dialect::HAL::IR
-  iree::hal::utils::executable_header
-  iree::schemas::cuda_executable_def_c_fbs
-  iree::schemas::executable_debug_info_c_fbs
-  iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR)
-set(KASHI_IREE_INCLUDE_DIRS
-  "${KASHI_IREE_SOURCE_DIR}/compiler/bindings/c"
-  "${KASHI_IREE_SOURCE_DIR}/compiler/src"
-  "${CMAKE_CURRENT_BINARY_DIR}/iree/compiler/src"
-  "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/llvm/include"
-  "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/mlir/include"
-  "${CMAKE_CURRENT_BINARY_DIR}/iree/llvm-project/include"
-  "${CMAKE_CURRENT_BINARY_DIR}/iree/llvm-project/tools/mlir/include")
-target_include_directories(kashi_core SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
+if(KASHI_IREE_SDK_DIR)
+  target_link_libraries(kashi_core PRIVATE KashiIree::core)
+else()
+  target_link_libraries(kashi_core PRIVATE
+    iree::compiler::API::StaticImpl
+    iree::compiler::Dialect::Flow::IR
+    iree::compiler::Dialect::HAL::IR
+    iree::hal::utils::executable_header
+    iree::schemas::cuda_executable_def_c_fbs
+    iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR)
+  set(KASHI_IREE_INCLUDE_DIRS
+    "${KASHI_IREE_SOURCE_DIR}/compiler/bindings/c"
+    "${KASHI_IREE_SOURCE_DIR}/compiler/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/iree/compiler/src"
+    "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/llvm/include"
+    "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/mlir/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/iree/llvm-project/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/iree/llvm-project/tools/mlir/include")
+  target_include_directories(kashi_core SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
+endif()
 if(KASHI_MUTATION)
   target_compile_options(kashi_core PRIVATE
     -O0 -g -UNDEBUG -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
@@ -105,6 +126,9 @@ endif()
 
 nanobind_add_module(_native cpp/bindings/module.cpp)
 target_link_libraries(_native PRIVATE kashi_core)
+if(KASHI_IREE_SDK_DIR)
+  target_link_libraries(_native PRIVATE kashi_iree_plugin KashiIree::native_link)
+endif()
 if(APPLE)
   target_link_options(_native PRIVATE "LINKER:-exported_symbol,_PyInit__native")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -147,13 +171,18 @@ if(KASHI_BUILD_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cxx")
   if(KASHI_TEST_SOURCES)
     add_executable(kashi_native_tests ${KASHI_TEST_SOURCES})
-    target_include_directories(kashi_native_tests SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
-    target_link_libraries(kashi_native_tests PRIVATE
-      kashi_core Catch2::Catch2WithMain
-      iree::compiler::Dialect::HAL::IR
-      iree::compiler::Utils
-      iree::schemas::cuda_executable_def_c_fbs
-      iree::schemas::executable_debug_info_c_fbs)
+    if(KASHI_IREE_SDK_DIR)
+      target_link_libraries(kashi_native_tests PRIVATE
+        kashi_core Catch2::Catch2WithMain kashi_iree_plugin KashiIree::tests KashiIree::test_link)
+    else()
+      target_include_directories(kashi_native_tests SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
+      target_link_libraries(kashi_native_tests PRIVATE
+        kashi_core Catch2::Catch2WithMain
+        iree::compiler::Dialect::HAL::IR
+        iree::compiler::Utils
+        iree::schemas::cuda_executable_def_c_fbs
+        iree::schemas::executable_debug_info_c_fbs)
+    endif()
     if(IREE_TARGET_BACKEND_CUDA)
       target_compile_definitions(kashi_native_tests PRIVATE KASHI_TEST_CUDA_CODEGEN)
     endif()

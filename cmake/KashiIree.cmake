@@ -1,6 +1,5 @@
 find_package(Git REQUIRED)
 
-set(KASHI_IREE_REVISION 5332c68297a68fafd596277d7686f91009ebf1cb)
 set(KASHI_IREE_SOURCE_DIR "" CACHE PATH "Local checkout of pinned IREE and its submodules")
 
 # Check the pinned revision and submodules without updating the checkout.

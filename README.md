@@ -21,6 +21,42 @@ The rebuild uses an isolated Python build environment.
 
 Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available.
 
+### Reuse a local IREE SDK (macOS arm64)
+
+The default build compiles IREE from source. To reuse its static libraries across
+build trees, create an SDK from a completed, uninstrumented Release Ninja build
+with native tests enabled. For example, from a Pixi shell on Apple silicon:
+
+```sh
+cmake -S . -B build/sdk-producer -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DCMAKE_BUILD_TYPE=Release -DKASHI_BUILD_TESTS=ON -DKASHI_IREE_SDK_DIR= \
+  -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+  -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+cmake --build build/sdk-producer --target _native kashi_native_tests
+python scripts/package_iree_sdk.py build/sdk-producer build/kashi-iree-sdk.tar.zst
+shasum -a 256 build/kashi-iree-sdk.tar.zst
+mkdir -p build/sdk-extract
+tar --zstd -xf build/kashi-iree-sdk.tar.zst -C build/sdk-extract
+```
+
+In a fresh CMake build directory, pass
+`-DKASHI_IREE_SDK_DIR="$PWD/build/sdk-extract/iree-sdk"` with the same toolchain
+and deployment target. For an editable reinstall, pass that option through
+`CMAKE_ARGS` so it overrides any cached CMake value:
+
+```sh
+CMAKE_ARGS="-DKASHI_IREE_SDK_DIR=$PWD/build/sdk-extract/iree-sdk" \
+  pixi run python -m pip install --no-deps -e .
+```
+
+The SDK includes upstream libraries, not Kashi's plugin object. The consumer
+compiles that object and resolves the builtin registration symbol expected by
+IREE's plugin manager. Rebuild the SDK when the IREE pin, toolchain, build flags,
+or builtin registration contract changes, not for ordinary Kashi pass edits.
+Linux and CI publishing still use the source-build path.
+
 ## vLLM and MLIR development
 
 The default Pixi environment selects a locked platform based on the host. GPU variants take priority over the CPU fallback:
