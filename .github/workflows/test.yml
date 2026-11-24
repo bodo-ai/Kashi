@@ -70,7 +70,7 @@ jobs:
         id: pixi
         with:
           pixi-version: v0.82.0
-          locked: true
+          locked: ${{ runner.os == 'Linux' }}
           run-install: ${{ runner.os == 'Linux' }}
           environments: ${{ runner.os == 'Linux' && 'default cpp-coverage' || 'default' }}
           cache-key: pixi-test-${{ hashFiles('cmake/iree-sdk.json') }}-
