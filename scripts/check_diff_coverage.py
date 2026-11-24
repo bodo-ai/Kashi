@@ -11,7 +11,8 @@ from xml.etree import ElementTree
 REPORTS = Path("build/coverage")
 PYTHON = Path("python/src/kashi")
 NATIVE = (Path("cpp/lib"), Path("cpp/include"))
-SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+CPP_HEADERS = {".h", ".hh", ".hpp", ".hxx"}
+SUFFIXES = {".cpp", ".cc", ".cxx"} | CPP_HEADERS
 HUNK = re.compile(rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
 
@@ -48,7 +49,7 @@ def native_lines(root):
     return {
         path.relative_to(root): lines
         for path, lines in result.items()
-        if path.is_relative_to(root)
+        if lines and path.is_relative_to(root)
     }
 
 
@@ -105,6 +106,9 @@ def main():
                 reports[reader] = {}
         lines = reports[reader].get(path)
         if lines is None:
+            # LLVM does not emit line records for declaration-only headers.
+            if path.suffix in CPP_HEADERS and reports[reader]:
+                continue
             print(f"- `{path}`: no line coverage data")
             missing = True
             continue

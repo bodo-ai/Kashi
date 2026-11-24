@@ -239,9 +239,11 @@ Python, `cpp.txt` and (when coverage is available) `cpp.json` and `cpp.lcov` for
 Actions posts a summary and uploads the machine-readable reports and native
 summary as `coverage-reports`. On pull requests, more than 90% of added or
 modified executable lines must be covered across `python/src/kashi/`,
-`cpp/lib/`, and `cpp/include/`. Lines are compared against the PR base; a
-changed source file with no coverage data fails the check. Test-only changes
-do not affect the percentage. Push runs report coverage without enforcing it.
+`cpp/lib/`, and `cpp/include/`. Lines are compared against the PR base.
+Missing coverage data fails the check for changed C++ translation units and
+Python files. With a native report present, headers without LLVM line records
+contribute no executable lines. Test-only changes do not affect the
+percentage. Push runs report coverage without enforcing it.
 
 
 ## Native mutation testing
