@@ -35,12 +35,11 @@ jobs:
         with:
           pixi-version: v0.82.0
           locked: true
+          cache-key: pixi-lint-${{ hashFiles('cmake/iree-sdk.json') }}-
       - name: Check Python and C++
         run: pixi run --locked lint
 
   test:
-    # Lint builds the editable package first, warming sccache for matching Linux compilations.
-    needs: lint
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -51,7 +50,7 @@ jobs:
             runner: ubuntu-24.04
             architecture: x86_64
           - name: macOS Apple silicon
-            runner: macos-15
+            runner: macos-26
             architecture: arm64
     steps:
       - uses: actions/checkout@v6
@@ -63,15 +62,29 @@ jobs:
       - *sccache
       - *mold
       - uses: prefix-dev/setup-pixi@v0.11.3
+        if: runner.os == 'Linux'
         id: pixi
         with:
           pixi-version: v0.82.0
           locked: true
-          environments: ${{ runner.os == 'Linux' && 'default cpp-coverage' || 'default' }}
-          cache-key: pixi-test-
+          environments: default cpp-coverage
+          cache-key: pixi-test-${{ hashFiles('cmake/iree-sdk.json') }}-
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        if: runner.os == 'macOS'
+        with:
+          pixi-version: v0.82.0
+          run-install: false
+      - name: Install macOS dependencies and editable package
+        if: runner.os == 'macOS'
+        # Pixi resolves against the locked macOS 14 target. Pip uses the
+        # runner's actual platform when installing our macOS 26 editable wheel.
+        run: |
+          pixi install --locked --skip kashi
+          MACOSX_DEPLOYMENT_TARGET=26.0 CMAKE_ARGS=-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            pixi run --locked --no-install python -m pip install --no-deps -e .
       - name: Python tests
         if: runner.os != 'Linux'
-        run: pixi run --locked test-python
+        run: pixi run --locked --no-install test-python
       - name: Python tests with coverage
         if: runner.os == 'Linux'
         run: pixi run --locked coverage-python
@@ -81,7 +94,9 @@ jobs:
         run: rm -rf build/scikit
       - name: Native tests
         if: runner.os != 'Linux'
-        run: pixi run --locked test-cpp
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '26.0'
+        run: pixi run --locked --no-install test-cpp
       - name: Native tests with coverage
         if: runner.os == 'Linux'
         run: pixi run --locked --no-install -e cpp-coverage coverage-cpp

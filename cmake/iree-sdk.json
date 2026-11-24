@@ -1,0 +1,9 @@
+{
+  "revision": "5332c68297a68fafd596277d7686f91009ebf1cb",
+  "base_url": "https://kashi-iree-sdk-427443013497-us-east-2.s3.us-east-2.amazonaws.com",
+  "sha256": {
+    "darwin-arm64-cpu": "64c4405cfc7c2092b36bb82134db3aa4eef26b922b7f697f932cb3faffe5eef8",
+    "linux-x86_64-cpu": "9291fee6ca8613974a92fe59f2cf3a84976ad778ab63bc82651f4e61f6b1ac46",
+    "linux-x86_64-cuda": "6965fc29105f036051a80d9fffb76a10c143a216cae7f652bd559deebbbeabe8"
+  }
+}

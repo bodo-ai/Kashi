@@ -21,6 +21,71 @@ The rebuild uses an isolated Python build environment.
 
 Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available.
 
+### IREE compiler SDK
+
+CMake downloads the pinned IREE SDK by default on Linux x86-64 and compatible
+macOS arm64 builds (macOS and deployment target 26 or newer). It verifies
+SHA-256 before extraction and shares the extracted SDK across build trees in
+`~/.cache/kashi/iree-sdk` (or `$XDG_CACHE_HOME/kashi/iree-sdk`). Downloads are
+anonymous; neither developers nor CI need AWS credentials.
+
+Linux uses the CUDA codegen SDK by default. Set `KASHI_DISABLE_CUDA=1` to use
+the CPU SDK. Neither SDK needs a GPU to build the extension or run compiler-only
+tests. Use `-DKASHI_USE_PUBLISHED_IREE_SDK=OFF` to build IREE from source, or
+`-DKASHI_IREE_SDK_DIR=/path/to/iree-sdk` to use an already extracted SDK.
+For an editable reinstall, pass these CMake options through `CMAKE_ARGS`.
+
+#### Build or update the archives
+
+From a Pixi shell, build an uninstrumented Release Ninja configuration with
+native tests enabled. Use the same toolchain and sysroot as its consumers.
+On macOS, pass `-DCMAKE_OSX_ARCHITECTURES=arm64` and explicitly select the
+minimum deployment target for the archive.
+
+```sh
+cmake -S . -B build/sdk-producer -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release -DKASHI_BUILD_TESTS=ON -DKASHI_IREE_SDK_DIR= \
+  -DKASHI_USE_PUBLISHED_IREE_SDK=OFF \
+  -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+  -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
+cmake --build build/sdk-producer --target _native kashi_native_tests
+python scripts/package_iree_sdk.py build/sdk-producer build/kashi-iree-sdk.tar.zst
+shasum -a 256 build/kashi-iree-sdk.tar.zst
+mkdir -p build/sdk-extract
+tar --zstd -xf build/kashi-iree-sdk.tar.zst -C build/sdk-extract
+```
+
+On Linux, CUDA codegen is enabled by default. Build and consume the CPU SDK
+with `KASHI_DISABLE_CUDA=1`; leave it unset for CUDA. Use separate build and
+extraction directories for the two variants. The CUDA producer needs IREE's
+CUDA toolkit dependencies (IREE downloads them if not provided); the SDK
+consumer does not need the toolkit or a GPU for compiler-only use. The CUDA
+SDK carries the notice for the libdevice bitcode embedded in its libraries.
+
+In a fresh CMake build directory, pass
+`-DKASHI_IREE_SDK_DIR="$PWD/build/sdk-extract/iree-sdk"` with the same toolchain
+and deployment target or Linux sysroot. For an editable reinstall, pass that
+option through `CMAKE_ARGS` so it overrides any cached CMake value:
+
+```sh
+CMAKE_ARGS="-DKASHI_IREE_SDK_DIR=$PWD/build/sdk-extract/iree-sdk" \
+  pixi run python -m pip install --no-deps -e .
+```
+
+The SDK includes upstream libraries, not Kashi's plugin object. The consumer
+compiles that object and resolves the builtin registration symbol expected by
+IREE's plugin manager. Rebuild the SDK when the IREE pin, toolchain, build flags,
+or builtin registration contract changes, not for ordinary Kashi pass edits.
+
+The manual **IREE SDK archives** GitHub Actions workflow builds and verifies
+both Linux variants and uploads the archives and SHA-256 files as run artifacts.
+To publish, upload verified archives to the SDK bucket at
+`<IREE revision>/<SHA-256>/kashi-iree-sdk-<system>-<arch>-<backend>.tar.zst`,
+then update `cmake/iree-sdk.json`. When changing the IREE revision, also grant
+anonymous HTTPS object reads for the new revision prefix. Keep older objects
+so older branches and rollbacks continue to work.
+
 ## vLLM and MLIR development
 
 The default Pixi environment selects a locked platform based on the host. GPU variants take priority over the CPU fallback:
