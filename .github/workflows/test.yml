@@ -61,11 +61,6 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - *sccache
       - *mold
-      - name: Set macOS IREE SDK deployment target
-        if: runner.os == 'macOS'
-        run: |
-          echo 'MACOSX_DEPLOYMENT_TARGET=26.0' >> "$GITHUB_ENV"
-          echo 'CMAKE_ARGS=-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0' >> "$GITHUB_ENV"
       - uses: prefix-dev/setup-pixi@v0.11.3
         if: runner.os == 'Linux'
         id: pixi
@@ -85,7 +80,8 @@ jobs:
         # runner's actual platform when installing our macOS 26 editable wheel.
         run: |
           pixi install --locked --skip kashi
-          pixi run --locked --no-install python -m pip install --no-deps -e .
+          MACOSX_DEPLOYMENT_TARGET=26.0 CMAKE_ARGS=-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            pixi run --locked --no-install python -m pip install --no-deps -e .
       - name: Python tests
         if: runner.os != 'Linux'
         run: pixi run --locked --no-install test-python
@@ -98,6 +94,8 @@ jobs:
         run: rm -rf build/scikit
       - name: Native tests
         if: runner.os != 'Linux'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '26.0'
         run: pixi run --locked --no-install test-cpp
       - name: Native tests with coverage
         if: runner.os == 'Linux'
