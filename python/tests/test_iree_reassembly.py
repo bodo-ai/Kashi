@@ -89,6 +89,8 @@ def test_tied_dispatch_records_aliasing_on_an_opaque_call():
     assert kernel.args == (a, b)
     assert kernel.meta["iree_tied_operands"] == [0, -1]
     assert [n.args for n in results] == [(kernel, 0), (kernel, 1)]
+    with pytest.raises(NotImplementedError, match="inspection-only"):
+        kernel.target(a, b, workload=[4])
 
 
 def test_untied_dispatch_has_no_tied_metadata():

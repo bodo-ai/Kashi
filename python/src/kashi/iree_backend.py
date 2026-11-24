@@ -196,7 +196,7 @@ def compile_iree_fx(
     partitioned = artifact_dir / "partitioned.mlir"
     partitioned.write_text(_asm(partition.module, decompose_custom_ops))
     (artifact_dir / "driver.mlir").write_text(
-        _asm(partition.driver, decompose_custom_ops)
+        _asm(partition.driver, decompose_custom_ops))
     if not list(partition.module.body.operations):
         # A graph made entirely of alias-sensitive/custom operations has no
         # compiled work. Execute its driver directly instead of feeding IREE

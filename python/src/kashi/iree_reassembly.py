@@ -190,12 +190,10 @@ class _SegmentConverter:
         Operand segments are workload, arguments, argument dimensions, and
         result dimensions. Only arguments are kernel inputs; workload and
         result types remain attached to the call as launch/result metadata.
-        Tied outputs (results written in place into an argument, e.g. IREE's
-        concatenation copies) are modeled as the call's own results; the tie is
-        kept as ``iree_tied_operands`` metadata, since these opaque kernels
-        cannot execute and so cannot observe the in-place write yet.
-        Executable targets receive these values and the
-        tied-output mapping so they can allocate or reuse the correct buffers.
+        Tied outputs are represented as call results with their input ties in
+        ``iree_tied_operands`` metadata. Inspection-only targets cannot execute;
+        executable targets also receive the mapping so they can reuse the
+        correct input buffers.
         """
         sizes = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
         num_workload, num_args, num_argument_dims, num_result_dims = sizes
@@ -203,10 +201,6 @@ class _SegmentConverter:
             ir.IntegerAttr(a).value
             for a in ir.ArrayAttr(op.attributes["tied_operands"])
         ]
-        if self.kernel_factory is None and any(t != -1 for t in tied):
-            raise NotImplementedError(
-                f"flow.dispatch with tied operands in {self.name}"
-            )
         entries = ir.ArrayAttr(op.attributes["entry_points"])
         if len(entries) != 1:
             raise NotImplementedError(
@@ -313,6 +307,8 @@ def flow_segment_handlers(
     leaves PyTorch's default device in effect.
     ``kernel_factory``, when provided, accepts an executable and export name
     and returns the callable used to execute that kernel.
+    Tied dispatches retain ``iree_tied_operands`` node metadata in both modes;
+    without a factory their targets remain inspection-only and cannot execute.
     """
     module = ir.Module.parse(flow_ir, ir.Context())
     kernels: dict[tuple[str, str], IreeKernel] = {}
