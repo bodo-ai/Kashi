@@ -67,13 +67,18 @@ jobs:
           echo 'MACOSX_DEPLOYMENT_TARGET=26.0' >> "$GITHUB_ENV"
           echo 'CMAKE_ARGS=-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0' >> "$GITHUB_ENV"
       - uses: prefix-dev/setup-pixi@v0.11.3
+        if: runner.os == 'Linux'
         id: pixi
         with:
           pixi-version: v0.82.0
-          locked: ${{ runner.os == 'Linux' }}
-          run-install: ${{ runner.os == 'Linux' }}
-          environments: ${{ runner.os == 'Linux' && 'default cpp-coverage' || 'default' }}
+          locked: true
+          environments: default cpp-coverage
           cache-key: pixi-test-${{ hashFiles('cmake/iree-sdk.json') }}-
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        if: runner.os == 'macOS'
+        with:
+          pixi-version: v0.82.0
+          run-install: false
       - name: Install macOS dependencies and editable package
         if: runner.os == 'macOS'
         # Pixi resolves against the locked macOS 14 target. Pip uses the
