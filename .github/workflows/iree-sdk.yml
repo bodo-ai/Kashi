@@ -45,6 +45,7 @@ jobs:
             cmake -S . -B "$1" -G Ninja \
               -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
               -DCMAKE_BUILD_TYPE=Release -DKASHI_BUILD_TESTS=ON \
+              -DKASHI_USE_PUBLISHED_IREE_SDK=OFF \
               -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
               -Dnanobind_DIR="$(python -m nanobind --cmake_dir)" -DKASHI_IREE_SDK_DIR="$2"
           }

@@ -63,6 +63,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT KASHI_MUTATION
   set(KASHI_ENABLE_CUDA ON)
 endif()
 set(KASHI_IREE_SDK_DIR "$ENV{KASHI_IREE_SDK_DIR}" CACHE PATH "Extracted IREE SDK directory")
+set(_published_sdk_default OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+  set(_published_sdk_default ON)
+elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND
+       CMAKE_SYSTEM_VERSION VERSION_GREATER_EQUAL 25 AND
+       (NOT CMAKE_OSX_ARCHITECTURES OR CMAKE_OSX_ARCHITECTURES STREQUAL "arm64") AND
+       (NOT CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL 26))
+  # Darwin 25 is macOS 26, the minimum deployment target of the published SDK.
+  set(_published_sdk_default ON)
+endif()
+option(KASHI_USE_PUBLISHED_IREE_SDK "Download the pinned IREE SDK instead of building from source" ${_published_sdk_default})
+if(KASHI_USE_PUBLISHED_IREE_SDK AND NOT KASHI_IREE_SDK_DIR)
+  include(cmake/KashiIreeSdk.cmake)
+  kashi_fetch_iree_sdk(KASHI_IREE_SDK_DIR)
+endif()
 if(KASHI_IREE_SDK_DIR)
   if(APPLE AND CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     message(FATAL_ERROR "The macOS IREE SDK requires an arm64-only build")
@@ -113,6 +128,7 @@ else()
     iree::compiler::Dialect::HAL::IR
     iree::hal::utils::executable_header
     iree::schemas::cuda_executable_def_c_fbs
+    iree::schemas::executable_debug_info_c_fbs
     iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR)
   set(KASHI_IREE_INCLUDE_DIRS
     "${KASHI_IREE_SOURCE_DIR}/compiler/bindings/c"

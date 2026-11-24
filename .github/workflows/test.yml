@@ -35,12 +35,11 @@ jobs:
         with:
           pixi-version: v0.82.0
           locked: true
+          cache-key: pixi-lint-${{ hashFiles('cmake/iree-sdk.json') }}-
       - name: Check Python and C++
         run: pixi run --locked lint
 
   test:
-    # Lint builds the editable package first, warming sccache for matching Linux compilations.
-    needs: lint
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -51,7 +50,7 @@ jobs:
             runner: ubuntu-24.04
             architecture: x86_64
           - name: macOS Apple silicon
-            runner: macos-15
+            runner: macos-26
             architecture: arm64
     steps:
       - uses: actions/checkout@v6
@@ -62,13 +61,18 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - *sccache
       - *mold
+      - name: Set macOS IREE SDK deployment target
+        if: runner.os == 'macOS'
+        run: |
+          echo 'MACOSX_DEPLOYMENT_TARGET=26.0' >> "$GITHUB_ENV"
+          echo 'CMAKE_ARGS=-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0' >> "$GITHUB_ENV"
       - uses: prefix-dev/setup-pixi@v0.11.3
         id: pixi
         with:
           pixi-version: v0.82.0
           locked: true
           environments: ${{ runner.os == 'Linux' && 'default cpp-coverage' || 'default' }}
-          cache-key: pixi-test-
+          cache-key: pixi-test-${{ hashFiles('cmake/iree-sdk.json') }}-
       - name: Python tests
         if: runner.os != 'Linux'
         run: pixi run --locked test-python

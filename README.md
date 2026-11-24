@@ -21,18 +21,32 @@ The rebuild uses an isolated Python build environment.
 
 Build a wheel with `pixi run python -m build --wheel`. Standard Python build tools also work without Pixi when the required compiler and build tools are available.
 
-### Reuse a local IREE SDK
+### IREE compiler SDK
 
-The default build compiles IREE from source. To reuse its static libraries across
-build trees, create an SDK from a completed, uninstrumented Release Ninja build
-with native tests enabled. Run these commands from a Pixi shell on macOS arm64
-or Linux x86-64. On macOS, pass `-DCMAKE_OSX_ARCHITECTURES=arm64` and
-`-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0` to both producer and consumer.
+CMake downloads the pinned IREE SDK by default on Linux x86-64 and compatible
+macOS arm64 builds (macOS and deployment target 26 or newer). It verifies
+SHA-256 before extraction and shares the extracted SDK across build trees in
+`~/.cache/kashi/iree-sdk` (or `$XDG_CACHE_HOME/kashi/iree-sdk`). Downloads are
+anonymous; neither developers nor CI need AWS credentials.
+
+Linux uses the CUDA codegen SDK by default. Set `KASHI_DISABLE_CUDA=1` to use
+the CPU SDK. Neither SDK needs a GPU to build the extension or run compiler-only
+tests. Use `-DKASHI_USE_PUBLISHED_IREE_SDK=OFF` to build IREE from source, or
+`-DKASHI_IREE_SDK_DIR=/path/to/iree-sdk` to use an already extracted SDK.
+For an editable reinstall, pass these CMake options through `CMAKE_ARGS`.
+
+#### Build or update the archives
+
+From a Pixi shell, build an uninstrumented Release Ninja configuration with
+native tests enabled. Use the same toolchain and sysroot as its consumers.
+On macOS, pass `-DCMAKE_OSX_ARCHITECTURES=arm64` and explicitly select the
+minimum deployment target for the archive.
 
 ```sh
 cmake -S . -B build/sdk-producer -G Ninja \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Release -DKASHI_BUILD_TESTS=ON -DKASHI_IREE_SDK_DIR= \
+  -DKASHI_USE_PUBLISHED_IREE_SDK=OFF \
   -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DPython_EXECUTABLE="$CONDA_PREFIX/bin/python" \
   -Dnanobind_DIR="$(python -m nanobind --cmake_dir)"
 cmake --build build/sdk-producer --target _native kashi_native_tests
@@ -66,7 +80,11 @@ or builtin registration contract changes, not for ordinary Kashi pass edits.
 
 The manual **IREE SDK archives** GitHub Actions workflow builds and verifies
 both Linux variants and uploads the archives and SHA-256 files as run artifacts.
-It does not publish a release or change the default CI build.
+To publish, upload verified archives to the SDK bucket at
+`<IREE revision>/<SHA-256>/kashi-iree-sdk-<system>-<arch>-<backend>.tar.zst`,
+then update `cmake/iree-sdk.json`. When changing the IREE revision, also grant
+anonymous HTTPS object reads for the new revision prefix. Keep older objects
+so older branches and rollbacks continue to work.
 
 ## vLLM and MLIR development
 
