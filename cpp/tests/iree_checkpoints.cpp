@@ -113,20 +113,6 @@ mlir::OwningOpRef<mlir::ModuleOp> makeCudaExecutable(mlir::MLIRContext &context,
 
 } // namespace
 
-// Test that resuming at typed checkpoints is byte-for-byte transparent.
-TEST_CASE("Typed checkpoint probes preserve VMVX compilation output") {
-  Artifacts split;
-  Artifacts uninterrupted;
-  kashi::compileIreeForTesting(fixture,
-                               {split.directory, IreeBackend::VMVX, {}},
-                               kashi::IreeTestPipeline::Checkpoints);
-  kashi::compileIreeForTesting(fixture,
-                               {uninterrupted.directory, IreeBackend::VMVX, {}},
-                               kashi::IreeTestPipeline::Uninterrupted);
-  REQUIRE(split.read("module.vmfb") == uninterrupted.read("module.vmfb"));
-  REQUIRE(split.read("flow.mlir").find("flow.dispatch") != std::string::npos);
-}
-
 // Check that a deliberately failed pass leaves the next invocation usable.
 TEST_CASE("A Flow pass failure does not poison the next embedded invocation") {
   Artifacts failed;
@@ -142,9 +128,9 @@ TEST_CASE("A Flow pass failure does not poison the next embedded invocation") {
   const auto lineStart =
       previousLine == std::string::npos ? 0 : previousLine + 1;
   REQUIRE(log.compare(lineStart, 7, "error: ") == 0);
-  REQUIRE(!fs::exists(failed.directory / "module.vmfb"));
+  REQUIRE(!fs::exists(failed.directory / "flow.mlir"));
   kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
-  REQUIRE(healthy.read("module.vmfb").size() > 0);
+  REQUIRE(healthy.read("flow.mlir").find("flow.dispatch") != std::string::npos);
 }
 
 TEST_CASE("CUDA manifest resolves entries in the selected serialized image") {
@@ -184,23 +170,19 @@ TEST_CASE("CUDA manifest resolves entries in the selected serialized image") {
 }
 
 #ifdef __linux__
-// Force real write failures at the Flow snapshot and VM bytecode stages.
+// Force a real write failure at the Flow snapshot stage.
 TEST_CASE("Compiler artifact write errors are recoverable") {
-  for (const auto &[file, stage] :
-       {std::pair{"flow.mlir", "write Flow snapshot"},
-        std::pair{"module.vmfb", "serialize VM bytecode"}}) {
-    CAPTURE(file);
-    Artifacts broken;
-    fs::create_symlink("/dev/full", broken.directory / file);
-    REQUIRE_THROWS_WITH(
-        kashi::compileIree(fixture, {broken.directory, IreeBackend::VMVX, {}}),
-        Catch::Matchers::ContainsSubstring(stage));
-    REQUIRE(broken.read("iree-compile.log").find(stage) != std::string::npos);
-    REQUIRE(fs::exists(broken.directory / "driver.mlir"));
-    Artifacts healthy;
-    kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
-    REQUIRE(healthy.read("module.vmfb").size() > 0);
-  }
+  constexpr auto stage = "write Flow snapshot";
+  Artifacts broken;
+  fs::create_symlink("/dev/full", broken.directory / "flow.mlir");
+  REQUIRE_THROWS_WITH(
+      kashi::compileIree(fixture, {broken.directory, IreeBackend::VMVX, {}}),
+      Catch::Matchers::ContainsSubstring(stage));
+  REQUIRE(broken.read("iree-compile.log").find(stage) != std::string::npos);
+  REQUIRE(fs::exists(broken.directory / "driver.mlir"));
+  Artifacts healthy;
+  kashi::compileIree(fixture, {healthy.directory, IreeBackend::VMVX, {}});
+  REQUIRE(healthy.read("flow.mlir").find("flow.dispatch") != std::string::npos);
 }
 
 // Inspect the OS disposition rather than Python's cached signal handler.

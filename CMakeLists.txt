@@ -79,7 +79,6 @@ target_link_libraries(kashi_core PRIVATE
   iree::compiler::Dialect::Flow::IR
   iree::compiler::Dialect::HAL::IR
   iree::hal::utils::executable_header
-  iree::compiler::Dialect::VM::Target::Bytecode
   iree::schemas::cuda_executable_def_c_fbs
   iree::schemas::executable_debug_info_c_fbs
   iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR)

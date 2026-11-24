@@ -9,7 +9,6 @@
 #include <mutex>
 #include <stdexcept>
 
-#include "iree/compiler/Dialect/VM/Target/Bytecode/BytecodeModuleTarget.h"
 #include "iree/compiler/Pipelines/Pipelines.h"
 #include "iree/compiler/embedding_api.h"
 #include "iree/compiler/mlir_interop.h"
@@ -346,14 +345,13 @@ void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
                           IreeBackend backend,
                           std::optional<IreeTestPipeline> testPipeline,
                           Diagnostics &diagnostics) {
-  const bool split = testPipeline != IreeTestPipeline::Uninterrupted;
   std::vector<KernelIdentity> identities;
   mlir::iree_compiler::enumerateIREEVMPipelinePhases(
       [&](Phase phase, llvm::StringRef name, llvm::StringRef) {
         const auto pipeline = checkpointPasses(phase, backend, testPipeline);
-        const bool snapshot = split && phase == Phase::Flow;
+        const bool snapshot = phase == Phase::Flow;
         const bool manifest =
-            split && backend == IreeBackend::CUDA && phase == Phase::HAL;
+            backend == IreeBackend::CUDA && phase == Phase::HAL;
         if (!pipeline && !snapshot && !manifest)
           return;
         if (phase != Phase::Start)
@@ -366,18 +364,6 @@ void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
           emitCudaManifest(invocation, dir, identities, diagnostics);
       });
   invocation.lowerTo("end");
-}
-
-void serializeVmModule(ModuleOp module, const fs::path &dir,
-                       Diagnostics &diagnostics) {
-  // No session VM or bytecode flags are overridden, so the pinned
-  // serializer's defaults match the invocation's options.
-  writeArtifact(
-      dir / "module.vmfb", diagnostics, "serialize VM bytecode",
-      [&](llvm::raw_ostream &out) {
-        return mlir::iree_compiler::IREE::VM::translateModuleToBytecode(
-            module, {}, {}, out);
-      });
 }
 
 /// Partition and lower a Torch module in one private IREE invocation.
@@ -395,7 +381,6 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
   auto sourceDevice = partitionInput(invocation, dir, diagnostics);
   lowerWithCheckpoints(invocation, dir, backend.backend, testPipeline,
                        diagnostics);
-  serializeVmModule(*invocation.takeModule(), dir, diagnostics);
   return sourceDevice;
 }
 } // namespace

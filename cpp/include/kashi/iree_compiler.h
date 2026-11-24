@@ -26,7 +26,7 @@ struct IreeCompileOptions {
 std::optional<std::string> compileIree(const std::string &assembly,
                                        const IreeCompileOptions &options);
 
-enum class IreeTestPipeline { Checkpoints, FailAtFlow, Uninterrupted };
+enum class IreeTestPipeline { Checkpoints, FailAtFlow };
 
 void compileIreeForTesting(const std::string &assembly,
                            const IreeCompileOptions &options,
