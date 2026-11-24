@@ -3,20 +3,30 @@ repos:
     hooks:
       - id: ruff-lint
         name: Ruff lint
-        entry: pixi run ruff check --fix
+        entry: pixi run --locked --no-install ruff check --fix
         language: system
         types_or: [python, pyi]
         files: ^(python|scripts)/
 
       - id: ruff-format
         name: Ruff format
-        entry: pixi run ruff format
+        entry: pixi run --locked --no-install ruff format
         language: system
         types_or: [python, pyi]
         files: ^(python|scripts)/
 
       - id: clang-format
         name: Clang format
-        entry: pixi run clang-format -i
+        entry: pixi run --locked --no-install clang-format -i
         language: system
+        files: ^cpp/.*\.(cpp|cc|cxx|h|hh|hpp|hxx)$
+
+      - id: clang-tidy
+        name: Clang tidy
+        # Git's hook environment points at Kashi, not the pinned IREE checkout.
+        entry: >-
+          bash -c 'unset $(git rev-parse --local-env-vars);
+          exec pixi run --locked --no-install lint-cpp'
+        language: system
+        pass_filenames: false
         files: ^cpp/.*\.(cpp|cc|cxx|h|hh|hpp|hxx)$

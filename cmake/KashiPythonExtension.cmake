@@ -1,0 +1,38 @@
+nanobind_add_module(_native cpp/bindings/module.cpp)
+target_link_libraries(_native PRIVATE kashi_core)
+if(KASHI_IREE_SDK_DIR)
+  target_link_libraries(_native PRIVATE kashi_iree_plugin KashiIree::native_link)
+endif()
+if(APPLE)
+  target_link_options(_native PRIVATE "LINKER:-exported_symbol,_PyInit__native")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(exports "${CMAKE_CURRENT_BINARY_DIR}/_native.exports")
+  file(GENERATE OUTPUT "${exports}" CONTENT "{ global: PyInit__native; local: *; };\n")
+  target_link_options(_native PRIVATE "LINKER:--version-script=${exports}")
+  set_property(TARGET _native APPEND PROPERTY LINK_DEPENDS "${exports}")
+else()
+  message(FATAL_ERROR "The private compiler supports Linux and macOS")
+endif()
+if(KASHI_LINT)
+  set_property(TARGET _native PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
+endif()
+install(TARGETS _native LIBRARY DESTINATION kashi RUNTIME DESTINATION kashi)
+install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/mlir/LICENSE.TXT"
+  DESTINATION kashi/licenses RENAME MLIR.txt)
+install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/flatcc/LICENSE"
+  DESTINATION kashi/licenses RENAME FlatCC.txt)
+if(IREE_TARGET_BACKEND_CUDA)
+  if(KASHI_IREE_SDK_DIR)
+    set(KASHI_CUDA_NOTICE "${KASHI_IREE_SDK_DIR}/licenses/CUDA.txt")
+  else()
+    find_file(KASHI_CUDA_NOTICE NAMES EULA.txt LICENSE
+      HINTS "$ENV{IREE_CUDA_DEPS_DIR}" "${CUDAToolkit_BIN_DIR}/.."
+      NO_DEFAULT_PATH REQUIRED)
+  endif()
+  install(FILES "${KASHI_CUDA_NOTICE}" DESTINATION kashi/licenses RENAME CUDA.txt)
+endif()
+install(FILES "${KASHI_IREE_SOURCE_DIR}/LICENSE" DESTINATION kashi/licenses RENAME IREE.txt)
+install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/llvm/LICENSE.TXT"
+  DESTINATION kashi/licenses RENAME LLVM.txt)
+install(FILES "${KASHI_IREE_SOURCE_DIR}/third_party/torch-mlir/LICENSE"
+  DESTINATION kashi/licenses RENAME Torch-MLIR.txt)

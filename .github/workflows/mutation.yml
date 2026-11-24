@@ -7,9 +7,13 @@ on:
 permissions:
   contents: read
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   mutation:
     runs-on: ubuntu-24.04
+    # CUDA checkpoint tests emit PTX offline; no GPU is needed.
     steps:
       - name: Initialize diagnostics
         run: printf 'Mutation job diagnostics\n' > "$RUNNER_TEMP/mutation.log"
@@ -17,6 +21,16 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // Expose the cache endpoint and job-scoped token to Pixi's sccache.
+            // GitHub provides them to this action, not to the later shell steps.
+            for (const name of ['ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN']) {
+              core.exportVariable(name, process.env[name] || '');
+            }
+      - name: Enable mold
+        run: echo 'CMAKE_LINKER_TYPE=MOLD' >> "$GITHUB_ENV"
       - name: Install pinned Clang and Mull
         shell: bash
         run: |
@@ -42,12 +56,18 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.11.3
         with:
           pixi-version: v0.82.0
-          locked: true
+          run-install: false
+      - name: Install mutation build dependencies
+        id: mutation-dependencies
+        # The editable Python package would build a second, incompatible IREE.
+        run: >-
+          pixi install --locked --only python --only cmake --only ninja --only sccache
+          --only catch2 --only nanobind --only mold --only cxx-compiler
       - name: Run mutation tests
         shell: bash
         env:
           MULL_DIFF_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
-        run: pixi run --locked test-mutation 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
+        run: pixi run --locked --no-install test-mutation 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
       - name: Upload mutation reports
         if: always()
         uses: actions/upload-artifact@v4

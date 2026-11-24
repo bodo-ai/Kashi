@@ -1,8 +1,10 @@
 """Behavioral coverage for partitioning Torch-dialect graphs at custom ops."""
 
+from types import SimpleNamespace
+
 import pytest
 from iree.compiler import ir
-from kashi.iree_partition import partition_at_custom_ops
+from kashi import _native
 
 TENSOR = "!torch.vtensor<[4],f32>"
 
@@ -11,6 +13,30 @@ def _parse(text):
     """Parse a standalone module using IREE's registered Torch dialect."""
     with ir.Context():
         return ir.Module.parse(text)
+
+
+def _partition(source, directory, *, partition_only=False):
+    """Compile a fixture and load the native partition and driver artifacts."""
+    device = None
+    try:
+        device = _native.compile_iree(str(source), str(directory), target="vmvx")
+    except RuntimeError as error:
+        # These fixtures exercise Torch interfaces that the backend may not lower.
+        if not partition_only or "compile through" not in str(error):
+            raise
+    return SimpleNamespace(
+        module=_parse((directory / "partitioned.mlir").read_text()),
+        driver=_parse((directory / "driver.mlir").read_text()),
+        device=device,
+    )
+
+
+def _reject_partition(source, directory, diagnostic):
+    """Require a partition-stage diagnostic without a partial driver."""
+    with pytest.raises(RuntimeError, match="partition"):
+        _partition(source, directory)
+    assert diagnostic in (directory / "iree-compile.log").read_text()
+    assert not (directory / "driver.mlir").exists()
 
 
 def _main(module):
@@ -46,11 +72,11 @@ module {
 """
 
 
-def test_mutating_boundary_keeps_wiring_and_rewrites_only_compiled_device():
+def test_mutating_boundary_keeps_wiring_and_rewrites_only_compiled_device(tmp_path):
     """Losing either result or passing the pre-mutation value changes the graph."""
     source = _parse(MUTATION)
     before = str(source)
-    result = partition_at_custom_ops(source)
+    result = _partition(source, tmp_path)
     assert str(source) == before
     assert result.module.operation.verify()
     assert result.driver.operation.verify()
@@ -58,9 +84,12 @@ def test_mutating_boundary_keeps_wiring_and_rewrites_only_compiled_device():
     assert 'torch.constant.device "cpu"' in str(result.module)
     assert 'torch.constant.device "cuda:0"' in str(result.driver)
     assert "torch.operator" not in str(result.module)
-    assert [s.live_out_types for s in result.segments] == [[TENSOR, TENSOR], [TENSOR]]
     ops = _ops(_main(result.driver))
     calls = [op for op in ops if op.name == "func.call"]
+    assert [[str(v.type) for v in call.results] for call in calls] == [
+        [TENSOR, TENSOR],
+        [TENSOR],
+    ]
     custom = next(op for op in ops if op.name == "torch.operator")
     assert ops.index(calls[0]) < ops.index(custom) < ops.index(calls[1])
     assert list(custom.operands) == [calls[0].results[1], calls[0].results[0]]
@@ -68,7 +97,7 @@ def test_mutating_boundary_keeps_wiring_and_rewrites_only_compiled_device():
     assert list(ops[-1].operands) == [calls[1].results[0]]
 
 
-def test_multiple_and_adjacent_boundaries_keep_order_and_value_identity():
+def test_multiple_and_adjacent_boundaries_keep_order_and_value_identity(tmp_path):
     """Consecutive mutations must not be coalesced or reordered."""
     source = _parse("""
 module {
@@ -82,7 +111,7 @@ module {
   }
 }
 """)
-    result = partition_at_custom_ops(source)
+    result = _partition(source, tmp_path)
     assert result.module.operation.verify() and result.driver.operation.verify()
     ops = [op for op in _ops(_main(result.driver)) if op.name != "func.return"]
     assert [op.name for op in ops] == [
@@ -106,7 +135,7 @@ module {
     assert ops[4].operands[0] == ops[3].results[0]
 
 
-def test_dynamic_int_and_list_cross_segment_boundaries():
+def test_dynamic_int_and_list_cross_segment_boundaries(tmp_path):
     """Runtime shape values must not be treated as cloneable constants."""
     source = _parse("""
 module {
@@ -119,17 +148,17 @@ module {
   }
 }
 """)
-    result = partition_at_custom_ops(source)
+    result = _partition(source, tmp_path, partition_only=True)
     assert result.module.operation.verify() and result.driver.operation.verify()
-    assert result.segments[0].live_out_types == ["!torch.int", "!torch.list<int>"]
     ops = _ops(_main(result.driver))
     calls = [op for op in ops if op.name == "func.call"]
+    assert [str(v.type) for v in calls[0].results] == ["!torch.int", "!torch.list<int>"]
     barrier = next(op for op in ops if op.name == "torch.operator")
     assert list(barrier.operands) == list(calls[0].results)
     assert calls[1].operands[1] == calls[0].results[1]
 
 
-def test_unsupported_crossing_is_reported_without_invalid_driver():
+def test_unsupported_crossing_is_reported_without_invalid_driver(tmp_path):
     """An unsupported float live-out cannot silently disappear from the driver."""
     source = _parse("""
 module {
@@ -140,20 +169,18 @@ module {
   }
 }
 """)
-    result = partition_at_custom_ops(source)
-    assert result.module.operation.verify()
-    assert result.driver is None
-    assert result.segments[0].unsupported_live_outs == ["!torch.float"]
+    _reject_partition(
+        source, tmp_path, "unsupported live-out for segment_0: '!torch.float'"
+    )
 
 
-def test_rejects_non_main_entry():
+def test_rejects_non_main_entry(tmp_path):
     """A different function is never silently partitioned as main."""
     source = _parse("module { func.func @other() { return } }")
-    with pytest.raises((ValueError, NotImplementedError), match="main"):
-        partition_at_custom_ops(source)
+    _reject_partition(source, tmp_path, "func.func @main")
 
 
-def test_custom_result_becomes_later_segment_input():
+def test_custom_result_becomes_later_segment_input(tmp_path):
     """Custom result SSA values feed the following compiled call unchanged."""
     source = _parse("""
 module {
@@ -164,7 +191,7 @@ module {
   }
 }
 """)
-    result = partition_at_custom_ops(source)
+    result = _partition(source, tmp_path)
     assert result.module.operation.verify() and result.driver.operation.verify()
     custom, call, ret = _ops(_main(result.driver))
     assert custom.name == "torch.operator" and call.name == "func.call"
@@ -172,7 +199,7 @@ module {
     assert ret.operands[0] == call.results[0]
 
 
-def test_unsupported_live_out_is_reported_even_when_later_segment_uses_it():
+def test_unsupported_live_out_is_reported_even_when_later_segment_uses_it(tmp_path):
     """Unsupported SSA values do not disappear when also used by a later run."""
     source = _parse("""
 module {
@@ -184,13 +211,12 @@ module {
   }
 }
 """)
-    result = partition_at_custom_ops(source)
-    assert result.module.operation.verify()
-    assert result.driver is None
-    assert result.segments[0].unsupported_live_outs == ["!torch.float"]
+    _reject_partition(
+        source, tmp_path, "unsupported live-out for segment_0: '!torch.float'"
+    )
 
 
-def test_unsupported_live_in_is_rejected():
+def test_unsupported_live_in_is_rejected(tmp_path):
     """An unsupported external segment input must not reach IREE silently."""
     source = _parse("""
 module {
@@ -200,19 +226,20 @@ module {
   }
 }
 """)
-    with pytest.raises(NotImplementedError, match="live-in.*!torch.float"):
-        partition_at_custom_ops(source)
+    _reject_partition(
+        source, tmp_path, "unsupported live-in for segment_0: '!torch.float'"
+    )
 
 
-def test_cpu_device_is_reported_without_rewriting():
+def test_cpu_device_is_reported_without_rewriting(tmp_path):
     """The returned device describes CPU graphs too, not just CUDA graphs."""
-    result = partition_at_custom_ops(_parse(MUTATION.replace("cuda:0", "cpu")))
+    result = _partition(_parse(MUTATION.replace("cuda:0", "cpu")), tmp_path)
     assert result.device == "cpu"
     assert result.module.operation.verify() and result.driver.operation.verify()
     assert 'torch.constant.device "cpu"' in str(result.module)
 
 
-def test_multiple_source_devices_are_rejected():
+def test_multiple_source_devices_are_rejected(tmp_path):
     """A single device field cannot faithfully describe a mixed-device graph."""
     source = _parse(
         MUTATION.replace(
@@ -220,11 +247,10 @@ def test_multiple_source_devices_are_rejected():
             '%device = torch.constant.device "cuda:0"\n    %cpu = torch.constant.device "cpu"',
         )
     )
-    with pytest.raises(NotImplementedError, match="multiple source devices"):
-        partition_at_custom_ops(source)
+    _reject_partition(source, tmp_path, "multiple source devices")
 
 
-def test_dynamic_list_argument_is_forwarded_to_each_user():
+def test_dynamic_list_argument_is_forwarded_to_each_user(tmp_path):
     """An input list remains the same SSA value at the custom call and segment."""
     source = _parse("""
 module {
@@ -235,7 +261,7 @@ module {
   }
 }
 """)
-    result = partition_at_custom_ops(source)
+    result = _partition(source, tmp_path, partition_only=True)
     assert result.module.operation.verify() and result.driver.operation.verify()
     block = _main(result.driver)
     custom, call, _ = _ops(block)

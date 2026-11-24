@@ -1,17 +1,17 @@
 """Opt-in FX to IREE CUDA compilation and opaque-kernel graph reconstruction."""
 
+import json
 import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from iree.compiler.tools.binaries import find_tool
+from iree.compiler import ir
 
+from kashi import _native
 from kashi.importer import import_fx
-from kashi.iree_partition import partition_at_custom_ops
-from kashi.iree_reassembly import flow_segment_handlers
+from kashi.iree_reassembly import IreeKernel, flow_segment_handlers
 from kashi.mlir_to_fx import rebuild_fx
 
 
@@ -21,8 +21,8 @@ class IreeCompilation:
 
     ``graph`` preserves the original graph's inputs and output pytree but its
     IREE kernel calls are opaque and cannot execute. ``artifact_dir`` contains
-    the partitioned and driver MLIR, compiler log, phase dumps and raw kernel
-    files. ``flow_ir`` and ``ptx_files`` identify the corresponding artifacts;
+    the partitioned, driver and Flow MLIR, compiler log, VM bytecode and raw PTX.
+    ``kernel_manifest`` maps Flow exports to their linked PTX entry points.
     ``kernels_ptx`` is a combined readable listing, or None if no PTX was emitted.
     """
 
@@ -31,6 +31,7 @@ class IreeCompilation:
     flow_ir: Path
     ptx_files: tuple[Path, ...]
     kernels_ptx: Path | None
+    kernel_manifest: Path
 
 
 def _source_device(
@@ -67,12 +68,29 @@ def _cuda_target(cuda_target: str | None) -> str:
     return f"sm_{major}{minor}"
 
 
+def _annotate_ptx_metadata(
+    graph: torch.fx.GraphModule,
+    artifact_dir: Path,
+    manifest: dict[str, dict[str, dict[str, str]]],
+) -> None:
+    """Attach the linked PTX image and entry to each opaque kernel call."""
+    for node in graph.graph.nodes:
+        target = node.target
+        if not isinstance(target, IreeKernel):
+            continue
+        try:
+            kernel = manifest[target.executable][target.export]
+        except KeyError as error:
+            raise RuntimeError(f"Missing linked CUDA kernel: {target}") from error
+        node.meta["iree_ptx_file"] = artifact_dir / kernel["file"]
+        node.meta["iree_ptx_entry"] = kernel["entry"]
+
+
 def compile_iree_fx(
     gm: torch.fx.GraphModule,
     *,
     output_dir: str | os.PathLike,
     cuda_target: str | None = None,
-    compiler: str | os.PathLike | None = None,
 ) -> IreeCompilation:
     """Compile an FX graph to CUDA PTX and reconstruct its opaque-kernel FX graph.
 
@@ -81,8 +99,6 @@ def compile_iree_fx(
         output_dir: Parent directory in which a unique artifact directory is created.
         cuda_target: IREE CUDA architecture such as ``sm_80``. If omitted, use
             ``IREE_CUDA_TARGET`` or the current CUDA device's capability.
-        compiler: Optional path to ``iree-compile``; by default use the IREE
-            package's tool discovery.
 
     Returns:
         The reassembled graph and paths to the flow IR and PTX artifacts. Kernel
@@ -97,68 +113,22 @@ def compile_iree_fx(
         raise RuntimeError(
             f"Verification failed for imported module:\n{imported.module}"
         )
-    partition = partition_at_custom_ops(imported.module)
-    if partition.driver is None:
-        unsupported = [
-            kind
-            for segment in partition.segments
-            for kind in segment.unsupported_live_outs
-        ]
-        raise NotImplementedError(
-            f"Cannot build IREE driver; unsupported segment live-outs: {unsupported}"
-        )
-    device = _source_device(gm, partition.device)
-    target = _cuda_target(cuda_target)
-    compiler_path = (
-        os.fspath(compiler) if compiler is not None else find_tool("iree-compile")
-    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = Path(tempfile.mkdtemp(prefix="kashi-iree-", dir=output_dir))
-    partitioned = artifact_dir / "partitioned.mlir"
-    partitioned.write_text(str(partition.module))
-    (artifact_dir / "driver.mlir").write_text(str(partition.driver))
-    phases_dir = artifact_dir / "phases"
-    kernels_dir = artifact_dir / "kernel_files"
-    command = [
-        compiler_path,
-        str(partitioned),
-        "--iree-hal-target-device=cuda",
-        f"--iree-cuda-target={target}",
-        "--iree-hal-link-executables=false",
-        f"--iree-hal-dump-executable-files-to={kernels_dir}",
-        f"--dump-compilation-phases-to={phases_dir}",
-        "-o",
-        os.devnull,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(
-            f"Could not run IREE compiler {compiler_path}: {error}"
-        ) from error
-    log_path = artifact_dir / "iree-compile.log"
-    log_path.write_text(completed.stdout)
-    if completed.returncode:
-        raise RuntimeError(
-            f"IREE compiler exited with {completed.returncode}; see {log_path}"
-        )
-
-    flow_files = sorted(phases_dir.glob("*.flow.mlir"))
-    if len(flow_files) != 1:
-        raise RuntimeError(
-            f"Expected one IREE flow phase in {phases_dir}, found {len(flow_files)}"
-        )
-    flow_ir = flow_files[0]
-    ptx_files = tuple(sorted(kernels_dir.glob("*.ptx")))
+    module = imported.module.operation
+    partition_device = _native.compile_iree(
+        module.get_asm(enable_debug_info=True),
+        artifact_dir,
+        target="cuda",
+        cuda_target=_cuda_target(cuda_target),
+    )
+    device = _source_device(gm, partition_device)
+    flow_ir = artifact_dir / "flow.mlir"
+    kernel_manifest = artifact_dir / "kernel_manifest.json"
+    manifest = json.loads(kernel_manifest.read_text())
+    ptx_files = tuple(sorted(artifact_dir.glob("kernel_*.ptx")))
     kernels_ptx = None
     if ptx_files:
         kernels_ptx = artifact_dir / "kernels.ptx"
@@ -167,5 +137,9 @@ def compile_iree_fx(
         )
 
     handlers = flow_segment_handlers(flow_ir.read_text(), device=device)
-    graph = rebuild_fx(partition.driver, imported.out_spec, segment_handlers=handlers)
-    return IreeCompilation(graph, artifact_dir, flow_ir, ptx_files, kernels_ptx)
+    driver = ir.Module.parse((artifact_dir / "driver.mlir").read_text(), ir.Context())
+    graph = rebuild_fx(driver, imported.out_spec, segment_handlers=handlers)
+    _annotate_ptx_metadata(graph, artifact_dir, manifest)
+    return IreeCompilation(
+        graph, artifact_dir, flow_ir, ptx_files, kernels_ptx, kernel_manifest
+    )
