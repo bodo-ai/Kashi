@@ -1,11 +1,12 @@
-"""Execute partitioned IREE functions as FX calls on PyTorch CUDA tensors.
+"""Execute partitioned IREE functions on PyTorch CUDA or ROCm tensors.
 
-IREE's Python DLPack bindings only exchange memory; they do not establish
-stream dependencies. The synchronous VM export waits for IREE's completion,
-while we explicitly wait for the caller's PyTorch stream before entering it.
-Fresh results are copied device-to-device into PyTorch-owned storage before
-returning: a foreign DLPack allocation has no PyTorch allocator stream tracking
-and can otherwise be freed while an asynchronous consumer still uses it.
+IREE's DLPack bindings exchange memory, not stream dependencies. HIP devices
+request the caller's PyTorch stream as their external dispatch stream; older
+IREE versions may ignore this option. We therefore also wait for PyTorch
+producers and require a synchronous VM ABI that completes all IREE work
+before returning, regardless of which stream the driver uses. Fresh outputs
+are copied device-to-device into PyTorch-owned storage so its allocator can
+track subsequent asynchronous uses.
 """
 
 import operator
@@ -17,6 +18,7 @@ from pathlib import Path
 import iree.runtime as rt
 import torch
 from iree.compiler import ir
+from iree.runtime.flags import parse_flags
 
 from kashi.iree_partition import PartitionResult
 
@@ -50,6 +52,59 @@ _INTEGER_REINTERPRET = {
     torch.uint64: torch.int64,
 }
 
+_hip_driver_lock = threading.Lock()
+_hip_library_path = None
+
+
+def _mapped_hip_libraries():
+    """Find loaded HIP runtimes; different copies cannot share stream handles."""
+    paths = set()
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6:
+            continue
+        path = re.sub(
+            r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[5]
+        )
+        if re.fullmatch(r"libamdhip64\.so(?:\.[0-9]+)*", Path(path).name):
+            paths.add(str(Path(path).resolve()))
+    return paths
+
+
+def _hip_driver():
+    """Force IREE onto PyTorch's loaded HIP library, and reject ambiguity.
+
+    A physical UUID cannot prove that two different HIP runtimes share a
+    primary context or interpret a borrowed stream handle identically. IREE
+    caches drivers process-wide, so also check after lookup in case another
+    caller initialized a different driver first. Linux process mappings are
+    required to establish this invariant, including for packaged ROCm wheels.
+    """
+    global _hip_library_path
+    with _hip_driver_lock:
+        paths = _mapped_hip_libraries()
+        if len(paths) != 1:
+            raise RuntimeError(f"Cannot uniquely identify PyTorch HIP library: {paths}")
+        path = next(iter(paths))
+        if _hip_library_path is None:
+            parse_flags(f"--hip_dylib_path=file:{path}")
+            _hip_library_path = path
+        elif _hip_library_path != path:
+            raise RuntimeError("PyTorch HIP library changed after IREE initialization")
+        driver = rt.get_driver("hip")
+        if _mapped_hip_libraries() != {path}:
+            raise RuntimeError("PyTorch and IREE loaded different HIP libraries")
+        return driver
+
+
+def _require_synchronous_abi(function):
+    """Reject exports that do not prove completion before the VM call returns."""
+    reflection = function.vm_function.reflection
+    declaration = reflection.get("iree.abi.declaration", "")
+    model = reflection.get("iree.abi.model")
+    if model not in (None, "sync") or not declaration.startswith("sync func "):
+        raise RuntimeError("IREE HIP export must declare the synchronous VM ABI")
+
 
 def _result_dtype(type_text: str):
     """Extract a Torch tensor dtype; refuse incomplete or unsupported metadata."""
@@ -64,51 +119,91 @@ def _result_dtype(type_text: str):
 class _RuntimeModule:
     """Share per-device VM contexts and exported functions among all segments."""
 
-    def __init__(self, path: Path, device: str | None, names: tuple[str, ...]):
-        """Record the persistent VMFB, device hint, and compiled exports."""
+    def __init__(
+        self,
+        path: Path,
+        device: str | None,
+        names: tuple[str, ...],
+        *,
+        target_device="cuda",
+    ):
+        """Record the persistent VMFB, device hint, target, and exports."""
+        if target_device not in ("cuda", "hip"):
+            raise ValueError(f"Unsupported IREE GPU target_device: {target_device}")
         self.path = Path(path)
         self.device = torch.device(device) if device is not None else None
         self.names = names
+        self.target_device = target_device
+        self.dlpack_device_type = 10 if target_device == "hip" else 2
         self._instances = {}
+        self._streams = {}
         self._lock = threading.Lock()
 
-    def instance(self, index: int):
-        """Get a cached IREE device and bound exports for a PyTorch CUDA index.
+    def instance(self, index: int, stream=None):
+        """Bind the VM to the physical GPU and, for HIP, the caller's stream.
 
-        Match physical UUIDs rather than assuming IREE and PyTorch enumerate
-        devices identically, particularly with CUDA_VISIBLE_DEVICES or MIG.
-        IREE CUDA and PyTorch both use the CUDA device's primary context.
+        PyTorch and IREE may enumerate devices differently. Both drivers use
+        the GPU's primary context, but DLPack alone cannot establish identity.
+        HIP borrows rather than owns the external stream, so cache and retain
+        the PyTorch stream alongside the VM device for its entire lifetime.
         """
+        cuda, hip = bool(torch.version.cuda), bool(torch.version.hip)
+        if cuda == hip or (self.target_device == "cuda") != cuda:
+            raise RuntimeError(
+                f"PyTorch GPU build does not uniquely match IREE {self.target_device}"
+            )
+        if self.target_device == "hip":
+            if stream is None:
+                stream = torch.cuda.current_stream(index)
+            key = (index, stream.cuda_stream)
+        else:
+            key = index
         with self._lock:
-            if index in self._instances:
-                return self._instances[index]
+            if key in self._instances:
+                return self._instances[key]
             properties = torch.cuda.get_device_properties(index)
             uuid = getattr(properties, "uuid", None)
-            if uuid is None:
-                raise RuntimeError(f"PyTorch did not report a UUID for cuda:{index}")
 
             def normalize_uuid(value):
-                """Normalize CUDA's optional GPU prefix and UUID separators."""
-                return str(value).lower().removeprefix("gpu-").replace("-", "")
+                """Normalize the drivers' GPU prefix and UUID separators."""
+                text = str(value).lower().removeprefix("gpu-").replace("-", "")
+                return text if re.fullmatch(r"[0-9a-f]{32}", text) else None
 
-            driver = rt.get_driver("cuda")
+            normalized = normalize_uuid(uuid)
+            if normalized is None:
+                raise RuntimeError(
+                    f"PyTorch did not report a valid UUID for cuda:{index}"
+                )
+            driver = (
+                _hip_driver() if self.target_device == "hip" else rt.get_driver("cuda")
+            )
             devices = [
                 info
                 for info in driver.query_available_devices()
-                if normalize_uuid(info["path"]) == normalize_uuid(uuid)
+                if normalize_uuid(info["path"]) == normalized
             ]
             if len(devices) != 1:
                 raise RuntimeError(
                     f"Cannot uniquely match PyTorch cuda:{index} ({uuid}) "
-                    "to an IREE CUDA device"
+                    f"to an IREE {self.target_device.upper()} device"
                 )
-            device = driver.create_device(devices[0], params=None)
+            params = (
+                {"hip_external_stream": str(stream.cuda_stream)}
+                if self.target_device == "hip"
+                else None
+            )
+            device = driver.create_device(devices[0], params=params)
             config = rt.Config(device=device)
             module = rt.VmModule.mmap(config.vm_instance, str(self.path))
             bound = rt.load_vm_module(module, config=config)
             functions = {name: bound[name] for name in self.names}
+            if self.target_device == "hip":
+                for function in functions.values():
+                    _require_synchronous_abi(function)
             instance = (device, bound, functions)
-            self._instances[index] = instance
+            self._instances[key] = instance
+            if self.target_device == "hip":
+                self._streams[key] = stream
             return instance
 
     def device_index(self, args) -> int:
@@ -120,7 +215,8 @@ class _RuntimeModule:
             if isinstance(value, torch.Tensor):
                 if value.device.type != "cuda" or value.device.index is None:
                     raise RuntimeError(
-                        f"IREE runtime requires CUDA tensors, got {value.device}"
+                        f"IREE {self.target_device.upper()} runtime requires tensors "
+                        f"on a PyTorch cuda:<index> device, got {value.device}"
                     )
                 devices.add(value.device.index)
             elif isinstance(value, (tuple, list)):
@@ -134,7 +230,16 @@ class _RuntimeModule:
                 f"IREE segment received tensors on multiple CUDA devices: {devices}"
             )
         if devices:
-            return next(iter(devices))
+            index = next(iter(devices))
+            if self.device is not None and (
+                self.device.type != "cuda"
+                or (self.device.index is not None and self.device.index != index)
+            ):
+                raise RuntimeError(
+                    f"IREE segment tensor device cuda:{index} does not match "
+                    f"partition device {self.device}"
+                )
+            return index
         if (
             self.device is None
             or self.device.type != "cuda"
@@ -179,10 +284,15 @@ class _SegmentTarget:
                 raise RuntimeError(
                     "IREE runtime execution does not support CUDA graph capture"
                 )
-            device, _bound, functions = self.runtime.instance(index)
             stream = torch.cuda.current_stream(index)
+            device, _bound, functions = self.runtime.instance(index, stream)
             imports = []
-            converted = [_import_argument(arg, device, imports) for arg in args]
+            converted = [
+                _import_argument(
+                    arg, device, imports, self.runtime.dlpack_device_type, index
+                )
+                for arg in args
+            ]
             # Imported buffers do not carry a producer fence. This wait also
             # covers any contiguous materializations enqueued above, and all
             # preceding custom-op mutations on this current PyTorch stream.
@@ -207,6 +317,7 @@ class _SegmentTarget:
                 self.output_types,
                 output_aliases=self.output_aliases,
                 source_args=args,
+                dlpack_device_type=self.runtime.dlpack_device_type,
             )
 
 
@@ -228,25 +339,37 @@ class _SegmentHandler:
         ]
 
 
-def _import_argument(value, device, imports):
+def _import_argument(value, device, imports, dlpack_device_type, index):
     """Import tensors with DLPack and recursively preserve integer lists.
 
-    IREE's HAL buffer views require dense row-major storage. A non-contiguous
-    tensor is packed on the GPU; the original and packed views are retained so
-    returned input aliases can be restored rather than silently detached.
+    IREE's HAL buffer views require dense row-major storage, and GPU bindings
+    may assume 64-byte alignment. Packing preserves the original and the
+    aligned temporary so exact input aliases can be restored after execution.
     """
     if isinstance(value, torch.Tensor):
         if value.layout != torch.strided:
             raise NotImplementedError(
                 f"IREE cannot import tensor layout {value.layout}"
             )
+        if value.__dlpack_device__() != (dlpack_device_type, index):
+            raise RuntimeError("Tensor DLPack device does not match the IREE device")
         packed = value.detach().resolve_conj().resolve_neg().contiguous()
+        # A contiguous PyTorch view can still start at a misaligned offset.
+        # Clone on the same GPU, then fail closed if its allocator cannot
+        # satisfy the alignment promised to the generated kernel.
+        if packed.numel() and packed.data_ptr() % 64:
+            packed = packed.clone(memory_format=torch.contiguous_format)
+            if packed.data_ptr() % 64:
+                raise RuntimeError("IREE GPU input requires 64-byte alignment")
         capsule = torch.utils.dlpack.to_dlpack(packed)
         buffer_view = device.from_dlpack_capsule(capsule)
         imports.append((value, packed))
         return buffer_view
     if isinstance(value, (tuple, list)):
-        return type(value)(_import_argument(item, device, imports) for item in value)
+        return type(value)(
+            _import_argument(item, device, imports, dlpack_device_type, index)
+            for item in value
+        )
     if isinstance(value, (int, torch.SymInt)):
         return int(value)
     raise TypeError(f"Unsupported IREE segment argument: {type(value).__name__}")
@@ -305,11 +428,12 @@ def _export_results(
     *,
     output_aliases=None,
     source_args=None,
+    dlpack_device_type=2,
 ):
-    """Export VM results, preserving aliases and safe CUDA allocation lifetime.
+    """Export VM results, preserving aliases and safe GPU allocation lifetime.
 
     Exact source SSA identities restore repeated results and input aliases.
-    Fresh outputs are copied into PyTorch-owned CUDA storage and synchronized:
+    Fresh outputs are copied into PyTorch-owned storage and synchronized:
     PyTorch's allocator cannot track asynchronous uses of IREE-owned memory.
     No tensor data passes through host memory.
     """
@@ -333,10 +457,9 @@ def _export_results(
         if isinstance(value, rt.DeviceArray):
             value = value._buffer_view
         if isinstance(value, rt.HalBufferView):
-            if output_aliases is not None:
-                # Source SSA identities were resolved above. A fresh result
-                # needs PyTorch-owned storage regardless of IREE's allocator;
-                # pooled CUDA buffers cannot be exported through DLPack at all.
+            if output_aliases is not None and dlpack_device_type == 2:
+                # CUDA pooled buffers may not support DLPack export. Preserve
+                # the existing CUDA copy path and its source SSA aliases.
                 if dtype is None:
                     raise NotImplementedError(
                         "Missing Torch dtype metadata for IREE tensor result"
@@ -345,14 +468,15 @@ def _export_results(
                 pooled.append((value, dtype))
                 return _PooledResult(position)
             try:
-                capsule = device.create_dlpack_capsule(
-                    value, 2, index
-                )  # DLPack kDLCUDA
+                capsule = device.create_dlpack_capsule(value, dlpack_device_type, index)
             except RuntimeError as error:
                 # IREE's stream-ordered CUDA pool does not support DLPack
                 # export. Its HAL buffer can still be copied device-to-device
                 # into an imported, PyTorch-owned allocation.
-                if "CUDA buffer type is not supported for export" not in str(error):
+                if (
+                    dlpack_device_type != 2
+                    or "CUDA buffer type is not supported for export" not in str(error)
+                ):
                     raise
                 if dtype is None:
                     raise NotImplementedError(
@@ -508,15 +632,15 @@ def _output_aliases(function) -> list:
 
 
 def runtime_segment_handlers(
-    vmfb_path: Path, partition: PartitionResult
+    vmfb_path: Path, partition: PartitionResult, *, target_device="cuda"
 ) -> dict[str, Callable]:
     """Create FX handlers for actual partition functions in a persistent VMFB.
 
     Each handler accepts ``(graph, args)`` and returns the segment's flat FX
-    live-outs. The first call on a CUDA device loads and caches its VM context.
-    Scalar-only segments require ``partition.device`` to name a CUDA index.
-    IREE's synchronous ABI and the stream waits make this unsuitable for CUDA
-    graph capture, which is rejected explicitly.
+    live-outs. The first call on a GPU loads and caches its VM context, per
+    PyTorch stream for HIP. Scalar-only segments require ``partition.device``
+    to name a CUDA index (also used by PyTorch for ROCm). The synchronous ABI
+    and stream waits make this unsuitable for GPU graph capture.
     """
     functions = {
         ir.StringAttr(op.attributes["sym_name"]).value: op
@@ -527,7 +651,10 @@ def runtime_segment_handlers(
         segment for segment in partition.segments if segment.func_name in functions
     ]
     runtime = _RuntimeModule(
-        vmfb_path, partition.device, tuple(segment.func_name for segment in segments)
+        vmfb_path,
+        partition.device,
+        tuple(segment.func_name for segment in segments),
+        target_device=target_device,
     )
     return {
         segment.func_name: _SegmentHandler(

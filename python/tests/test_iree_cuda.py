@@ -4,10 +4,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from kashi.iree_cuda import _grid, create_cuda_kernel
+from kashi.iree_cuda import create_cuda_kernel
+from kashi.iree_gpu_dispatch import _grid
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.skipif(
+    not (torch.version.cuda and torch.cuda.is_available()),
+    reason="NVIDIA CUDA device required",
+)
 def test_direct_ptx_uses_independent_output_offset_and_current_stream(tmp_path):
     """An offset inserted by stream allocation must not shift a new output buffer."""
     phases = tmp_path / "phases"
@@ -120,7 +124,10 @@ DONE:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.skipif(
+    not (torch.version.cuda and torch.cuda.is_available()),
+    reason="NVIDIA CUDA device required",
+)
 def test_direct_ptx_preserves_tied_operand_identity(tmp_path):
     """A tied result must update and return the original CUDA tensor."""
     phases = tmp_path / "phases"
@@ -254,3 +261,48 @@ def test_workgroup_grid_rejects_invalid_affine_expressions(expression):
     maps = {"#grid": (["d0"], [], [expression])}
     with pytest.raises(NotImplementedError, match="affine"):
         _grid(args, body, maps, [7], "test")
+
+
+@pytest.mark.skipif(
+    not (torch.version.cuda and torch.cuda.is_available()),
+    reason="NVIDIA CUDA device required",
+)
+def test_direct_graph_capture_retains_dlpack_input_through_replay(
+    tmp_path, monkeypatch
+):
+    import gc
+    import weakref
+
+    from kashi.iree_backend import compile_iree_fx
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    result = graph.call_function(torch.ops.aten.relu.default, (x,))
+    graph.output(result)
+    with FakeTensorMode():
+        value = torch.empty(16, device="cuda")
+        x.meta["val"] = result.meta["val"] = value
+    model = torch.fx.GraphModule(torch.nn.Module(), graph)
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", "direct")
+    compiled = compile_iree_fx(model, output_dir=tmp_path, target_device="cuda")
+    source = torch.arange(-8, 8, device="cuda", dtype=torch.float32)
+    imported = torch.utils.dlpack.from_dlpack(source)
+    reference = weakref.ref(imported)
+    compiled.graph(torch.zeros_like(source))  # load the module before capture
+    torch.cuda.synchronize()
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture):
+        output = compiled.graph(imported)
+    del imported, source
+    gc.collect()
+    assert reference() is not None
+    capture.replay()
+    capture.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        output.cpu(), torch.arange(-8, 8, dtype=torch.float32).relu()
+    )
+    capture.reset()
+    gc.collect()
+    assert reference() is None

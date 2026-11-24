@@ -1,8 +1,13 @@
-"""Exercise both IREE execution modes with real CUDA tensors."""
+"""Exercise both IREE execution modes with real CUDA or HIP tensors."""
 
 import pytest
 
 torch = pytest.importorskip("torch")
+
+# PyTorch exposes ROCm devices through the same ``torch.cuda`` API; require a
+# matching accelerator build as well as an accessible device.
+_HAS_GPU = bool(torch.version.cuda or torch.version.hip) and torch.cuda.is_available()
+_HAS_NVIDIA = bool(torch.version.cuda) and torch.cuda.is_available()
 
 _LIB = torch.library.Library("kashi_iree_execution", "FRAGMENT")
 _LIB.define("write(Tensor(a!) out, Tensor value) -> ()")
@@ -50,7 +55,7 @@ def test_invalid_iree_execution_mode_is_rejected(tmp_path, monkeypatch):
 
 def test_cuda_target_uses_the_graph_device(monkeypatch):
     """The generated PTX target follows the captured tensor's GPU architecture."""
-    from kashi.iree_backend import _cuda_target
+    from kashi.iree_device import _cuda_target
 
     monkeypatch.delenv("IREE_CUDA_TARGET", raising=False)
 
@@ -62,14 +67,14 @@ def test_cuda_target_uses_the_graph_device(monkeypatch):
     assert _cuda_target(None, "cuda:1") == "sm_90"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
 @pytest.mark.parametrize(
-    "mode", [None, "cuda", "iree"], ids=["default", "cuda", "iree"]
+    "mode", [None, "direct", "iree"], ids=["default", "direct", "iree"]
 )
 def test_iree_graph_executes_dynamic_tensors_on_current_stream(
     tmp_path, monkeypatch, mode
 ):
-    """Both modes must execute dynamic shapes on the caller's CUDA stream."""
+    """Both modes must execute dynamic shapes on the caller's GPU stream."""
     from kashi.iree_backend import compile_iree_fx
 
     if mode is None:
@@ -96,8 +101,8 @@ def test_iree_graph_executes_dynamic_tensors_on_current_stream(
     stream.synchronize()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 def test_iree_graph_preserves_mutating_custom_boundary(tmp_path, monkeypatch, mode):
     """Both modes must preserve writes consumed by later compiled segments."""
     from kashi.iree_backend import compile_iree_fx
@@ -123,8 +128,8 @@ def test_iree_graph_preserves_mutating_custom_boundary(tmp_path, monkeypatch, mo
     torch.testing.assert_close(actual, -expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_iree_graph_matmul_matches_torch(tmp_path, monkeypatch, mode, dtype):
     """Both launch paths reproduce matrix multiplication for real model dtypes."""
@@ -148,8 +153,8 @@ def test_iree_graph_matmul_matches_torch(tmp_path, monkeypatch, mode, dtype):
     torch.testing.assert_close(actual, model(a, b))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 def test_iree_graph_preserves_split_view_mutation(tmp_path, monkeypatch, mode):
     """A custom mutation of a split view must update its original tensor."""
     from kashi.iree_backend import compile_iree_fx
@@ -178,8 +183,8 @@ def test_iree_graph_preserves_split_view_mutation(tmp_path, monkeypatch, mode):
     assert right.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 def test_iree_graph_keeps_distinct_outputs_independent(tmp_path, monkeypatch, mode):
     """IREE common-subexpression elimination must not create new aliases."""
     from kashi.iree_backend import compile_iree_fx
@@ -204,8 +209,8 @@ def test_iree_graph_keeps_distinct_outputs_independent(tmp_path, monkeypatch, mo
     torch.testing.assert_close(second, expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 def test_torch_compile_iree_backend_keeps_artifacts_alive(monkeypatch, mode):
     """The public backend can execute repeatedly without a caller-owned directory."""
     import gc
@@ -226,12 +231,12 @@ def test_torch_compile_iree_backend_keeps_artifacts_alive(monkeypatch, mode):
     torch.testing.assert_close(compiled(x + 2), -(x + 2))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.skipif(not _HAS_NVIDIA, reason="NVIDIA CUDA device required")
 def test_direct_cuda_backend_supports_graph_replay(monkeypatch):
     """Direct launches participate in CUDA graph capture and replay."""
     from kashi.iree_backend import compile_iree_backend
 
-    monkeypatch.setenv("KASHI_IREE_EXECUTION", "cuda")
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", "direct")
     torch._dynamo.reset()
 
     def model(x):
@@ -250,8 +255,8 @@ def test_direct_cuda_backend_supports_graph_replay(monkeypatch):
     torch.testing.assert_close(output, -x)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.skipif(not _HAS_GPU, reason="CUDA or HIP device required")
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 def test_iree_graph_preserves_unsigned_dtype(monkeypatch, mode):
     """IREE's signless integer types must retain PyTorch's unsigned dtype."""
     from kashi.iree_backend import compile_iree_backend

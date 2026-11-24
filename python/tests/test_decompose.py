@@ -435,7 +435,10 @@ def test_partitioned_artifact_keeps_tags(tmp_path):
 # --- Parity with vLLM's real kernels (CUDA only). -----------------------------
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM _C kernels need CUDA")
+@pytest.mark.skipif(
+    not (torch.version.cuda and torch.cuda.is_available()),
+    reason="vLLM _C kernels need an NVIDIA CUDA device",
+)
 @pytest.mark.parametrize(
     "program, inputs",
     [
