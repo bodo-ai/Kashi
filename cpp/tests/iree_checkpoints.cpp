@@ -11,7 +11,6 @@
 
 #ifdef __linux__
 #include <signal.h>
-#include <utility>
 #endif
 
 #include <catch2/catch_test_macros.hpp>

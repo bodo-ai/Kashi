@@ -71,11 +71,19 @@ jobs:
         with:
           pixi-version: v0.82.0
           locked: true
+          run-install: ${{ runner.os == 'Linux' }}
           environments: ${{ runner.os == 'Linux' && 'default cpp-coverage' || 'default' }}
           cache-key: pixi-test-${{ hashFiles('cmake/iree-sdk.json') }}-
+      - name: Install macOS dependencies and editable package
+        if: runner.os == 'macOS'
+        # Pixi resolves against the locked macOS 14 target. Pip uses the
+        # runner's actual platform when installing our macOS 26 editable wheel.
+        run: |
+          pixi install --locked --skip kashi
+          pixi run --locked --no-install python -m pip install --no-deps -e .
       - name: Python tests
         if: runner.os != 'Linux'
-        run: pixi run --locked test-python
+        run: pixi run --locked --no-install test-python
       - name: Python tests with coverage
         if: runner.os == 'Linux'
         run: pixi run --locked coverage-python
@@ -85,7 +93,7 @@ jobs:
         run: rm -rf build/scikit
       - name: Native tests
         if: runner.os != 'Linux'
-        run: pixi run --locked test-cpp
+        run: pixi run --locked --no-install test-cpp
       - name: Native tests with coverage
         if: runner.os == 'Linux'
         run: pixi run --locked --no-install -e cpp-coverage coverage-cpp
