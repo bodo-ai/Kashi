@@ -72,13 +72,32 @@ def test_dispatch_workload_metadata_multiresult_and_stable_kernel():
         kernels[0].target(a, b, workload=[4])
 
 
-def test_tied_dispatch_is_rejected():
-    """Aliased dispatch outputs cannot be represented as pure FX calls."""
+def test_tied_dispatch_records_aliasing_on_an_opaque_call():
+    """In-place dispatches (e.g. IREE's concatenation copies) stay opaque calls.
+
+    The kernels cannot execute yet, so the result is modeled as the call's
+    value and the tie is kept as metadata for a future executable lowering.
+    """
     text = DISPATCH.replace("[-1 : index, -1 : index]", "[0 : index, -1 : index]")
     handler = flow_segment_handlers(text, device=None)["segment_1"]
     graph = torch.fx.Graph()
-    with pytest.raises(NotImplementedError, match="tied operands"):
-        handler(graph, [graph.placeholder("a"), graph.placeholder("b")])
+    a, b = graph.placeholder("a"), graph.placeholder("b")
+
+    results = handler(graph, [a, b])
+
+    (kernel,) = [n for n in graph.nodes if isinstance(n.target, IreeKernel)]
+    assert kernel.args == (a, b)
+    assert kernel.meta["iree_tied_operands"] == [0, -1]
+    assert [n.args for n in results] == [(kernel, 0), (kernel, 1)]
+
+
+def test_untied_dispatch_has_no_tied_metadata():
+    handler = flow_segment_handlers(DISPATCH, device=None)["segment_1"]
+    graph = torch.fx.Graph()
+    handler(graph, [graph.placeholder("a"), graph.placeholder("b")])
+
+    (kernel,) = [n for n in graph.nodes if isinstance(n.target, IreeKernel)]
+    assert "iree_tied_operands" not in kernel.meta
 
 
 def test_unsupported_operation_is_named():
