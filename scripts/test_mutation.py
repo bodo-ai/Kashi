@@ -414,7 +414,11 @@ def main():
         ],
         env=env,
     )
-    build_output = run(["cmake", "--build", BUILD], env=env, capture=True)
+    build_output = run(
+        ["cmake", "--build", BUILD, "--target", "kashi_native_tests"],
+        env=env,
+        capture=True,
+    )
     print(build_output, end="", flush=True)
     if "Using some defaults" in build_output or "Failed to load passes" in build_output:
         raise MutationError("Mull plugin or configuration failed during compilation")

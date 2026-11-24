@@ -75,12 +75,16 @@ jobs:
       - name: Python tests with coverage
         if: runner.os == 'Linux'
         run: pixi run --locked coverage-python
+      - name: Reclaim editable build space before native coverage
+        if: runner.os == 'Linux'
+        # Python coverage is complete; native coverage builds its own test binary.
+        run: rm -rf build/scikit
       - name: Native tests
         if: runner.os != 'Linux'
         run: pixi run --locked test-cpp
       - name: Native tests with coverage
         if: runner.os == 'Linux'
-        run: pixi run --locked -e cpp-coverage coverage-cpp
+        run: pixi run --locked --no-install -e cpp-coverage coverage-cpp
       - name: Require more than 90% changed-line coverage
         if: runner.os == 'Linux' && github.event_name == 'pull_request'
         shell: bash

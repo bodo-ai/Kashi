@@ -165,6 +165,9 @@ uses the locked Linux x86-64 Clang/LLVM environment and an instrumented
 `build/coverage-cpp/` tree. It measures `cpp/lib/` and `cpp/include/` through
 Catch2/CTest, not the native extension loaded by Python or code in dependencies.
 It reports `no native tests yet` until there are native tests to run.
+The native coverage build uses Release to avoid generating debug symbols for
+embedded LLVM. CI removes the editable build tree after Python coverage to
+leave room for the separate native build.
 
 Reports are written to `build/coverage/`: `python.xml` and `python.md` for
 Python, `cpp.txt` and (when coverage is available) `cpp.json` and `cpp.lcov` for C++. GitHub
@@ -183,6 +186,8 @@ Every pull request runs Mull against added or modified C++ files under
 The PR check fails if any mutant survives across all tests. Manually dispatched
 runs cover all project C++ code and report survivors without failing on them.
 Baseline and infrastructure errors fail both modes.
+CI installs only the native build dependencies and runs Mull without
+installing the editable Python package.
 
 Reports are in `build/mutation/reports/`.
 

@@ -68,7 +68,7 @@ jobs:
         shell: bash
         env:
           MULL_DIFF_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
-        run: pixi run --locked test-mutation 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
+        run: pixi run --locked --no-install test-mutation 2>&1 | tee -a "$RUNNER_TEMP/mutation.log"
       - name: Upload mutation reports
         if: always()
         uses: actions/upload-artifact@v4
