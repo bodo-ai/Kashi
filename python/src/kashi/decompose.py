@@ -242,6 +242,9 @@ def decompose_custom_ops(graph: torch.fx.Graph) -> None:
         rule = _DECOMPOSITIONS.get(name)
         if rule is None:
             continue
+        # Add tag to decomposed nodes indicating the operator they originated from, for
+        # example: "_C.rms_norm#2" if the node originated from the 3rd rm_norm in the
+        # graph. The FxImporter uses this tag to generate a NameLoc.
         tag = f"{name.replace('::', '.')}#{counts[name]}"
         counts[name] += 1
         op_position = position[op]
