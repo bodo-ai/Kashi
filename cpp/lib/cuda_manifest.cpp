@@ -64,15 +64,18 @@ StringRef nextPtxToken(StringRef &image) {
     if (first == '"' || first == '\'') {
       while (length < image.size()) {
         char c = image[length++];
-        if (c == first)
+        if (c == first) {
           break;
-        if (c == '\\' && length < image.size())
+        }
+        if (c == '\\' && length < image.size()) {
           ++length;
+        }
       }
     } else if (isPtxWordChar(first)) {
       // Keep dotted words together so a suffix cannot look like a directive.
-      while (length < image.size() && isPtxWordChar(image[length]))
+      while (length < image.size() && isPtxWordChar(image[length])) {
         ++length;
+      }
     }
     auto token = image.take_front(length);
     image = image.drop_front(length);
@@ -93,13 +96,15 @@ llvm::DenseSet<StringRef> readPtxEntries(StringRef image) {
       char first = token.front();
       if ((llvm::isAlpha(first) ||
            (token.size() > 1 && StringRef("_$%").contains(first))) &&
-          token.drop_front().find_first_of(".%") == StringRef::npos)
+          token.drop_front().find_first_of(".%") == StringRef::npos) {
         entries.insert(token);
+      }
     }
-    if (token == "{")
+    if (token == "{") {
       ++depth;
-    else if (token == "}" && depth != 0)
+    } else if (token == "}" && depth != 0) {
       --depth;
+    }
     expectName = depth == 0 && token == ".entry";
   }
   return entries;
@@ -110,8 +115,9 @@ LogicalResult extractCudaBinary(IREE::HAL::ExecutableBinaryOp binary,
                                 size_t &nextImage,
                                 llvm::StringMap<KernelLocation> &locations) {
   auto data = dyn_cast<DenseIntElementsAttr>(binary.getData());
-  if (!data || !data.getElementType().isInteger(8) || data.isSplat())
+  if (!data || !data.getElementType().isInteger(8) || data.isSplat()) {
     return binary.emitError("expected a byte array for the CUDA executable");
+  }
   auto raw = data.getRawData();
   iree_const_byte_span_t flatbuffer{};
   auto status = iree_hal_read_executable_flatbuffer_header(
@@ -122,8 +128,9 @@ LogicalResult extractCudaBinary(IREE::HAL::ExecutableBinaryOp binary,
     return binary.emitError("invalid serialized CUDA executable header");
   }
   if (iree_hal_cuda_ExecutableDef_verify_as_root(flatbuffer.data,
-                                                 flatbuffer.data_length))
+                                                 flatbuffer.data_length)) {
     return binary.emitError("invalid serialized CUDA executable FlatBuffer");
+  }
   auto root = iree_hal_cuda_ExecutableDef_as_root(flatbuffer.data);
   auto modules = iree_hal_cuda_ExecutableDef_modules(root);
   auto exports = iree_hal_cuda_ExecutableDef_exports(root);
@@ -135,13 +142,15 @@ LogicalResult extractCudaBinary(IREE::HAL::ExecutableBinaryOp binary,
   for (size_t i = 0, e = iree_hal_cuda_ModuleDef_vec_len(modules); i < e; ++i) {
     auto ptx = iree_hal_cuda_ModuleDef_ptx_image(
         iree_hal_cuda_ModuleDef_vec_at(modules, i));
-    if (!ptx)
+    if (!ptx) {
       return binary.emitError("missing serialized CUDA PTX image");
+    }
     StringRef text(ptx, flatbuffers_string_len(ptx));
     auto file = "kernel_" + std::to_string(nextImage++) + ".ptx";
     if (failed(writeFile(binary, directory / file,
-                         [&](auto &out) { out << text; })))
+                         [&](auto &out) { out << text; }))) {
       return failure();
+    }
     images.push_back({std::move(file), readPtxEntries(text)});
   }
   for (size_t i = 0, e = iree_hal_cuda_ExportDef_vec_len(exports); i < e; ++i) {
@@ -149,20 +158,23 @@ LogicalResult extractCudaBinary(IREE::HAL::ExecutableBinaryOp binary,
     auto ordinal = iree_hal_cuda_ExportDef_module_ordinal(entry);
     auto exportName = iree_hal_cuda_ExportDef_export_name(entry);
     auto kernelName = iree_hal_cuda_ExportDef_kernel_name(entry);
-    if (!exportName || !kernelName || ordinal >= images.size())
+    if (!exportName || !kernelName || ordinal >= images.size()) {
       return binary.emitError(
           "serialized CUDA export has no matching PTX entry");
+    }
     const auto &image = images[ordinal];
     StringRef entryName(kernelName, flatbuffers_string_len(kernelName));
-    if (!image.entries.contains(entryName))
+    if (!image.entries.contains(entryName)) {
       return binary.emitError(
           "serialized CUDA export has no matching PTX entry");
+    }
     StringRef stableName(exportName, flatbuffers_string_len(exportName));
     if (!locations
              .try_emplace(stableName, KernelLocation{image.file, entryName})
-             .second)
+             .second) {
       return binary.emitError("ambiguous serialized CUDA export: ")
              << stableName;
+    }
   }
   return success();
 }
@@ -174,8 +186,9 @@ LogicalResult extractCudaBinary(IREE::HAL::ExecutableBinaryOp binary,
 FailureOr<std::vector<KernelIdentity>> identifyCudaKernels(ModuleOp module) {
   llvm::DenseSet<StringAttr> names;
   module.walk([&](SymbolOpInterface symbol) {
-    if (auto name = symbol.getNameAttr())
+    if (auto name = symbol.getNameAttr()) {
       names.insert(name);
+    }
   });
   std::vector<KernelIdentity> identities;
   // CUDA serialization matches functions and exports by name, so rename both.
@@ -183,8 +196,9 @@ FailureOr<std::vector<KernelIdentity>> identifyCudaKernels(ModuleOp module) {
   size_t nextName = 0;
   for (auto executable : module.getOps<IREE::Flow::ExecutableOp>()) {
     auto inner = executable.getInnerModule();
-    if (!inner)
+    if (!inner) {
       return executable.emitError("expected a Flow executable with a body");
+    }
     SymbolTable symbols(inner);
     llvm::SmallDenseMap<StringAttr, StringAttr, 4> assigned;
     for (auto exportOp : executable.getOps<IREE::Flow::ExecutableExportOp>()) {
@@ -192,23 +206,26 @@ FailureOr<std::vector<KernelIdentity>> identifyCudaKernels(ModuleOp module) {
       auto [it, inserted] = assigned.try_emplace(originalName);
       if (inserted) {
         auto function = symbols.lookup<SymbolOpInterface>(originalName);
-        if (!function)
+        if (!function) {
           return exportOp.emitError(
               "cannot resolve the exported Flow function");
+        }
         do {
           llvm::SmallString<32> buffer;
           llvm::raw_svector_ostream stream(buffer);
           stream << "kashi_kernel_" << nextName++;
           it->second = StringAttr::get(module.getContext(), buffer);
         } while (!names.insert(it->second).second);
-        if (failed(symbols.rename(function, it->second)))
+        if (failed(symbols.rename(function, it->second))) {
           return exportOp.emitError("cannot rename the exported Flow function");
+        }
       }
       exportOp.setFunctionRefAttr(FlatSymbolRefAttr::get(it->second));
       // Dispatches still reference the old qualified export symbol.
-      if (failed(
-              SymbolTable::replaceAllSymbolUses(exportOp, it->second, module)))
+      if (failed(SymbolTable::replaceAllSymbolUses(exportOp, it->second,
+                                                   module))) {
         return exportOp.emitError("cannot retarget Flow dispatch references");
+      }
       identities.push_back({executable.getSymName(), exportOp.getSymName(),
                             it->second.getValue()});
       exportOp.setSymNameAttr(it->second);
@@ -226,18 +243,21 @@ LogicalResult writeCudaManifest(ModuleOp module,
   for (auto executable : module.getOps<IREE::HAL::ExecutableOp>()) {
     for (auto binary : executable.getOps<IREE::HAL::ExecutableBinaryOp>()) {
       if (binary.getFormat() == "cuda-nvptx-fb" &&
-          failed(extractCudaBinary(binary, directory, nextImage, locations)))
+          failed(extractCudaBinary(binary, directory, nextImage, locations))) {
         return failure();
+      }
     }
   }
   llvm::json::Object manifest;
   for (const auto &identity : identities) {
     auto it = locations.find(identity.stableName);
-    if (it == locations.end())
+    if (it == locations.end()) {
       return module.emitError("missing serialized CUDA export for ")
              << identity.executable << "::" << identity.exportName;
-    if (!manifest.getObject(identity.executable))
+    }
+    if (!manifest.getObject(identity.executable)) {
       manifest[identity.executable] = llvm::json::Object{};
+    }
     (*manifest.getObject(identity.executable))[identity.exportName] =
         llvm::json::Object{{"file", StringRef(it->second.file)},
                            {"entry", it->second.entry}};

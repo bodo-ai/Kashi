@@ -66,10 +66,12 @@ LogicalResult classifySourceOps(Block &body, PartitionPlan &plan) {
   plan.segments.emplace_back();
   for (Operation &op : body.without_terminator()) {
     StringRef name = op.getName().getStringRef();
-    if (op.getNumRegions())
+    if (op.getNumRegions()) {
       return op.emitError("nested regions are not supported");
-    if (!name.starts_with("torch."))
+    }
+    if (!name.starts_with("torch.")) {
       return op.emitError("unsupported source operation: ") << name;
+    }
     if (isCustomOp(op)) {
       plan.segments.emplace_back();
       continue;
@@ -88,15 +90,18 @@ LogicalResult classifySourceOps(Block &body, PartitionPlan &plan) {
       continue;
     }
 
-    if (constant && op.getNumOperands())
+    if (constant && op.getNumOperands()) {
       return op.emitError("constant with operands: ") << name;
+    }
     if (name == Torch::ConstantDeviceOp::getOperationName()) {
       StringRef device = op.getAttrOfType<StringAttr>("value").getValue();
-      if (plan.sourceDevice && device != *plan.sourceDevice)
+      if (plan.sourceDevice && device != *plan.sourceDevice) {
         return op.emitError("multiple source devices are unsupported: ")
                << *plan.sourceDevice << " and " << device;
-      if (!plan.sourceDevice)
+      }
+      if (!plan.sourceDevice) {
         plan.sourceDevice = device.str();
+      }
     }
     plan.constants.insert(&op);
   }
@@ -106,11 +111,13 @@ LogicalResult classifySourceOps(Block &body, PartitionPlan &plan) {
 /// Collect a constant and all the constants it needs.
 void collectConstantClosure(Operation &op,
                             llvm::DenseSet<Operation *> &needed) {
-  if (!needed.insert(&op).second)
+  if (!needed.insert(&op).second) {
     return;
+  }
   // Only constant lists have operands, all defined by earlier constants.
-  for (Value element : op.getOperands())
+  for (Value element : op.getOperands()) {
     collectConstantClosure(*element.getDefiningOp(), needed);
+  }
 }
 
 LogicalResult computeSegmentABI(const PartitionPlan &plan, size_t index,
@@ -137,19 +144,23 @@ LogicalResult computeSegmentABI(const PartitionPlan &plan, size_t index,
         collectConstantClosure(*def, neededConstants);
         continue;
       }
-      if (isLocal(def) || !seenInputs.insert(operand).second)
+      if (isLocal(def) || !seenInputs.insert(operand).second) {
         continue;
-      if (!supportsBoundaryType(operand.getType()))
+      }
+      if (!supportsBoundaryType(operand.getType())) {
         return op->emitError("unsupported live-in for ")
                << name << ": " << operand.getType();
+      }
       segment.inputs.push_back(operand);
     }
     for (Value result : op->getResults()) {
-      if (llvm::all_of(result.getUsers(), isLocal))
+      if (llvm::all_of(result.getUsers(), isLocal)) {
         continue;
-      if (!supportsBoundaryType(result.getType()))
+      }
+      if (!supportsBoundaryType(result.getType())) {
         return op->emitError("unsupported live-out for ")
                << name << ": " << result.getType();
+      }
       segment.outputs.push_back(result);
     }
   }
@@ -167,31 +178,40 @@ void populateSegmentBody(Segment &segment, const ConstantOps &constants,
   // Clone only the needed constants, in source order so list elements are
   // mapped before the list itself. Device rewriting is segment-local.
   for (Operation *op : constants) {
-    if (!neededConstants.contains(op))
+    if (!neededConstants.contains(op)) {
       continue;
+    }
     Operation &clone = *builder.clone(*op, mapping);
     if (op->getName().getStringRef() ==
             Torch::ConstantDeviceOp::getOperationName() &&
-        op->getAttrOfType<StringAttr>("value").getValue().starts_with("cuda"))
+        op->getAttrOfType<StringAttr>("value").getValue().starts_with("cuda")) {
       clone.setAttr("value", builder.getStringAttr("cpu"));
+    }
   }
-  for (Operation *op : segment.ops)
+  for (Operation *op : segment.ops) {
     builder.clone(*op, mapping);
+  }
   func::ReturnOp::create(builder, returnLoc, mapped(segment.outputs, mapping));
 }
 
+/// Outline each nonempty segment as a definition in the segment module and a
+/// matching private declaration in the driver. Compute its ordered SSA
+/// interface once so the definition and its driver calls share the same ABI.
 LogicalResult outlineSegments(PartitionPlan &plan, Partition &result,
                               func::FuncOp main, func::ReturnOp ret) {
   OpBuilder segmentBuilder = OpBuilder::atBlockEnd(result.segments->getBody());
   OpBuilder driverBuilder = OpBuilder::atBlockEnd(result.driver->getBody());
   for (auto [index, segment] : llvm::enumerate(plan.segments)) {
-    if (segment.ops.empty())
+    if (segment.ops.empty()) {
       continue;
+    }
 
     std::string name = "segment_" + std::to_string(index);
     llvm::DenseSet<Operation *> neededConstants;
-    if (failed(computeSegmentABI(plan, index, name, segment, neededConstants)))
+    if (failed(
+            computeSegmentABI(plan, index, name, segment, neededConstants))) {
       return failure();
+    }
 
     auto signature =
         segmentBuilder.getFunctionType(TypeRange(ValueRange(segment.inputs)),
@@ -207,8 +227,9 @@ LogicalResult outlineSegments(PartitionPlan &plan, Partition &result,
 
 void callSegment(OpBuilder &builder, Location loc, const Segment &segment,
                  IRMapping &mapping) {
-  if (!segment.function)
+  if (!segment.function) {
     return;
+  }
   auto call = func::CallOp::create(builder, loc, segment.function,
                                    mapped(segment.inputs, mapping));
   // The same ABI order binds return operand i to call result i and restores
@@ -229,10 +250,11 @@ void buildDriver(ModuleOp driver, const PartitionPlan &plan, func::FuncOp main,
 
   size_t index = 0;
   for (Operation &op : sourceBody.without_terminator()) {
-    if (isCustomOp(op))
+    if (isCustomOp(op)) {
       callSegment(builder, op.getLoc(), plan.segments[index++], mapping);
-    else if (!plan.constants.contains(&op))
+    } else if (!plan.constants.contains(&op)) {
       continue;
+    }
     builder.clone(op, mapping);
   }
   callSegment(builder, ret.getLoc(), plan.segments[index], mapping);
@@ -242,31 +264,37 @@ void buildDriver(ModuleOp driver, const PartitionPlan &plan, func::FuncOp main,
 
 FailureOr<Partition> partitionTorchModule(ModuleOp source) {
   auto &operations = source.getBody()->getOperations();
-  if (!llvm::hasSingleElement(operations))
+  if (!llvm::hasSingleElement(operations)) {
     return source.emitError(
         "expected a module containing only func.func @main");
+  }
   auto main = dyn_cast<func::FuncOp>(operations.front());
   if (!main || main.getSymName() != "main" ||
-      !llvm::hasSingleElement(main.getBody()))
+      !llvm::hasSingleElement(main.getBody())) {
     return source.emitError("expected a single block in func.func @main");
+  }
   Block &body = main.getBody().front();
   auto ret = dyn_cast_or_null<func::ReturnOp>(body.getTerminator());
-  if (!ret)
+  if (!ret) {
     return main.emitError("expected func.return at the end of @main");
+  }
 
   PartitionPlan plan;
-  if (failed(classifySourceOps(body, plan)))
+  if (failed(classifySourceOps(body, plan))) {
     return failure();
+  }
 
   Partition result{ModuleOp::create(source.getLoc()),
                    ModuleOp::create(source.getLoc()),
                    std::move(plan.sourceDevice)};
-  if (failed(outlineSegments(plan, result, main, ret)))
+  if (failed(outlineSegments(plan, result, main, ret))) {
     return failure();
+  }
 
   buildDriver(*result.driver, plan, main, ret);
-  if (failed(verify(*result.driver)))
+  if (failed(verify(*result.driver))) {
     return failure();
+  }
   return result;
 }
 } // namespace kashi

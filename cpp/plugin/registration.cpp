@@ -133,8 +133,9 @@ struct CollideFlowFunctions final
     for (auto executable : getOperation().getOps<IREE::Flow::ExecutableOp>()) {
       SymbolTable inner(executable.getInnerModule());
       auto exports = executable.getOps<IREE::Flow::ExecutableExportOp>();
-      if (!llvm::hasSingleElement(exports))
+      if (!llvm::hasSingleElement(exports)) {
         continue;
+      }
       auto exportOp = *exports.begin();
       auto *function = inner.lookup(exportOp.getFunctionRef());
       if (!function || failed(inner.rename(function, "shared_kernel"))) {

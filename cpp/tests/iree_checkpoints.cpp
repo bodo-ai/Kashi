@@ -193,10 +193,11 @@ TEST_CASE("Compiler artifact writes preserve the host signal handler") {
   kashi::compileIree(fixture, {artifacts.directory, IreeBackend::VMVX, {}});
   REQUIRE(sigaction(SIGTERM, nullptr, &after) == 0);
   REQUIRE(after.sa_flags == before.sa_flags);
-  if (before.sa_flags & SA_SIGINFO)
+  if (before.sa_flags & SA_SIGINFO) {
     REQUIRE(after.sa_sigaction == before.sa_sigaction);
-  else
+  } else {
     REQUIRE(after.sa_handler == before.sa_handler);
+  }
 }
 
 // An opened but unwritable log must not be presented as a diagnostic source.

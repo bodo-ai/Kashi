@@ -1,3 +1,9 @@
+// Kashi embeds IREE to compile partitioned Torch MLIR in process. Only the
+// segment module enters IREE's standard pipeline; the driver stays available
+// for Python to rebuild FX. At selected phase boundaries we run registered
+// Kashi passes and capture artifacts, then resume on the same invocation
+// without serializing IR between phases.
+
 #include "kashi/iree_compiler.h"
 #include "kashi/cuda_manifest.h"
 #include "kashi/iree_partition.h"
@@ -46,9 +52,10 @@ struct CompilerRuntime {
 struct Diagnostics {
   /// Open the log before any invocation can emit diagnostics.
   explicit Diagnostics(fs::path path) : path(std::move(path)), log(this->path) {
-    if (!log)
+    if (!log) {
       throw std::runtime_error("cannot open IREE diagnostic log: " +
                                this->path.string());
+    }
   }
   fs::path path;
   std::ofstream log;
@@ -61,8 +68,9 @@ struct Diagnostics {
                       const char *text, size_t size, void *data) {
     auto &self = *static_cast<Diagnostics *>(data);
     std::lock_guard lock(self.mutex);
-    if (severity == IREE_COMPILER_DIAGNOSTIC_SEVERITY_ERROR)
+    if (severity == IREE_COMPILER_DIAGNOSTIC_SEVERITY_ERROR) {
       self.log << "error: ";
+    }
     self.log.write(text, static_cast<std::streamsize>(size)) << '\n';
   }
 
@@ -74,8 +82,9 @@ struct Diagnostics {
     const std::string failure = ("IREE " + stage + " failed").str();
     std::lock_guard lock(mutex);
     log << failure;
-    if (message)
+    if (message) {
       log << ": " << *message;
+    }
     log << '\n' << std::flush;
     throw Error(failure + "; " +
                 (log ? "see " : "cannot write diagnostic log ") +
@@ -91,8 +100,9 @@ struct Diagnostics {
 
   template <typename Error = std::runtime_error, typename T>
   T require(FailureOr<T> result, const llvm::Twine &stage) {
-    if (failed(result))
+    if (failed(result)) {
       fail<Error>(stage);
+    }
     // Keep the MLIR predicate: FailureOr hides std::optional::has_value().
     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
     return std::move(*result);
@@ -128,8 +138,9 @@ const char *terminatedData(llvm::StringRef literal) {
 const BackendConfig &getBackendConfig(const IreeCompileOptions &options,
                                       Diagnostics &diagnostics) {
   for (const auto &config : backendConfigs) {
-    if (options.target == config.backend)
+    if (options.target == config.backend) {
       return config;
+    }
   }
   diagnostics.fail("configuration", "expected target cuda or vmvx");
 }
@@ -152,8 +163,9 @@ Session createSession(const BackendConfig &backend,
   } else if (backend.architectureFlag || architecture) {
     diagnostics.fail("configuration", "cuda_target is required only for CUDA");
   }
-  for (StringLiteral flag : backend.extraFlags)
+  for (StringLiteral flag : backend.extraFlags) {
     flags.push_back(terminatedData(flag));
+  }
   Session session(ireeCompilerSessionCreate());
   diagnostics.check(
       CompilerError(ireeCompilerSessionSetFlags(
@@ -183,8 +195,9 @@ public:
   }
 
   void parse(const Source &source) {
-    if (!ireeCompilerInvocationParseSource(handle.get(), source.get()))
+    if (!ireeCompilerInvocationParseSource(handle.get(), source.get())) {
       diagnostics.fail("parse");
+    }
   }
 
   OwningOpRef<ModuleOp> takeModule() {
@@ -194,8 +207,9 @@ public:
 
   void putModule(OwningOpRef<ModuleOp> module, llvm::StringRef stage) {
     if (!ireeCompilerInvocationImportStealModule(
-            handle.get(), wrap(module.release().getOperation())))
+            handle.get(), wrap(module.release().getOperation()))) {
       diagnostics.fail(stage);
+    }
   }
 
   // Phase names are null-terminated literals from IREE's phase enumeration.
@@ -204,15 +218,17 @@ public:
                                               terminatedData(nextPhase));
     ireeCompilerInvocationSetCompileToPhase(handle.get(), terminatedData(to));
     if (!ireeCompilerInvocationPipeline(handle.get(),
-                                        IREE_COMPILER_PIPELINE_STD))
+                                        IREE_COMPILER_PIPELINE_STD)) {
       diagnostics.fail("compile through " + to);
+    }
     nextPhase = to;
   }
 
   void runPasses(llvm::StringRef checkpoint, llvm::StringLiteral pipeline) {
     if (!ireeCompilerInvocationRunPassPipeline(handle.get(),
-                                               terminatedData(pipeline)))
+                                               terminatedData(pipeline))) {
       diagnostics.fail("pass at " + checkpoint);
+    }
   }
 
 private:
@@ -279,32 +295,39 @@ checkpointPasses(Phase phase, IreeBackend backend,
   const bool cuda = backend == IreeBackend::CUDA;
   switch (phase) {
   case Phase::Start:
-    if (probes)
+    if (probes) {
       return StringLiteral("kashi-verify-segments,kashi-probe-torch");
+    }
     return StringLiteral("kashi-verify-segments");
   case Phase::Flow:
-    if (testPipeline == IreeTestPipeline::FailAtFlow)
+    if (testPipeline == IreeTestPipeline::FailAtFlow) {
       return StringLiteral("kashi-fail-flow-probe");
-    if (probes && cuda)
+    }
+    if (probes && cuda) {
       return StringLiteral("kashi-probe-flow,kashi-collide-flow-functions");
-    if (probes)
+    }
+    if (probes) {
       return StringLiteral("kashi-probe-flow");
+    }
     break;
   case Phase::ExecutableConfigurations:
-    if (probes && cuda)
+    if (probes && cuda) {
       return StringLiteral("kashi-probe-configurations");
+    }
     break;
   case Phase::ExecutableTargets:
     // The API appends to the root pass manager. Wrap only nested operations:
     // an outer builtin.module would skip the root module.
-    if (probes && cuda)
+    if (probes && cuda) {
       return StringLiteral(
           "hal.executable(hal.executable.variant(builtin.module("
           "kashi-probe-nvvm)))");
+    }
     break;
   case Phase::VM:
-    if (probes)
+    if (probes) {
       return StringLiteral("kashi-probe-vm");
+    }
     break;
   default:
     break;
@@ -325,9 +348,10 @@ std::vector<KernelIdentity> captureFlow(Invocation &invocation,
                   return success();
                 });
   std::vector<KernelIdentity> identities;
-  if (backend == IreeBackend::CUDA)
+  if (backend == IreeBackend::CUDA) {
     identities = diagnostics.require(identifyCudaKernels(*flow),
                                      "identify Flow exports");
+  }
   invocation.putModule(std::move(flow), "verify Flow checkpoint");
   return identities;
 }
@@ -336,8 +360,9 @@ void emitCudaManifest(Invocation &invocation, const fs::path &dir,
                       const std::vector<KernelIdentity> &identities,
                       Diagnostics &diagnostics) {
   auto hal = invocation.takeModule();
-  if (failed(writeCudaManifest(*hal, dir, identities)))
+  if (failed(writeCudaManifest(*hal, dir, identities))) {
     diagnostics.fail("resolve linked CUDA exports");
+  }
   invocation.putModule(std::move(hal), "verify linked HAL module");
 }
 
@@ -352,16 +377,21 @@ void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
         const bool snapshot = phase == Phase::Flow;
         const bool manifest =
             backend == IreeBackend::CUDA && phase == Phase::HAL;
-        if (!pipeline && !snapshot && !manifest)
+        if (!pipeline && !snapshot && !manifest) {
           return;
-        if (phase != Phase::Start)
+        }
+        if (phase != Phase::Start) {
           invocation.lowerTo(name);
-        if (pipeline)
+        }
+        if (pipeline) {
           invocation.runPasses(name, *pipeline);
-        if (snapshot)
+        }
+        if (snapshot) {
           identities = captureFlow(invocation, dir, backend, diagnostics);
-        if (manifest)
+        }
+        if (manifest) {
           emitCudaManifest(invocation, dir, identities, diagnostics);
+        }
       });
   invocation.lowerTo("end");
 }
@@ -387,8 +417,9 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
 
 std::optional<IreeBackend> parseIreeBackend(std::string_view target) {
   for (const auto &config : backendConfigs) {
-    if (config.name == target)
+    if (config.name == target) {
       return config.backend;
+    }
   }
   return std::nullopt;
 }
