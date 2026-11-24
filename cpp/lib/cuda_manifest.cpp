@@ -60,25 +60,24 @@ StringRef nextPtxToken(StringRef &image) {
       continue;
     }
     char first = image.front();
-    size_t length = 1;
+    auto rest = image.drop_front();
     if (first == '"' || first == '\'') {
-      while (length < image.size()) {
-        char c = image[length++];
+      while (!rest.empty()) {
+        char c = rest.front();
+        rest = rest.drop_front();
         if (c == first) {
           break;
         }
-        if (c == '\\' && length < image.size()) {
-          ++length;
+        if (c == '\\') {
+          rest = rest.substr(1); // Clamp a trailing escape at EOF.
         }
       }
     } else if (isPtxWordChar(first)) {
       // Keep dotted words together so a suffix cannot look like a directive.
-      while (length < image.size() && isPtxWordChar(image[length])) {
-        ++length;
-      }
+      rest = rest.drop_while(isPtxWordChar);
     }
-    auto token = image.take_front(length);
-    image = image.drop_front(length);
+    auto token = image.take_front(image.size() - rest.size());
+    image = rest;
     return token;
   }
   return {};
@@ -93,10 +92,13 @@ llvm::DenseSet<StringRef> readPtxEntries(StringRef image) {
   for (auto token = nextPtxToken(image); !token.empty();
        token = nextPtxToken(image)) {
     if (expectName) {
+      // PTX permits a single letter; _, $, and % require a following
+      // identifier character. A dot or noninitial % is never part of a name.
+      auto suffix = token.drop_front();
       char first = token.front();
       if ((llvm::isAlpha(first) ||
-           (token.size() > 1 && StringRef("_$%").contains(first))) &&
-          token.drop_front().find_first_of(".%") == StringRef::npos) {
+           (!suffix.empty() && StringRef("_$%").contains(first))) &&
+          suffix.find_first_of(".%") == StringRef::npos) {
         entries.insert(token);
       }
     }

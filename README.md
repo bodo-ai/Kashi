@@ -252,7 +252,8 @@ The PR check fails if any mutant survives across all tests. Manually dispatched
 runs cover all project C++ code and report survivors without failing on them.
 Baseline and infrastructure errors fail both modes.
 CI installs only the native build dependencies and runs Mull without
-installing the editable Python package.
+installing the editable Python package. Linux mutation tests use the CUDA SDK
+to exercise PTX codegen and manifest generation without a GPU.
 
 Reports are in `build/mutation/reports/`.
 

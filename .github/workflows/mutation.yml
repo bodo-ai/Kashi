@@ -13,8 +13,7 @@ env:
 jobs:
   mutation:
     runs-on: ubuntu-24.04
-    env:
-      KASHI_DISABLE_CUDA: "1"
+    # CUDA checkpoint tests emit PTX offline; no GPU is needed.
     steps:
       - name: Initialize diagnostics
         run: printf 'Mutation job diagnostics\n' > "$RUNNER_TEMP/mutation.log"

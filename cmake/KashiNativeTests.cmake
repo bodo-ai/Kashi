@@ -11,13 +11,17 @@ if(KASHI_TEST_SOURCES)
   add_executable(kashi_native_tests ${KASHI_TEST_SOURCES})
   if(KASHI_IREE_SDK_DIR)
     target_link_libraries(kashi_native_tests PRIVATE
-      kashi_core Catch2::Catch2WithMain kashi_iree_plugin KashiIree::tests KashiIree::test_link)
+      kashi_core Catch2::Catch2WithMain kashi_iree_plugin
+      KashiIree::core KashiIree::tests KashiIree::test_link)
   else()
     target_include_directories(kashi_native_tests SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
     target_link_libraries(kashi_native_tests PRIVATE
       kashi_core Catch2::Catch2WithMain
       iree::compiler::Dialect::HAL::IR
       iree::compiler::Utils
+      iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR
+      MLIRFuncDialect
+      MLIRParser
       iree::schemas::cuda_executable_def_c_fbs
       iree::schemas::executable_debug_info_c_fbs)
   endif()
