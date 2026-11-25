@@ -10,7 +10,6 @@ import torch
 import vllm._custom_ops  # noqa # registers torch.ops._C
 from kashi.decompose import DECOMPOSED_FROM_KEY, decompose_custom_ops
 from kashi.importer import import_fx
-from kashi.iree_partition import partition_at_custom_ops
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
@@ -316,11 +315,6 @@ def test_import_without_flag_keeps_custom_ops():
 
     assert 'torch.operator "torch._C.rms_norm"' in asm
     assert "kashi.decomposed" not in asm
-
-
-def test_decomposed_graph_is_a_single_iree_segment():
-    """With no custom ops left, IREE gets one segment."""
-    assert len(partition_at_custom_ops(_import(decompose=True)).segments) == 1
 
 
 def test_compile_iree_fx_forwards_the_flag(monkeypatch, tmp_path):

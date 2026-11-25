@@ -7,7 +7,6 @@ graph. A compiler-provided executor makes each kernel call executable.
 """
 
 import operator
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -26,7 +25,49 @@ _ELEMENT_TYPE_TO_DTYPE = {
     "i32": torch.int32,
     "i64": torch.int64,
 }
-_ENTRY_POINT = re.compile(r"@(?P<executable>[^:]+)::@(?P<export>.+)")
+
+
+def _view_root(value):
+    """Find the storage-producing FX value beneath reconstructed views."""
+    while (
+        isinstance(value, torch.fx.Node)
+        and value.op == "call_function"
+        and value.target in (torch.ops.aten.view.default, torch.ops.aten.view.dtype)
+    ):
+        value = value.args[0]
+    return value
+
+
+def _segment_functions(module):
+    """Index native partition functions by their exported symbol name."""
+    return {
+        ir.StringAttr(op.attributes["sym_name"]).value: op
+        for op in module.body.operations
+        if op.operation.name == "func.func"
+    }
+
+
+def _segment_output_aliases(function):
+    """Identify source SSA results that are inputs or repeated results."""
+    block = function.regions[0].blocks[0]
+    inputs = {value: index for index, value in enumerate(block.arguments)}
+    seen = {}
+    aliases = []
+    for index, value in enumerate(block.operations[-1].operation.operands):
+        if value in inputs:
+            aliases.append(("input", inputs[value]))
+        elif value in seen:
+            aliases.append(("output", seen[value]))
+        else:
+            aliases.append(None)
+        seen.setdefault(value, index)
+    return aliases
+
+
+def _segment_result_types(function):
+    """Read result types from the native partition's return operands."""
+    block = function.regions[0].blocks[0]
+    return tuple(str(value.type) for value in block.operations[-1].operation.operands)
 
 
 class IreeKernel:
@@ -92,6 +133,9 @@ class _SegmentConverter:
                 f"function takes {len(data_args)} data arguments"
             )
         self.values.update(zip(data_args, args))
+        self.input_roots = {
+            _view_root(arg) for arg in args if isinstance(arg, torch.fx.Node)
+        }
 
     def convert(self) -> list:
         """Append the function's operations and return its data results."""
@@ -203,21 +247,17 @@ class _SegmentConverter:
             ir.IntegerAttr(a).value
             for a in ir.ArrayAttr(op.attributes["tied_operands"])
         ]
-        if self.kernel_factory is None and any(t != -1 for t in tied):
-            raise NotImplementedError(
-                f"flow.dispatch with tied operands in {self.name}"
-            )
         entries = ir.ArrayAttr(op.attributes["entry_points"])
         if len(entries) != 1:
             raise NotImplementedError(
                 f"flow.dispatch with multiple entry points in {self.name}"
             )
-        entry = _ENTRY_POINT.fullmatch(str(entries[0]))
-        if entry is None:
+        path = ir.SymbolRefAttr(entries[0]).value
+        if len(path) != 2:
             raise NotImplementedError(
                 f"Unsupported flow.dispatch entry point {entries[0]} in {self.name}"
             )
-        key = (entry.group("executable"), entry.group("export"))
+        key = (path[0], path[1])
         if key not in self.kernels:
             executor = (
                 self.kernel_factory(*key) if self.kernel_factory is not None else None
@@ -230,6 +270,24 @@ class _SegmentConverter:
         dims_end = args_end + num_argument_dims
         result_end = dims_end + num_result_dims
         args = operands[args_start:args_end]
+        # A Flow tie can reuse a live-in's storage even though Torch segment
+        # operations are functional. Protect source tensors before the kernel
+        # writes; internal allocations remain eligible for in-place reuse.
+        if self.kernel_factory is not None:
+            copies = {}
+            for index in tied:
+                if index < 0 or index >= len(args):
+                    continue
+                arg = args[index]
+                if (
+                    isinstance(arg, torch.fx.Node)
+                    and _view_root(arg) in self.input_roots
+                ):
+                    if arg not in copies:
+                        copies[arg] = self.graph.call_function(
+                            torch.ops.aten.clone.default, (arg,)
+                        )
+                    args[index] = copies[arg]
         kwargs = {"workload": workload}
         if self.kernel_factory is not None:
             # Flow separates dynamic result dimensions from kernel arguments.

@@ -1,7 +1,6 @@
 """Exercise the runtime segment bridge with compiled CUDA VM functions."""
 
 import gc
-from dataclasses import replace
 
 import pytest
 
@@ -9,7 +8,6 @@ torch = pytest.importorskip("torch")
 compiler = pytest.importorskip("iree.compiler")
 pytest.importorskip("iree.runtime")
 
-from kashi.iree_partition import PartitionResult, SegmentInfo
 from kashi.iree_runtime import runtime_segment_handlers
 
 MODULE = r"""
@@ -54,24 +52,21 @@ def compiled_module(tmp_path_factory):
     )
     path = tmp_path_factory.mktemp("runtime") / "module.vmfb"
     path.write_bytes(blob)
-    module = ir.Module.parse(MODULE, ir.Context())
-    partition = PartitionResult(
-        module=module,
-        driver=None,
-        device=None,
-        segments=[
-            SegmentInfo(
-                0,
-                "segment_0",
-                ["!torch.vtensor<[?,?],f32>", "!torch.int"],
-                ["!torch.vtensor<[?,?],f32>"] * 3 + ["!torch.int"],
-                [],
-            ),
-            SegmentInfo(1, "segment_1", ["!torch.int"], ["!torch.int"], []),
-            SegmentInfo(2, "segment_2", [], [], []),
-        ],
+    signatures = ir.Module.parse(
+        """
+module {
+  func.func @segment_0(%x: !torch.vtensor<[?,?],f32>, %n: !torch.int) -> (!torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32>, !torch.int) {
+    %y = torch.aten.relu %x : !torch.vtensor<[?,?],f32> -> !torch.vtensor<[?,?],f32>
+    return %y, %y, %x, %n : !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32>, !torch.int
+  }
+  func.func @segment_1(%n: !torch.int) -> !torch.int {
+    return %n : !torch.int
+  }
+}
+""",
+        ir.Context(),
     )
-    return path, partition
+    return path, signatures
 
 
 def _build_graph(handler, arity):
@@ -200,8 +195,12 @@ def test_runtime_requires_device_for_scalar_only_segment(compiled_module):
 def test_runtime_uses_explicit_device_for_scalar_only_segment(compiled_module):
     """Scalar-only segments can run when their device is explicitly known."""
     path, partition = compiled_module
-    partition = replace(partition, device=f"cuda:{torch.cuda.current_device()}")
-    graph = _build_graph(runtime_segment_handlers(path, partition)["segment_1"], 1)
+    graph = _build_graph(
+        runtime_segment_handlers(
+            path, partition, device=f"cuda:{torch.cuda.current_device()}"
+        )["segment_1"],
+        1,
+    )
     assert graph(12) == (12,)
 
 

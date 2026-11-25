@@ -1,106 +1,71 @@
-cmake_minimum_required(VERSION 3.20)
-project(kashi LANGUAGES CXX)
-option(KASHI_BUILD_TESTS "Build the native Catch2 tests" OFF)
-option(KASHI_MUTATION "Instrument project native code for Mull" OFF)
-option(KASHI_LINT "Run clang-tidy on project C++ sources" OFF)
-option(KASHI_COVERAGE "Instrument native tests for LLVM coverage" OFF)
-set(KASHI_MULL_PLUGIN "" CACHE FILEPATH "Mull LLVM frontend plugin")
-
-if(KASHI_MUTATION)
-  if(NOT KASHI_BUILD_TESTS)
-    message(FATAL_ERROR "KASHI_MUTATION requires KASHI_BUILD_TESTS=ON")
-  endif()
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "KASHI_MUTATION requires Clang")
-  endif()
-  if(NOT IS_ABSOLUTE "${KASHI_MULL_PLUGIN}"
-     OR NOT EXISTS "${KASHI_MULL_PLUGIN}"
-     OR IS_DIRECTORY "${KASHI_MULL_PLUGIN}")
-    message(FATAL_ERROR "KASHI_MULL_PLUGIN must name an existing plugin file")
-  endif()
+cmake_minimum_required(VERSION 3.29)
+if(NOT DEFINED CMAKE_LINKER_TYPE AND DEFINED ENV{CMAKE_LINKER_TYPE})
+  set(CMAKE_LINKER_TYPE "$ENV{CMAKE_LINKER_TYPE}")
 endif()
+project(kashi LANGUAGES C CXX)
 
-if(KASHI_LINT)
-  find_program(KASHI_CLANG_TIDY NAMES clang-tidy REQUIRED)
-endif()
-
-if(KASHI_COVERAGE)
-  if(NOT KASHI_BUILD_TESTS OR KASHI_MUTATION)
-    message(FATAL_ERROR "KASHI_COVERAGE requires tests and cannot be combined with Mull")
-  endif()
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "KASHI_COVERAGE requires Clang")
-  endif()
-  set(KASHI_COVERAGE_FLAGS -fprofile-instr-generate -fcoverage-mapping)
-endif()
+include(cmake/KashiBuildOptions.cmake)
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Avoid the newer TLSDESC ABI chosen by nanobind on some build sysroots.
+  set(NB_HAS_MTLS_GNU2 OFF)
+endif()
 find_package(nanobind CONFIG REQUIRED)
+include(cmake/KashiIreeSetup.cmake)
 
-file(GLOB_RECURSE KASHI_LIB_SOURCES CONFIGURE_DEPENDS
-  "${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/*.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/*.cc"
-  "${CMAKE_CURRENT_SOURCE_DIR}/cpp/lib/*.cxx")
-
-if(KASHI_LIB_SOURCES)
-  if(KASHI_COVERAGE)
-    # Keep every translation unit in the test binary, even if no test calls it.
-    add_library(kashi_core OBJECT ${KASHI_LIB_SOURCES})
-  else()
-    add_library(kashi_core STATIC ${KASHI_LIB_SOURCES})
-  endif()
-  set_target_properties(kashi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  if(KASHI_LINT)
-    set_property(TARGET kashi_core PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
-  endif()
-  target_include_directories(kashi_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include")
-  if(KASHI_MUTATION)
-    target_compile_options(kashi_core PRIVATE
-      -O0 -g -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
-  endif()
-  if(KASHI_COVERAGE)
-    target_compile_options(kashi_core PRIVATE ${KASHI_COVERAGE_FLAGS})
-    # Both the test executable and the extension link these object files.
-    target_link_options(kashi_core INTERFACE -fprofile-instr-generate)
-  endif()
+set(KASHI_LIB_SOURCES
+  cpp/lib/cuda_manifest.cpp
+  cpp/lib/iree_compiler.cpp
+  cpp/lib/iree_partition.cpp)
+if(KASHI_COVERAGE)
+  # Keep every translation unit in the test binary, even if no test calls it.
+  add_library(kashi_core OBJECT ${KASHI_LIB_SOURCES})
 else()
-  add_library(kashi_core INTERFACE)
-  target_include_directories(kashi_core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include")
+  add_library(kashi_core STATIC ${KASHI_LIB_SOURCES})
+endif()
+set_target_properties(kashi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(KASHI_LINT)
+  set_property(TARGET kashi_core PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
+endif()
+target_include_directories(kashi_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include")
+target_compile_features(kashi_core PUBLIC cxx_std_17)
+if(KASHI_IREE_SDK_DIR)
+  target_link_libraries(kashi_core PRIVATE KashiIree::core)
+else()
+  target_link_libraries(kashi_core PRIVATE
+    iree::compiler::API::StaticImpl
+    iree::compiler::Dialect::Flow::IR
+    iree::compiler::Dialect::HAL::IR
+    iree::compiler::Dialect::VM::Target::Bytecode
+    iree::hal::utils::executable_header
+    iree::schemas::cuda_executable_def_c_fbs
+    iree::schemas::executable_debug_info_c_fbs
+    iree::compiler::plugins::input::Torch::torch-mlir::TorchDialectIR)
+  set(KASHI_IREE_INCLUDE_DIRS
+    "${KASHI_IREE_SOURCE_DIR}/compiler/bindings/c"
+    "${KASHI_IREE_SOURCE_DIR}/compiler/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/iree/compiler/src"
+    "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/llvm/include"
+    "${KASHI_IREE_SOURCE_DIR}/third_party/llvm-project/mlir/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/iree/llvm-project/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/iree/llvm-project/tools/mlir/include")
+  target_include_directories(kashi_core SYSTEM PRIVATE ${KASHI_IREE_INCLUDE_DIRS})
+endif()
+if(KASHI_MUTATION)
+  target_compile_options(kashi_core PRIVATE
+    -O0 -g -UNDEBUG -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
+  set_property(SOURCE ${KASHI_LIB_SOURCES} APPEND PROPERTY OBJECT_DEPENDS
+    "${KASHI_MULL_CONFIG};${KASHI_MULL_PLUGIN}")
+endif()
+if(KASHI_COVERAGE)
+  target_compile_options(kashi_core PRIVATE ${KASHI_COVERAGE_FLAGS})
+  # Both the test executable and the extension link these object files.
+  target_link_options(kashi_core INTERFACE -fprofile-instr-generate)
 endif()
 
-nanobind_add_module(_native cpp/bindings/module.cpp)
-target_link_libraries(_native PRIVATE kashi_core)
-if(KASHI_LINT)
-  set_property(TARGET _native PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
-endif()
-install(TARGETS _native LIBRARY DESTINATION kashi RUNTIME DESTINATION kashi)
+include(cmake/KashiPythonExtension.cmake)
 
 if(KASHI_BUILD_TESTS)
-  enable_testing()
-  find_package(Catch2 3 CONFIG REQUIRED)
-  list(APPEND CMAKE_MODULE_PATH "${Catch2_DIR}")
-  include(Catch)
-
-  file(GLOB_RECURSE KASHI_TEST_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/*.cxx")
-  if(KASHI_TEST_SOURCES)
-    add_executable(kashi_native_tests ${KASHI_TEST_SOURCES})
-    target_link_libraries(kashi_native_tests PRIVATE kashi_core Catch2::Catch2WithMain)
-    if(KASHI_LINT)
-      set_property(TARGET kashi_native_tests PROPERTY CXX_CLANG_TIDY "${KASHI_CLANG_TIDY}")
-    endif()
-    if(KASHI_MUTATION)
-      # The Mull policy excludes test sources while permitting inline project headers.
-      target_compile_options(kashi_native_tests PRIVATE
-        -O0 -g -grecord-command-line "-fpass-plugin=${KASHI_MULL_PLUGIN}")
-    endif()
-    if(KASHI_COVERAGE)
-      # Instrument test translation units for coverage of inline project headers.
-      target_compile_options(kashi_native_tests PRIVATE ${KASHI_COVERAGE_FLAGS})
-      target_link_options(kashi_native_tests PRIVATE -fprofile-instr-generate)
-    endif()
-    catch_discover_tests(kashi_native_tests)
-  endif()
+  include(cmake/KashiNativeTests.cmake)
 endif()

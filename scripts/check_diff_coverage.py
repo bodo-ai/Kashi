@@ -51,7 +51,7 @@ def native_lines(root):
     return {
         path.relative_to(root): lines
         for path, lines in result.items()
-        if path.is_relative_to(root)
+        if lines and path.is_relative_to(root)
     }
 
 
@@ -117,6 +117,9 @@ def main():
                 reports[reader] = {}
         lines = reports[reader].get(path)
         if lines is None:
+            # LLVM does not emit line records for declaration-only headers.
+            if path.suffix in CPP_HEADERS and reports[reader]:
+                continue
             print(f"- `{path}`: no line coverage data")
             missing = True
             continue

@@ -16,9 +16,12 @@ from pathlib import Path
 
 import iree.runtime as rt
 import torch
-from iree.compiler import ir
 
-from kashi.iree_partition import PartitionResult
+from kashi.iree_reassembly import (
+    _segment_functions,
+    _segment_output_aliases,
+    _segment_result_types,
+)
 
 _TENSOR_DTYPES = {
     "i1": torch.bool,
@@ -490,54 +493,27 @@ class _PooledResult:
         self.position = position
 
 
-def _output_aliases(function) -> list:
-    """Recover exact input and repeated-result identity from segment SSA values."""
-    block = function.regions[0].blocks[0]
-    inputs = {value: index for index, value in enumerate(block.arguments)}
-    seen = {}
-    aliases = []
-    for index, value in enumerate(block.operations[-1].operation.operands):
-        if value in inputs:
-            aliases.append(("input", inputs[value]))
-        elif value in seen:
-            aliases.append(("output", seen[value]))
-        else:
-            aliases.append(None)
-        seen.setdefault(value, index)
-    return aliases
-
-
 def runtime_segment_handlers(
-    vmfb_path: Path, partition: PartitionResult
+    vmfb_path: Path, partitioned_module, *, device: str | None = None
 ) -> dict[str, Callable]:
-    """Create FX handlers for actual partition functions in a persistent VMFB.
+    """Create VMFB handlers using signatures and aliases from native IR.
 
     Each handler accepts ``(graph, args)`` and returns the segment's flat FX
     live-outs. The first call on a CUDA device loads and caches its VM context.
-    Scalar-only segments require ``partition.device`` to name a CUDA index.
-    IREE's synchronous ABI and the stream waits make this unsuitable for CUDA
-    graph capture, which is rejected explicitly.
+    Scalar-only segments require ``device`` to name a CUDA index. IREE's
+    synchronous ABI and stream waits preclude CUDA graph capture.
     """
-    functions = {
-        ir.StringAttr(op.attributes["sym_name"]).value: op
-        for op in partition.module.body.operations
-        if op.operation.name == "func.func"
-    }
-    segments = [
-        segment for segment in partition.segments if segment.func_name in functions
-    ]
-    runtime = _RuntimeModule(
-        vmfb_path, partition.device, tuple(segment.func_name for segment in segments)
-    )
+    functions = _segment_functions(partitioned_module)
+    runtime = _RuntimeModule(vmfb_path, device, tuple(functions))
     return {
-        segment.func_name: _SegmentHandler(
+        name: _SegmentHandler(
             _SegmentTarget(
                 runtime,
-                segment.func_name,
-                len(segment.live_in_types),
-                segment.live_out_types,
-                _output_aliases(functions[segment.func_name]),
+                name,
+                len(function.regions[0].blocks[0].arguments),
+                _segment_result_types(function),
+                _segment_output_aliases(function),
             )
         )
-        for segment in segments
+        for name, function in functions.items()
     }

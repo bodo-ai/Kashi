@@ -150,6 +150,33 @@ def test_iree_graph_matmul_matches_torch(tmp_path, monkeypatch, mode, dtype):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 @pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.parametrize("destination", ["cuda", "cpu"])
+def test_iree_to_copy_preserves_noncontiguous_input(
+    tmp_path, monkeypatch, mode, destination
+):
+    """Device/dtype copies must keep PyTorch's storage and device semantics."""
+    from kashi.iree_backend import compile_iree_fx
+
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", mode)
+    torch._dynamo.reset()
+    device = torch.device(destination)
+
+    def backend(gm, example_inputs):
+        return compile_iree_fx(gm, output_dir=tmp_path).graph.forward
+
+    def model(x):
+        return torch.ops.aten._to_copy.default(x, dtype=torch.float32, device=device)
+
+    source = torch.arange(20, device="cuda", dtype=torch.bfloat16).reshape(4, 5).t()
+    result = torch.compile(model, backend=backend, fullgraph=True)(source)
+    torch.testing.assert_close(result, model(source))
+    assert result.device.type == destination
+    result.zero_()
+    assert source.count_nonzero() == 19
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.parametrize("mode", ["cuda", "iree"])
 def test_iree_graph_preserves_split_view_mutation(tmp_path, monkeypatch, mode):
     """A custom mutation of a split view must update its original tensor."""
     from kashi.iree_backend import compile_iree_fx

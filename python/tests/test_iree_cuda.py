@@ -1,5 +1,7 @@
 """Direct CUDA launches honor IREE's lowered binding and scalar ABI."""
 
+import json
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -7,14 +9,71 @@ torch = pytest.importorskip("torch")
 from kashi.iree_cuda import _grid, create_cuda_kernel
 
 
+def test_linked_manifest_joins_original_flow_and_stable_phase_exports(tmp_path):
+    """The launcher uses all three names instead of guessing the PTX entry."""
+    from kashi.iree_cuda import _metadata
+
+    phases = tmp_path / "phases"
+    phases.mkdir()
+    (tmp_path / "flow.mlir").write_text("""
+flow.executable private @example {
+  flow.executable.export public @flow_fn as("entry") workgroups() -> (index, index, index) {}
+  builtin.module { func.func @flow_fn() { return } }
+}
+""")
+    (phases / "module.stream.mlir").write_text("""
+stream.executable private @example {
+  builtin.module { func.func @kashi_kernel_0() { return } }
+}
+""")
+    (phases / "module.executable-targets.mlir").write_text("""
+hal.executable private @example {
+  hal.executable.variant public @cuda_nvptx_fb target(#target) {
+    hal.executable.export public @kashi_kernel_0 ordinal(0) layout(#layout) count(%arg0: !hal.device) -> (index, index, index) {
+      %c1 = arith.constant 1 : index
+      hal.return %c1, %c1, %c1 : index, index, index
+    } <workgroup_size = [16 : index, 1 : index, 1 : index], subgroup_size = 32>
+  }
+}
+""")
+    (tmp_path / "kernel_0.ptx").write_text(".visible .entry linked_entry() { ret; }")
+    (tmp_path / "kernel_manifest.json").write_text(
+        json.dumps(
+            {
+                "example": {
+                    "entry": {
+                        "file": "kernel_0.ptx",
+                        "entry": "linked_entry",
+                        "stable": "kashi_kernel_0",
+                    }
+                }
+            }
+        )
+    )
+    metadata = _metadata(tmp_path, "example", "entry")
+    assert metadata[7] == (16, 1, 1)
+    assert metadata[10] == "linked_entry"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_direct_ptx_uses_independent_output_offset_and_current_stream(tmp_path):
     """An offset inserted by stream allocation must not shift a new output buffer."""
     phases = tmp_path / "phases"
-    kernels = tmp_path / "kernel_files"
     phases.mkdir()
-    kernels.mkdir()
-    (phases / "x.flow.mlir").write_text("""
+    (tmp_path / "kernel_manifest.json").write_text(
+        json.dumps(
+            {
+                "example": {
+                    "entry": {
+                        "file": "kernel_0.ptx",
+                        "entry": "linked_entry",
+                        "stable": "kashi_kernel_0",
+                    }
+                }
+            }
+        )
+    )
+    (tmp_path / "flow.mlir").write_text("""
 flow.executable private @example {
   flow.executable.export public @entry workgroups(%arg0: index) -> (index, index, index) {
   }
@@ -28,7 +87,7 @@ flow.executable private @example {
     (phases / "x.stream.mlir").write_text("""
 stream.executable private @example {
   builtin.module {
-    func.func @entry(%arg0: !stream.binding {stream.alignment = 64 : index}, %arg1: !stream.binding {stream.alignment = 64 : index}, %arg2: i32, %arg3: i32, %arg4: i32, %arg5: i32) {
+    func.func @kashi_kernel_0(%arg0: !stream.binding {stream.alignment = 64 : index}, %arg1: !stream.binding {stream.alignment = 64 : index}, %arg2: i32, %arg3: i32, %arg4: i32, %arg5: i32) {
       %c0 = arith.constant 0 : index
       %c32_i64 = arith.constant 32 : i64
       %0 = arith.extui %arg2 : i32 to i64
@@ -54,18 +113,18 @@ stream.executable private @example {
 #layout = #hal.pipeline.layout<constants = 4, bindings = [#hal.pipeline.binding<storage_buffer, ReadOnly>, #hal.pipeline.binding<storage_buffer, None>]>
 hal.executable private @example {
   hal.executable.variant public @cuda_nvptx_fb target(#target) {
-    hal.executable.export public @entry ordinal(0) layout(#layout) count(%arg0: !hal.device, %arg1: index) -> (index, index, index) {
+    hal.executable.export public @kashi_kernel_0 ordinal(0) layout(#layout) count(%arg0: !hal.device, %arg1: index) -> (index, index, index) {
       %c1 = arith.constant 1 : index
       hal.return %c1, %c1, %c1 : index, index, index
     } <workgroup_size = [128 : index, 1 : index, 1 : index], subgroup_size = 32>
   }
 }
 """)
-    (kernels / "module_example_cuda_nvptx_fb.ptx").write_text("""
+    (tmp_path / "kernel_0.ptx").write_text("""
 .version 7.0
 .target sm_70
 .address_size 64
-.visible .entry entry(
+.visible .entry linked_entry(
   .param .u64 .ptr .global .align 16 input,
   .param .u64 .ptr .global .align 16 output,
   .param .b32 offset_lo,
@@ -124,11 +183,23 @@ DONE:
 def test_direct_ptx_preserves_tied_operand_identity(tmp_path):
     """A tied result must update and return the original CUDA tensor."""
     phases = tmp_path / "phases"
-    kernels = tmp_path / "kernel_files"
     phases.mkdir()
-    kernels.mkdir()
-    (phases / "x.flow.mlir").write_text("""
+    (tmp_path / "kernel_manifest.json").write_text(
+        json.dumps(
+            {
+                "example": {
+                    "entry": {
+                        "file": "kernel_0.ptx",
+                        "entry": "linked_entry",
+                        "stable": "kashi_kernel_0",
+                    }
+                }
+            }
+        )
+    )
+    (tmp_path / "flow.mlir").write_text("""
 flow.executable private @example {
+  flow.executable.export public @entry workgroups() -> (index, index, index) {}
   builtin.module {
     func.func @entry(%arg0: !iree_tensor_ext.dispatch.tensor<readwrite:tensor<16xf32>>) {
       return
@@ -139,7 +210,7 @@ flow.executable private @example {
     (phases / "x.stream.mlir").write_text("""
 stream.executable private @example {
   builtin.module {
-    func.func @entry(%arg0: !stream.binding {stream.alignment = 64 : index}) {
+    func.func @kashi_kernel_0(%arg0: !stream.binding {stream.alignment = 64 : index}) {
       %c0 = arith.constant 0 : index
       %0 = stream.binding.subspan %arg0[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<16xf32>>
       return
@@ -150,18 +221,18 @@ stream.executable private @example {
     (phases / "x.executable-targets.mlir").write_text("""
 hal.executable private @example {
   hal.executable.variant public @cuda_nvptx_fb target(#target) {
-    hal.executable.export public @entry ordinal(0) layout(#layout) count(%arg0: !hal.device) -> (index, index, index) {
+    hal.executable.export public @kashi_kernel_0 ordinal(0) layout(#layout) count(%arg0: !hal.device) -> (index, index, index) {
       %c1 = arith.constant 1 : index
       hal.return %c1, %c1, %c1 : index, index, index
     } <workgroup_size = [16 : index, 1 : index, 1 : index], subgroup_size = 32>
   }
 }
 """)
-    (kernels / "module_example_cuda_nvptx_fb.ptx").write_text("""
+    (tmp_path / "kernel_0.ptx").write_text("""
 .version 7.0
 .target sm_70
 .address_size 64
-.visible .entry entry(.param .u64 .ptr .global .align 16 buffer)
+.visible .entry linked_entry(.param .u64 .ptr .global .align 16 buffer)
 .maxntid 16, 1, 1 {
   .reg .b32 %r;
   .reg .b64 %rd<3>;

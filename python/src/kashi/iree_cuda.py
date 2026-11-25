@@ -6,6 +6,7 @@ No IREE runtime or host-device copy is involved.
 """
 
 import ctypes
+import json
 import operator
 import re
 import threading
@@ -118,6 +119,19 @@ def _function(text, export):
         raise RuntimeError(f"Missing function body for IREE CUDA export {export}")
     body, _ = _balanced(text, body_start, "{", "}")
     return _split(args), body
+
+
+def _flow_function(flow, export):
+    """Resolve a Flow export's public symbol to its underlying function."""
+    pattern = (
+        r"\bflow\.executable\.export\s+(?:(?:private|public)\s+)?"
+        r'@([\w.$-]+)(?:\s+as\(("(?:\\.|[^"\\])*")\))?'
+    )
+    for match in re.finditer(pattern, flow):
+        function, alias = match.groups()
+        if (json.loads(alias) if alias else function) == export:
+            return function
+    raise RuntimeError(f"Missing Flow export {export}")
 
 
 def _offset_constants(body, binding_count, constant_count, export):
@@ -446,12 +460,23 @@ def _grid(count_args, body, maps, workload, export):
 
 def _metadata(directory, executable, export):
     """Read and validate the flow, stream, target and PTX ABI metadata."""
-    flow = _executable(_phase(directory, "flow"), "flow", executable)
+    try:
+        record = json.loads((directory / "kernel_manifest.json").read_text())[
+            executable
+        ][export]
+        stable = record["stable"]
+        symbol = record["entry"]
+        ptx_path = directory / record["file"]
+    except KeyError as error:
+        raise RuntimeError(
+            f"Missing linked CUDA kernel: {executable}::{export}"
+        ) from error
+    flow = _executable((directory / "flow.mlir").read_text(), "flow", executable)
     stream = _executable(_phase(directory, "stream"), "stream", executable)
     targets = _phase(directory, "executable-targets")
     target = _executable(targets, "hal", executable)
-    flow_args, _ = _function(flow, export)
-    stream_args, stream_body = _function(stream, export)
+    flow_args, _ = _function(flow, _flow_function(flow, export))
+    stream_args, stream_body = _function(stream, stable)
     binding_count = sum("!stream.binding" in arg for arg in stream_args)
     if any("!stream.binding" not in arg for arg in stream_args[:binding_count]) or any(
         not re.fullmatch(r"%[^:]+:\s*i32", arg) for arg in stream_args[binding_count:]
@@ -461,7 +486,7 @@ def _metadata(directory, executable, export):
     offsets = _offset_constants(stream_body, binding_count, constant_count, export)
 
     match = re.search(
-        rf"\bhal\.executable\.export\s+(?:public|private)\s+@{re.escape(export)}\b.*?\bcount\s*\(",
+        rf"\bhal\.executable\.export\s+(?:public|private)\s+@{re.escape(stable)}\b.*?\bcount\s*\(",
         target,
         re.DOTALL,
     )
@@ -495,16 +520,8 @@ def _metadata(directory, executable, export):
             _split(m.group(4)),
         )
 
-    ptx_files = list(
-        (directory / "kernel_files").glob(f"module_{executable}_cuda_nvptx_fb.ptx")
-    )
-    if len(ptx_files) != 1:
-        raise RuntimeError(
-            f"Expected one CUDA PTX for {executable} in {directory}, found {len(ptx_files)}"
-        )
-    ptx = ptx_files[0].read_text()
-    symbol = export.replace("$", "_")
-    match = re.search(rf"\.visible\s+\.entry\s+{re.escape(symbol)}\s*\(", ptx)
+    ptx = ptx_path.read_text()
+    match = re.search(rf"(?<![\w.])\.entry\s+{re.escape(symbol)}\s*\(", ptx)
     if not match:
         _unsupported(export, f"PTX entry symbol {symbol}")
     params, _ = _balanced(ptx, match.end() - 1, "(", ")")

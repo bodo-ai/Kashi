@@ -1,17 +1,24 @@
 """Opt-in FX to IREE CUDA compilation and executable graph reconstruction."""
 
+import json
 import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from iree.compiler.tools.binaries import find_tool
+from iree.compiler import ir
 
+from kashi import _native
 from kashi.importer import import_fx
-from kashi.iree_partition import partition_at_custom_ops
-from kashi.iree_reassembly import flow_segment_handlers
+from kashi.iree_reassembly import (
+    IreeKernel,
+    _segment_functions,
+    _segment_output_aliases,
+    _segment_result_types,
+    _view_root,
+    flow_segment_handlers,
+)
 from kashi.mlir_to_fx import rebuild_fx
 
 _UNSIGNED_RESULT_DTYPES = {
@@ -32,6 +39,7 @@ class IreeCompilation:
     compiled segments, the VMFB module, compiler log, phase dumps and raw
     kernel files. ``flow_ir`` and ``vmfb_path`` are None when no segments
     require compilation. ``kernels_ptx`` is None when no PTX was emitted.
+    ``kernel_manifest`` maps Flow exports to their linked PTX entry points.
     """
 
     graph: torch.fx.GraphModule
@@ -41,6 +49,7 @@ class IreeCompilation:
     kernels_ptx: Path | None
     vmfb_path: Path | None
     execution_mode: str
+    kernel_manifest: Path | None
 
 
 def _source_device(
@@ -63,6 +72,17 @@ def _source_device(
     return next(iter(devices), None)
 
 
+def _imported_device(module) -> str | None:
+    """Find a device literal before target selection for factory-only graphs."""
+    for function in module.body.operations:
+        if function.operation.name != "func.func" or not function.regions[0].blocks:
+            continue
+        for op in function.regions[0].blocks[0].operations:
+            if op.operation.name == "torch.constant.device":
+                return ir.StringAttr(op.attributes["value"]).value
+    return None
+
+
 def _cuda_target(cuda_target: str | None, source_device: str | None = None) -> str:
     """Resolve an explicit target or the source CUDA tensor's architecture."""
     target = cuda_target or os.environ.get("IREE_CUDA_TARGET")
@@ -80,44 +100,43 @@ def _cuda_target(cuda_target: str | None, source_device: str | None = None) -> s
     return f"sm_{major}{minor}"
 
 
-def _asm(module, with_locations: bool) -> str:
-    """Print a module, keeping locations only when they carry decomposition tags."""
-    if with_locations:
-        return module.operation.get_asm(enable_debug_info=True)
-    return str(module)
+def _annotate_ptx_metadata(
+    graph: torch.fx.GraphModule,
+    artifact_dir: Path,
+    manifest: dict[str, dict[str, dict[str, str]]],
+) -> None:
+    """Attach the linked PTX image and entry to each opaque kernel call."""
+    for node in graph.graph.nodes:
+        target = node.target
+        if not isinstance(target, IreeKernel):
+            continue
+        try:
+            kernel = manifest[target.executable][target.export]
+        except KeyError as error:
+            raise RuntimeError(f"Missing linked CUDA kernel: {target}") from error
+        node.meta["iree_ptx_file"] = artifact_dir / kernel["file"]
+        node.meta["iree_ptx_entry"] = kernel["entry"]
+        node.meta["iree_stable_export"] = kernel["stable"]
 
 
-def _view_root(value):
-    """Find the storage-producing FX value beneath IREE's reconstructed views."""
-    while (
-        isinstance(value, torch.fx.Node)
-        and value.op == "call_function"
-        and value.target in (torch.ops.aten.view.default, torch.ops.aten.view.dtype)
-    ):
-        value = value.args[0]
-    return value
+def _preserve_segment_results(handlers, functions):
+    """Restore source SSA aliases and independent storage for fresh results."""
 
-
-def _preserve_segment_results(handlers, segments):
-    """Prevent IREE value deduplication from creating new PyTorch aliases.
-
-    Alias-producing source operators stay in the driver, so distinct tensor
-    live-outs of a compiled segment have independent PyTorch storage. IREE can
-    nevertheless return the same value, or a view of an input, for more than
-    one live-out. Clone only those results whose reconstructed storage roots
-    collide with an input or a previous live-out.
-    """
-
-    def wrap(handler, result_types):
+    def wrap(handler, result_types, aliases):
         """Add copies only when a source-distinct tensor would share storage."""
 
         def splice(graph, args):
             """Splice a segment and enforce its source-level storage identities."""
             results = list(handler(graph, args))
             seen = {_view_root(arg) for arg in args if isinstance(arg, torch.fx.Node)}
-            for index, (value, type_text) in enumerate(
-                zip(results, result_types, strict=True)
+            for index, (value, type_text, alias) in enumerate(
+                zip(results, result_types, aliases, strict=True)
             ):
+                if alias is not None:
+                    results[index] = (
+                        args[alias[1]] if alias[0] == "input" else results[alias[1]]
+                    )
+                    continue
                 if not type_text.startswith(("!torch.vtensor", "!torch.tensor")):
                     continue
                 root = _view_root(value)
@@ -138,8 +157,14 @@ def _preserve_segment_results(handlers, segments):
 
         return splice
 
-    types = {segment.func_name: segment.live_out_types for segment in segments}
-    return {name: wrap(handler, types[name]) for name, handler in handlers.items()}
+    return {
+        name: wrap(
+            handler,
+            _segment_result_types(functions[name]),
+            _segment_output_aliases(functions[name]),
+        )
+        for name, handler in handlers.items()
+    }
 
 
 def compile_iree_fx(
@@ -147,7 +172,6 @@ def compile_iree_fx(
     *,
     output_dir: str | os.PathLike,
     cuda_target: str | None = None,
-    compiler: str | os.PathLike | None = None,
     decompose_custom_ops: bool = False,
 ) -> IreeCompilation:
     """Compile an FX graph to CUDA PTX and reconstruct an executable FX graph.
@@ -157,8 +181,6 @@ def compile_iree_fx(
         output_dir: Parent directory in which a unique artifact directory is created.
         cuda_target: IREE CUDA architecture such as ``sm_80``. If omitted, use
             ``IREE_CUDA_TARGET`` or the current CUDA device's capability.
-        compiler: Optional path to ``iree-compile``; by default use the IREE
-            package's tool discovery.
         decompose_custom_ops: Rewrite supported vLLM custom ops into ATen ops
             before import. Their MLIR locations name the original call, and the
             MLIR artifacts are written with locations so IREE sees them.
@@ -179,77 +201,49 @@ def compile_iree_fx(
         raise RuntimeError(
             f"Verification failed for imported module:\n{imported.module}"
         )
-    partition = partition_at_custom_ops(imported.module)
-    if partition.driver is None:
-        unsupported = [
-            kind
-            for segment in partition.segments
-            for kind in segment.unsupported_live_outs
-        ]
-        raise NotImplementedError(
-            f"Cannot build IREE driver; unsupported segment live-outs: {unsupported}"
-        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = Path(tempfile.mkdtemp(prefix="kashi-iree-", dir=output_dir))
-    partitioned = artifact_dir / "partitioned.mlir"
-    partitioned.write_text(_asm(partition.module, decompose_custom_ops))
-    (artifact_dir / "driver.mlir").write_text(
-        _asm(partition.driver, decompose_custom_ops)
-    if not list(partition.module.body.operations):
-        # A graph made entirely of alias-sensitive/custom operations has no
-        # compiled work. Execute its driver directly instead of feeding IREE
-        # an empty module, which cannot produce a VMFB.
-        graph = rebuild_fx(partition.driver, imported.out_spec, segment_handlers={})
-        return IreeCompilation(graph, artifact_dir, None, (), None, None, mode)
-
-    device = _source_device(gm, partition.device)
-    target = _cuda_target(cuda_target, device)
-    compiler_path = (
-        os.fspath(compiler) if compiler is not None else find_tool("iree-compile")
-    )
-    phases_dir = artifact_dir / "phases"
-    vmfb_path = artifact_dir / "module.vmfb"
-    kernels_dir = artifact_dir / "kernel_files"
-    command = [
-        compiler_path,
-        str(partitioned),
-        "--iree-hal-target-device=cuda",
-        f"--iree-cuda-target={target}",
-        "--iree-hal-link-executables=false",
-        f"--iree-hal-dump-executable-files-to={kernels_dir}",
-        f"--dump-compilation-phases-to={phases_dir}",
-        "-o",
-        str(vmfb_path),
-    ]
+    target_error = None
+    target = None
     try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=1800,
-            check=False,
+        device_hint = _source_device(gm, _imported_device(imported.module))
+        target = _cuda_target(cuda_target, device_hint)
+    except (ValueError, NotImplementedError) as error:
+        # A driver-only graph needs neither a unique device nor a CUDA target.
+        target_error = error
+    try:
+        partition_device = _native.compile_iree(
+            imported.module.operation.get_asm(enable_debug_info=True),
+            artifact_dir,
+            target="cuda",
+            cuda_target=target,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(
-            f"Could not run IREE compiler {compiler_path}: {error}"
-        ) from error
-    log_path = artifact_dir / "iree-compile.log"
-    log_path.write_text(completed.stdout)
-    if completed.returncode:
-        raise RuntimeError(
-            f"IREE compiler exited with {completed.returncode}; see {log_path}"
-        )
+    except RuntimeError as error:
+        if (
+            target_error is not None
+            and "IREE configuration failed" in str(error)
+            and "cuda_target is required only for CUDA"
+            in (artifact_dir / "iree-compile.log").read_text()
+        ):
+            raise target_error from error
+        raise
+    partitioned = ir.Module.parse(
+        (artifact_dir / "partitioned.mlir").read_text(), ir.Context()
+    )
+    driver = ir.Module.parse((artifact_dir / "driver.mlir").read_text(), ir.Context())
+    functions = _segment_functions(partitioned)
+    if not functions:
+        graph = rebuild_fx(driver, imported.out_spec, segment_handlers={})
+        return IreeCompilation(graph, artifact_dir, None, (), None, None, mode, None)
 
-    flow_files = sorted(phases_dir.glob("*.flow.mlir"))
-    if len(flow_files) != 1:
-        raise RuntimeError(
-            f"Expected one IREE flow phase in {phases_dir}, found {len(flow_files)}"
-        )
-    flow_ir = flow_files[0]
-    ptx_files = tuple(sorted(kernels_dir.glob("*.ptx")))
+    device = _source_device(gm, partition_device)
+    flow_ir = artifact_dir / "flow.mlir"
+    vmfb_path = artifact_dir / "module.vmfb"
+    kernel_manifest = artifact_dir / "kernel_manifest.json"
+    manifest = json.loads(kernel_manifest.read_text())
+    ptx_files = tuple(sorted(artifact_dir.glob("kernel_*.ptx")))
     kernels_ptx = None
     if ptx_files:
         kernels_ptx = artifact_dir / "kernels.ptx"
@@ -261,22 +255,29 @@ def compile_iree_fx(
         from kashi.iree_cuda import create_cuda_kernel
 
         def kernel_factory(executable, export):
-            """Bind a flow dispatch to its CUDA executable and launch metadata."""
+            """Bind a flow dispatch to its linked CUDA launch metadata."""
             return create_cuda_kernel(executable, export, artifact_dir=artifact_dir)
 
         handlers = flow_segment_handlers(
             flow_ir.read_text(), device=device, kernel_factory=kernel_factory
         )
-        handlers = _preserve_segment_results(handlers, partition.segments)
+        handlers = _preserve_segment_results(handlers, functions)
     else:
         from kashi.iree_runtime import runtime_segment_handlers
 
-        # Segments with no tensor live-ins still need the source device.
-        partition.device = device
-        handlers = runtime_segment_handlers(vmfb_path, partition)
-    graph = rebuild_fx(partition.driver, imported.out_spec, segment_handlers=handlers)
+        handlers = runtime_segment_handlers(vmfb_path, partitioned, device=device)
+    graph = rebuild_fx(driver, imported.out_spec, segment_handlers=handlers)
+    if mode == "cuda":
+        _annotate_ptx_metadata(graph, artifact_dir, manifest)
     return IreeCompilation(
-        graph, artifact_dir, flow_ir, ptx_files, kernels_ptx, vmfb_path, mode
+        graph,
+        artifact_dir,
+        flow_ir,
+        ptx_files,
+        kernels_ptx,
+        vmfb_path,
+        mode,
+        kernel_manifest,
     )
 
 
