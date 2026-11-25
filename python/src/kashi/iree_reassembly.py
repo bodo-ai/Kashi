@@ -7,7 +7,6 @@ graph. Dispatches are deliberately not executable kernel launches.
 """
 
 import operator
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -26,7 +25,6 @@ _ELEMENT_TYPE_TO_DTYPE = {
     "i32": torch.int32,
     "i64": torch.int64,
 }
-_ENTRY_POINT = re.compile(r"@(?P<executable>[^:]+)::@(?P<export>.+)")
 
 
 class IreeKernel:
@@ -205,12 +203,12 @@ class _SegmentConverter:
             raise NotImplementedError(
                 f"flow.dispatch with multiple entry points in {self.name}"
             )
-        entry = _ENTRY_POINT.fullmatch(str(entries[0]))
-        if entry is None:
+        path = ir.SymbolRefAttr(entries[0]).value
+        if len(path) != 2:
             raise NotImplementedError(
                 f"Unsupported flow.dispatch entry point {entries[0]} in {self.name}"
             )
-        key = (entry.group("executable"), entry.group("export"))
+        key = (path[0], path[1])
         if key not in self.kernels:
             self.kernels[key] = IreeKernel(*key)
         operands = [self.values[v] for v in op.operands]

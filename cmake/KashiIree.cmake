@@ -1,0 +1,120 @@
+find_package(Git REQUIRED)
+
+set(KASHI_IREE_SOURCE_DIR "" CACHE PATH "Local checkout of pinned IREE and its submodules")
+
+# Check the pinned revision and submodules without updating the checkout.
+function(_kashi_iree_checkout_valid source out)
+  set(${out} FALSE PARENT_SCOPE)
+  if(NOT EXISTS "${source}/.git" OR NOT EXISTS "${source}/CMakeLists.txt")
+    return()
+  endif()
+  execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${source}" rev-parse HEAD
+    OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE result ERROR_QUIET)
+  if(NOT result STREQUAL "0" OR NOT revision STREQUAL KASHI_IREE_REVISION)
+    return()
+  endif()
+  execute_process(COMMAND "${GIT_EXECUTABLE}" --no-optional-locks -C "${source}"
+    status --porcelain --untracked-files=normal --ignore-submodules=none
+    OUTPUT_VARIABLE dirty RESULT_VARIABLE result ERROR_QUIET)
+  if(NOT result STREQUAL "0" OR NOT dirty STREQUAL "")
+    return()
+  endif()
+  execute_process(COMMAND "${GIT_EXECUTABLE}" --no-optional-locks -C "${source}" submodule status
+    OUTPUT_VARIABLE submodules RESULT_VARIABLE result ERROR_QUIET)
+  if(result STREQUAL "0" AND NOT submodules MATCHES "(^|\n)[+U-]")
+    set(${out} TRUE PARENT_SCOPE)
+  endif()
+endfunction()
+
+if(NOT KASHI_IREE_SOURCE_DIR)
+  if(DEFINED ENV{XDG_CACHE_HOME} AND NOT "$ENV{XDG_CACHE_HOME}" STREQUAL "")
+    set(_cache "$ENV{XDG_CACHE_HOME}/kashi")
+  else()
+    set(_cache "$ENV{HOME}/.cache/kashi")
+  endif()
+  file(MAKE_DIRECTORY "${_cache}")
+  file(LOCK "${_cache}/iree-${KASHI_IREE_REVISION}.lock" GUARD FILE TIMEOUT 1800)
+  set(KASHI_IREE_SOURCE_DIR "${_cache}/iree-${KASHI_IREE_REVISION}")
+  _kashi_iree_checkout_valid("${KASHI_IREE_SOURCE_DIR}" _iree_valid)
+  if(NOT _iree_valid)
+    # A previous configure may have finished staging but not published it.
+    file(GLOB _staged_checkouts LIST_DIRECTORIES true "${KASHI_IREE_SOURCE_DIR}.staging-*")
+    set(_staging "")
+    foreach(_candidate IN LISTS _staged_checkouts)
+      _kashi_iree_checkout_valid("${_candidate}" _iree_valid)
+      if(_iree_valid)
+        set(_staging "${_candidate}")
+        break()
+      endif()
+    endforeach()
+
+    # Never populate the canonical path in place: a failed setup must not make
+    # it look ready to the next configure. Keep any older data until validation.
+    string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef _suffix)
+    if(NOT _staging)
+      set(_staging "${KASHI_IREE_SOURCE_DIR}.staging-${_suffix}")
+      file(MAKE_DIRECTORY "${_staging}")
+      # Fetch the complete pinned tree explicitly; a filtered default-branch
+      # clone can have the commit without the objects needed to check it out.
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}" init --quiet
+        COMMAND_ERROR_IS_FATAL ANY)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}" remote add origin
+        https://github.com/iree-org/iree.git COMMAND_ERROR_IS_FATAL ANY)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}" fetch --no-tags
+        --depth 1 origin "${KASHI_IREE_REVISION}" COMMAND_ERROR_IS_FATAL ANY)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}"
+        checkout --detach "${KASHI_IREE_REVISION}" COMMAND_ERROR_IS_FATAL ANY)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_staging}"
+        submodule update --init --depth 1 --jobs 8 COMMAND_ERROR_IS_FATAL ANY)
+      _kashi_iree_checkout_valid("${_staging}" _iree_valid)
+      if(NOT _iree_valid)
+        message(FATAL_ERROR "Staged IREE checkout at ${_staging} does not match ${KASHI_IREE_REVISION} with pinned submodules")
+      endif()
+    endif()
+
+    if(EXISTS "${KASHI_IREE_SOURCE_DIR}" OR IS_SYMLINK "${KASHI_IREE_SOURCE_DIR}")
+      set(_preserved "${KASHI_IREE_SOURCE_DIR}.invalid-${_suffix}")
+      file(RENAME "${KASHI_IREE_SOURCE_DIR}" "${_preserved}")
+      message(STATUS "Preserved invalid IREE cache entry at ${_preserved}")
+    endif()
+    file(RENAME "${_staging}" "${KASHI_IREE_SOURCE_DIR}")
+  endif()
+  file(LOCK "${_cache}/iree-${KASHI_IREE_REVISION}.lock" RELEASE)
+else()
+  _kashi_iree_checkout_valid("${KASHI_IREE_SOURCE_DIR}" _iree_valid)
+  if(NOT _iree_valid)
+    message(FATAL_ERROR "IREE at ${KASHI_IREE_SOURCE_DIR} must be an unmodified checkout of ${KASHI_IREE_REVISION} with pinned submodules")
+  endif()
+endif()
+
+foreach(_incompatible BUILD_SHARED_LIBS IREE_USE_SYSTEM_DEPS LLVM_LINK_LLVM_DYLIB MLIR_LINK_MLIR_DYLIB)
+  if(${_incompatible})
+    message(FATAL_ERROR "${_incompatible} is incompatible with Kashi's private static compiler")
+  endif()
+endforeach()
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(IREE_BUILD_COMPILER ON CACHE BOOL "" FORCE)
+set(IREE_BUILD_BUNDLED_LLVM ON CACHE BOOL "" FORCE)
+set(IREE_ENABLE_POSITION_INDEPENDENT_CODE ON CACHE BOOL "" FORCE)
+set(LLVM_ENABLE_PIC ON CACHE BOOL "" FORCE)
+set(IREE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(IREE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(IREE_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
+set(IREE_LINK_COMPILER_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(IREE_EXPERIMENTAL_COMPILER_DYNAMIC_PLUGINS OFF CACHE BOOL "" FORCE)
+set(IREE_INPUT_TORCH ON CACHE BOOL "" FORCE)
+set(IREE_INPUT_STABLEHLO OFF CACHE BOOL "" FORCE)
+set(IREE_INPUT_TOSA OFF CACHE BOOL "" FORCE)
+set(IREE_TARGET_BACKEND_DEFAULTS OFF CACHE BOOL "" FORCE)
+set(IREE_TARGET_BACKEND_VMVX ON CACHE BOOL "" FORCE)
+set(IREE_HAL_DRIVER_DEFAULTS OFF CACHE BOOL "" FORCE)
+set(IREE_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(IREE_ENABLE_LIBBACKTRACE OFF CACHE BOOL "" FORCE)
+# The runtime reads this cached target before IREE configures libbacktrace.
+unset(IREE_LIBBACKTRACE_TARGET CACHE)
+set(IREE_ENABLE_WERROR_FLAG OFF CACHE BOOL "" FORCE)
+set(IREE_TARGET_BACKEND_CUDA "${KASHI_ENABLE_CUDA}" CACHE BOOL "" FORCE)
+# IREE caches this path independently when the build changes checkout.
+set(TORCH_MLIR_ROOT_DIR "${KASHI_IREE_SOURCE_DIR}/third_party/torch-mlir" CACHE PATH "" FORCE)
+list(APPEND IREE_CMAKE_BUILTIN_PLUGIN_PATHS "${PROJECT_SOURCE_DIR}/cpp/plugin")
+add_subdirectory("${KASHI_IREE_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/iree" EXCLUDE_FROM_ALL)

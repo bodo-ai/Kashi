@@ -72,6 +72,8 @@ def main() -> int:
     )
     coverage = parser.parse_args().coverage
     build_dir = COVERAGE_BUILD_DIR if coverage else BUILD_DIR
+    # Avoid building debug symbols for the entire embedded LLVM dependency.
+    config = "Release" if coverage else "Debug"
     try:
         cmake_args = []
         build_env = None
@@ -82,6 +84,7 @@ def main() -> int:
             cmake_args = [
                 "-G",
                 "Ninja",
+                "-DCMAKE_C_COMPILER=clang",
                 "-DCMAKE_CXX_COMPILER=clang++",
                 "-DKASHI_COVERAGE=ON",
             ]
@@ -108,7 +111,7 @@ def main() -> int:
                 *cmake_args,
                 "-DKASHI_BUILD_TESTS=ON",
                 "-DKASHI_MUTATION=OFF",
-                "-DCMAKE_BUILD_TYPE=Debug",
+                f"-DCMAKE_BUILD_TYPE={config}",
                 f"-DPython_EXECUTABLE={sys.executable}",
                 f"-Dnanobind_DIR={nanobind_dir}",
                 f"-DCMAKE_PREFIX_PATH={sys.prefix}",
@@ -116,12 +119,12 @@ def main() -> int:
             check=True,
         )
         subprocess.run(
-            ["cmake", "--build", str(build_dir), "--config", "Debug"],
+            ["cmake", "--build", str(build_dir), "--config", config],
             check=True,
             env=build_env,
         )
 
-        ctest = ["ctest", "--test-dir", str(build_dir), "-C", "Debug"]
+        ctest = ["ctest", "--test-dir", str(build_dir), "-C", config]
         discovery = subprocess.run(
             [*ctest, "--show-only=json-v1"],
             check=True,
