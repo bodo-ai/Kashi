@@ -33,7 +33,7 @@ def _partition(source, directory, *, partition_only=False):
 
 def _reject_partition(source, directory, diagnostic):
     """Require a partition-stage diagnostic without a partial driver."""
-    with pytest.raises(RuntimeError, match="partition"):
+    with pytest.raises(NotImplementedError, match="partition"):
         _partition(source, directory)
     assert diagnostic in (directory / "iree-compile.log").read_text()
     assert not (directory / "driver.mlir").exists()
@@ -72,8 +72,8 @@ module {
 """
 
 
-def test_mutating_boundary_keeps_wiring_and_rewrites_only_compiled_device(tmp_path):
-    """Losing either result or passing the pre-mutation value changes the graph."""
+def test_mutating_boundary_keeps_wiring_and_source_allocation_device(tmp_path):
+    """Custom mutations observe the driver-allocated buffer and compiled value."""
     source = _parse(MUTATION)
     before = str(source)
     result = _partition(source, tmp_path)
@@ -81,20 +81,65 @@ def test_mutating_boundary_keeps_wiring_and_rewrites_only_compiled_device(tmp_pa
     assert result.module.operation.verify()
     assert result.driver.operation.verify()
     assert result.device == "cuda:0"
-    assert 'torch.constant.device "cpu"' in str(result.module)
     assert 'torch.constant.device "cuda:0"' in str(result.driver)
     assert "torch.operator" not in str(result.module)
     ops = _ops(_main(result.driver))
     calls = [op for op in ops if op.name == "func.call"]
     assert [[str(v.type) for v in call.results] for call in calls] == [
-        [TENSOR, TENSOR],
+        [TENSOR],
         [TENSOR],
     ]
     custom = next(op for op in ops if op.name == "torch.operator")
+    allocation = next(op for op in ops if op.name == "torch.aten.empty.memory_format")
     assert ops.index(calls[0]) < ops.index(custom) < ops.index(calls[1])
-    assert list(custom.operands) == [calls[0].results[1], calls[0].results[0]]
-    assert list(calls[1].operands) == [calls[0].results[1], calls[0].results[0]]
+    assert list(custom.operands) == [allocation.results[0], calls[0].results[0]]
+    assert list(calls[1].operands) == [allocation.results[0], calls[0].results[0]]
     assert list(ops[-1].operands) == [calls[1].results[0]]
+
+
+def test_split_view_mutation_retains_original_base(tmp_path):
+    """A mutating custom op must receive a view of the original input storage."""
+    source = _parse("""
+module {
+  func.func @main(%x: !torch.vtensor<[6,4],f32>) -> (!torch.vtensor<[6,4],f32>, !torch.vtensor<[6,2],f32>) {
+    %two = torch.constant.int 2
+    %dim = torch.constant.int -1
+    %sections = torch.prim.ListConstruct %two, %two : (!torch.int, !torch.int) -> !torch.list<int>
+    %pieces = torch.aten.split_with_sizes %x, %sections, %dim : !torch.vtensor<[6,4],f32>, !torch.list<int>, !torch.int -> !torch.list<vtensor>
+    %left, %right = torch.prim.ListUnpack %pieces : !torch.list<vtensor> -> !torch.vtensor<[6,2],f32>, !torch.vtensor<[6,2],f32>
+    torch.operator "torch.test.increment"(%left) : (!torch.vtensor<[6,2],f32>) -> ()
+    return %x, %left : !torch.vtensor<[6,4],f32>, !torch.vtensor<[6,2],f32>
+  }
+}
+""")
+    result = _partition(source, tmp_path, partition_only=True)
+    block = _main(result.driver)
+    ops = _ops(block)
+    split = next(op for op in ops if op.name == "torch.aten.split_with_sizes")
+    unpack = next(op for op in ops if op.name == "torch.prim.ListUnpack")
+    custom = next(op for op in ops if op.name == "torch.operator")
+    assert split.operands[0] == block.arguments[0]
+    assert unpack.operands[0] == split.results[0]
+    assert custom.operands[0] == unpack.results[0]
+    assert list(ops[-1].operands) == [block.arguments[0], unpack.results[0]]
+
+
+def test_tensor_list_keeps_input_aliases_at_boundary(tmp_path):
+    """A returned tensor list must retain its elements' original identities."""
+    source = _parse("""
+module {
+  func.func @main(%x: !torch.vtensor<[4],f32>, %y: !torch.vtensor<[4],f32>) -> !torch.list<vtensor> {
+    %items = torch.prim.ListConstruct %x, %y : (!torch.vtensor<[4],f32>, !torch.vtensor<[4],f32>) -> !torch.list<vtensor>
+    return %items : !torch.list<vtensor>
+  }
+}
+""")
+    result = _partition(source, tmp_path, partition_only=True)
+    block = _main(result.driver)
+    ops = _ops(block)
+    construct = next(op for op in ops if op.name == "torch.prim.ListConstruct")
+    assert list(construct.operands) == list(block.arguments)
+    assert ops[-1].operands[0] == construct.results[0]
 
 
 def test_multiple_and_adjacent_boundaries_keep_order_and_value_identity(tmp_path):
@@ -150,12 +195,17 @@ module {
 """)
     result = _partition(source, tmp_path, partition_only=True)
     assert result.module.operation.verify() and result.driver.operation.verify()
-    ops = _ops(_main(result.driver))
-    calls = [op for op in ops if op.name == "func.call"]
-    assert [str(v.type) for v in calls[0].results] == ["!torch.int", "!torch.list<int>"]
+    block = _main(result.driver)
+    ops = _ops(block)
+    size = next(op for op in ops if op.name == "torch.aten.size.int")
+    shape = next(op for op in ops if op.name == "torch.prim.ListConstruct")
     barrier = next(op for op in ops if op.name == "torch.operator")
-    assert list(barrier.operands) == list(calls[0].results)
-    assert calls[1].operands[1] == calls[0].results[1]
+    view = next(op for op in ops if op.name == "torch.aten.view")
+    assert list(size.operands) == list(block.arguments)
+    assert shape.operands[0] == size.results[0]
+    assert list(barrier.operands) == [size.results[0], shape.results[0]]
+    assert view.operands[1] == shape.results[0]
+    assert ops[-1].operands[0] == view.results[0]
 
 
 def test_unsupported_crossing_is_reported_without_invalid_driver(tmp_path):
@@ -220,9 +270,10 @@ def test_unsupported_live_in_is_rejected(tmp_path):
     """An unsupported external segment input must not reach IREE silently."""
     source = _parse("""
 module {
-  func.func @main(%f: !torch.float) -> !torch.list<float> {
-    %list = torch.prim.ListConstruct %f : (!torch.float) -> !torch.list<float>
-    return %list : !torch.list<float>
+  func.func @main(%x: !torch.vtensor<[4],f32>, %f: !torch.float) -> !torch.vtensor<[4],f32> {
+    %one = torch.constant.int 1
+    %out = torch.aten.add.Scalar %x, %f, %one : !torch.vtensor<[4],f32>, !torch.float, !torch.int -> !torch.vtensor<[4],f32>
+    return %out : !torch.vtensor<[4],f32>
   }
 }
 """)
@@ -236,7 +287,7 @@ def test_cpu_device_is_reported_without_rewriting(tmp_path):
     result = _partition(_parse(MUTATION.replace("cuda:0", "cpu")), tmp_path)
     assert result.device == "cpu"
     assert result.module.operation.verify() and result.driver.operation.verify()
-    assert 'torch.constant.device "cpu"' in str(result.module)
+    assert 'torch.constant.device "cpu"' in str(result.driver)
 
 
 def test_multiple_source_devices_are_rejected(tmp_path):
@@ -251,7 +302,7 @@ def test_multiple_source_devices_are_rejected(tmp_path):
 
 
 def test_dynamic_list_argument_is_forwarded_to_each_user(tmp_path):
-    """An input list remains the same SSA value at the custom call and segment."""
+    """An input list remains the same SSA value at the custom call and view."""
     source = _parse("""
 module {
   func.func @main(%x: !torch.vtensor<[4],f32>, %shape: !torch.list<int>) -> !torch.vtensor<[4],f32> {
@@ -264,7 +315,8 @@ module {
     result = _partition(source, tmp_path, partition_only=True)
     assert result.module.operation.verify() and result.driver.operation.verify()
     block = _main(result.driver)
-    custom, call, _ = _ops(block)
+    custom, view, returned = _ops(block)
+    assert custom.name == "torch.operator" and view.name == "torch.aten.view"
     assert custom.operands[0] == block.arguments[1]
-    assert call.operands[0] == block.arguments[0]
-    assert call.operands[1] == block.arguments[1]
+    assert list(view.operands) == list(block.arguments)
+    assert returned.operands[0] == view.results[0]

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "mlir/IR/BuiltinOps.h"
 
@@ -13,9 +15,11 @@ struct Partition {
   std::optional<std::string> sourceDevice;
 };
 
-// Outlines Torch runs between custom ops and builds a driver that calls them
-// in source order. Both modules use the source context; the source is
-// unchanged.
-mlir::FailureOr<Partition> partitionTorchModule(mlir::ModuleOp source);
+// The optional schema query returns whether an ATen operation aliases or
+// writes an argument; nullopt means the operation has no known schema.
+// Without it, registered Torch traits are used conservatively.
+mlir::FailureOr<Partition> partitionTorchModule(
+    mlir::ModuleOp source,
+    const std::function<std::optional<bool>(std::string_view)> &schema = {});
 
 } // namespace kashi

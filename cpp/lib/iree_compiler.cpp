@@ -34,6 +34,7 @@
 #include <mutex>
 #include <stdexcept>
 
+#include "iree/compiler/Dialect/VM/Target/Bytecode/BytecodeModuleTarget.h"
 #include "iree/compiler/Pipelines/Pipelines.h"
 #include "iree/compiler/embedding_api.h"
 #include "iree/compiler/mlir_interop.h"
@@ -164,33 +165,40 @@ const BackendConfig &getBackendConfig(const IreeCompileOptions &options,
   diagnostics.fail("configuration", "expected target cuda or vmvx");
 }
 
-Session createSession(const BackendConfig &backend,
-                      const std::optional<std::string> &architecture,
-                      Diagnostics &diagnostics) {
+Session createSession(Diagnostics &diagnostics) {
   // Keep the embedded pipeline from running IREE's JIT of constant
   // initializers on the host. This disables runtime-backed evaluation via
   // the local-task CPU driver, not ordinary IR constant folding.
-  llvm::SmallVector<const char *, 6> flags = {"--iree-plugin=kashi",
+  llvm::SmallVector<const char *, 3> flags = {"--iree-plugin=kashi",
                                               "--iree-input-type=torch",
                                               "--iree-opt-const-eval=false"};
-  flags.push_back(terminatedData(backend.deviceFlag));
-  llvm::SmallString<32> archFlag;
-  if (backend.architectureFlag && architecture) {
-    archFlag += *backend.architectureFlag;
-    archFlag += *architecture;
-    flags.push_back(archFlag.c_str());
-  } else if (backend.architectureFlag || architecture) {
-    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
-  }
-  for (StringLiteral flag : backend.extraFlags) {
-    flags.push_back(terminatedData(flag));
-  }
   Session session(ireeCompilerSessionCreate());
   diagnostics.check(
       CompilerError(ireeCompilerSessionSetFlags(
           session.get(), static_cast<int>(flags.size()), flags.data())),
       "configuration");
   return session;
+}
+
+/// Configure the target only after native partitioning finds compilable work.
+void configureBackend(const Session &session, const BackendConfig &backend,
+                      const std::optional<std::string> &architecture,
+                      Diagnostics &diagnostics) {
+  llvm::SmallVector<const char *, 3> flags = {
+      terminatedData(backend.deviceFlag)};
+  llvm::SmallString<32> archFlag;
+  if (backend.architectureFlag && architecture) {
+    archFlag += *backend.architectureFlag;
+    archFlag += *architecture;
+    flags.push_back(archFlag.c_str());
+  }
+  for (StringLiteral flag : backend.extraFlags) {
+    flags.push_back(terminatedData(flag));
+  }
+  diagnostics.check(
+      CompilerError(ireeCompilerSessionSetFlags(
+          session.get(), static_cast<int>(flags.size()), flags.data())),
+      "configuration");
 }
 
 Source wrapSource(const Session &session, const std::string &assembly,
@@ -292,17 +300,25 @@ void writeModule(ModuleOp module, const fs::path &path,
                 });
 }
 
-std::optional<std::string> partitionInput(Invocation &invocation,
-                                          const fs::path &dir,
-                                          Diagnostics &diagnostics) {
+struct PartitionResult {
+  std::optional<std::string> sourceDevice;
+  bool empty;
+};
+
+PartitionResult partitionInput(Invocation &invocation, const fs::path &dir,
+                               const IreeCompileOptions &options,
+                               Diagnostics &diagnostics) {
   auto original = invocation.takeModule();
   auto partition = diagnostics.require<UnsupportedPartition>(
-      partitionTorchModule(*original), "partition");
+      partitionTorchModule(*original, options.schema), "partition");
   writeModule(*partition.segments, dir / "partitioned.mlir", diagnostics);
   writeModule(*partition.driver, dir / "driver.mlir", diagnostics);
+  bool empty = partition.segments->getBody()->empty();
+  if (empty)
+    return {std::move(partition.sourceDevice), true};
   invocation.putModule(std::move(partition.segments),
                        "verify partitioned module");
-  return std::move(partition.sourceDevice);
+  return {std::move(partition.sourceDevice), false};
 }
 
 using Phase = mlir::iree_compiler::IREEVMPipelinePhase;
@@ -366,6 +382,7 @@ std::vector<KernelIdentity> captureFlow(Invocation &invocation,
                   flow->print(out);
                   return success();
                 });
+  writeModule(*flow, dir / "phases" / "module.flow.mlir", diagnostics);
   std::vector<KernelIdentity> identities;
   if (backend == IreeBackend::CUDA) {
     identities = diagnostics.require(identifyCudaKernels(*flow),
@@ -385,6 +402,32 @@ void emitCudaManifest(Invocation &invocation, const fs::path &dir,
   invocation.putModule(std::move(hal), "verify linked HAL module");
 }
 
+void capturePhase(Invocation &invocation, const fs::path &path,
+                  Diagnostics &diagnostics) {
+  auto module = invocation.takeModule();
+  // The launch ABI reader consumes textual operation forms; location suffixes
+  // are not part of that ABI. Keep provenance on partitioned/driver MLIR.
+  writeArtifact(path, diagnostics, "write " + path.filename().string(),
+                [&](llvm::raw_ostream &out) {
+                  module->print(out);
+                  out << '\n';
+                  return success();
+                });
+  invocation.putModule(std::move(module), "verify phase checkpoint");
+}
+
+void emitVmBytecode(Invocation &invocation, const fs::path &dir,
+                    Diagnostics &diagnostics) {
+  auto module = invocation.takeModule();
+  writeArtifact(dir / "module.vmfb", diagnostics, "write VM bytecode",
+                [&](llvm::raw_ostream &out) {
+                  namespace VM = mlir::iree_compiler::IREE::VM;
+                  return VM::translateModuleToBytecode(
+                      *module, VM::TargetOptions{}, VM::BytecodeTargetOptions{},
+                      out);
+                });
+}
+
 void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
                           IreeBackend backend,
                           std::optional<IreeTestPipeline> testPipeline,
@@ -393,10 +436,12 @@ void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
   mlir::iree_compiler::enumerateIREEVMPipelinePhases(
       [&](Phase phase, llvm::StringRef name, llvm::StringRef) {
         const auto pipeline = checkpointPasses(phase, backend, testPipeline);
-        const bool snapshot = phase == Phase::Flow;
+        const bool flowSnapshot = phase == Phase::Flow;
+        const bool phaseSnapshot =
+            phase == Phase::Stream || phase == Phase::ExecutableTargets;
         const bool manifest =
             backend == IreeBackend::CUDA && phase == Phase::HAL;
-        if (!pipeline && !snapshot && !manifest) {
+        if (!pipeline && !flowSnapshot && !phaseSnapshot && !manifest) {
           return;
         }
         if (phase != Phase::Start) {
@@ -405,14 +450,20 @@ void lowerWithCheckpoints(Invocation &invocation, const fs::path &dir,
         if (pipeline) {
           invocation.runPasses(name, *pipeline);
         }
-        if (snapshot) {
+        if (flowSnapshot) {
           identities = captureFlow(invocation, dir, backend, diagnostics);
+        }
+        if (phaseSnapshot) {
+          capturePhase(invocation,
+                       dir / "phases" / ("module." + name.str() + ".mlir"),
+                       diagnostics);
         }
         if (manifest) {
           emitCudaManifest(invocation, dir, identities, diagnostics);
         }
       });
   invocation.lowerTo("end");
+  emitVmBytecode(invocation, dir, diagnostics);
 }
 
 /// Partition and lower a Torch module in one private IREE invocation.
@@ -423,14 +474,27 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
   const fs::path dir = fs::absolute(options.artifactDir);
   Diagnostics diagnostics(dir / "iree-compile.log");
   const auto &backend = getBackendConfig(options, diagnostics);
-  const auto session = createSession(backend, options.cudaTarget, diagnostics);
+  if (!backend.architectureFlag && options.cudaTarget)
+    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
+  // CPU-only IREE builds do not register CUDA flags. Parse and partition with
+  // common flags first, so driver-only graphs need no CUDA backend at all.
+  const auto session = createSession(diagnostics);
   const auto source = wrapSource(session, assembly, diagnostics);
   Invocation invocation(session, diagnostics);
   invocation.parse(source);
-  auto sourceDevice = partitionInput(invocation, dir, diagnostics);
+  auto partition = partitionInput(invocation, dir, options, diagnostics);
+  if (partition.empty)
+    return std::move(partition.sourceDevice);
+  if (backend.architectureFlag && !options.cudaTarget)
+    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
+  configureBackend(session, backend, options.cudaTarget, diagnostics);
+  std::error_code error;
+  fs::create_directories(dir / "phases", error);
+  if (error)
+    diagnostics.fail("create phase directory", error.message());
   lowerWithCheckpoints(invocation, dir, backend.backend, testPipeline,
                        diagnostics);
-  return sourceDevice;
+  return std::move(partition.sourceDevice);
 }
 } // namespace
 
