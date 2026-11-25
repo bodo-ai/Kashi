@@ -3,6 +3,7 @@
 Graphs are plain Python functions traced with ``make_fx`` on fake tensors.
 """
 
+import operator
 import sys
 
 import pytest
@@ -318,9 +319,84 @@ def test_import_without_flag_keeps_custom_ops():
     assert "kashi.decomposed" not in asm
 
 
-def test_decomposed_graph_is_a_single_iree_segment():
-    """With no custom ops left, IREE gets one segment."""
-    assert len(partition_at_custom_ops(_import(decompose=True)).segments) == 1
+def test_decomposed_graph_executes_across_iree_segments():
+    """Decomposed math executes through IREE while view boundaries stay safe."""
+    import iree.compiler
+    import iree.runtime
+    from iree.compiler import ir
+    from kashi.mlir_to_fx import rebuild_fx
+
+    generator = torch.Generator().manual_seed(7)
+    x = torch.randn(3, 8, generator=generator)
+    weight = torch.randn(8, generator=generator)
+    gm = _trace(_two_norms_then_silu, x, weight)
+    imported = import_fx(gm, decompose_custom_ops=True)
+    partition = partition_at_custom_ops(imported.module)
+    assert partition.module.operation.verify()
+    assert partition.driver is not None
+    assert partition.driver.operation.verify()
+
+    functions = {
+        ir.StringAttr(op.attributes["sym_name"]).value: op
+        for op in partition.module.body.operations
+    }
+    compute_locations = [
+        str(op.operation.location)
+        for function in functions.values()
+        for op in function.regions[0].blocks[0].operations
+        if op.operation.name.startswith("torch.aten.")
+    ]
+    for tag in ("_C.rms_norm#0", "_C.rms_norm#1", "_C.silu_and_mul#0"):
+        assert any(f"kashi.decomposed:{tag}" in loc for loc in compute_locations)
+
+    # Execute each real compiled CPU segment while the reconstructed driver
+    # keeps the slices in PyTorch; segment counts are not a semantic contract.
+    blob = iree.compiler.compile_str(
+        str(partition.module),
+        target_backends=["llvm-cpu"],
+        extra_args=["--iree-llvmcpu-target-cpu=generic"],
+    )
+    compiled = iree.runtime.load_vm_flatbuffer(blob, driver="local-task")
+
+    def make_handler(name, result_count):
+        """Splice an executable CPU IREE segment into the driver graph."""
+
+        def execute(*args):
+            inputs = [
+                arg.detach().numpy() if isinstance(arg, torch.Tensor) else arg
+                for arg in args
+            ]
+            values = compiled[name](*inputs)
+            if result_count == 0:
+                return ()
+            values = (values,) if result_count == 1 else tuple(values)
+            values = tuple(
+                torch.from_numpy(value.to_host())
+                if hasattr(value, "to_host")
+                else value
+                for value in values
+            )
+            return values[0] if result_count == 1 else values
+
+        def splice(graph, args):
+            call = graph.call_function(execute, tuple(args))
+            if result_count == 1:
+                return [call]
+            return [
+                graph.call_function(operator.getitem, (call, i))
+                for i in range(result_count)
+            ]
+
+        return splice
+
+    handlers = {
+        segment.func_name: make_handler(segment.func_name, len(segment.live_out_types))
+        for segment in partition.segments
+        if segment.func_name in functions
+    }
+    rebuilt = rebuild_fx(partition.driver, imported.out_spec, segment_handlers=handlers)
+    reference = _ref_silu_and_mul(_ref_rms(_ref_rms(x, weight), weight))
+    torch.testing.assert_close(rebuilt(x, weight), reference, rtol=1e-4, atol=1e-5)
 
 
 def test_compile_iree_fx_forwards_the_flag(monkeypatch, tmp_path):

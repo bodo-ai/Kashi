@@ -81,41 +81,64 @@ The importer supports dtype-only `Tensor.to(dtype)` conversions, including the
 casts captured in CPU Qwen3 graphs; device and tensor overloads are not supported.
 CPU RMS normalization and gated-activation operations are also normalized to ATen.
 
-## Experimental IREE/PTX graph
+## Experimental IREE CUDA execution
 
-`kashi.iree_backend.compile_iree_fx` explicitly opts an FX graph into the IREE
-pipeline. It partitions around custom operators, compiles ordinary segments to
-CUDA PTX, and returns a single FX graph containing opaque kernel calls. The
-default `compile_fx` backend remains executable and does not invoke IREE.
+`kashi.iree_backend.compile_iree_backend` is a `torch.compile` backend that
+partitions an FX graph, compiles ordinary segments with IREE, and executes the
+reconstructed graph on CUDA. Custom operations and alias-sensitive PyTorch
+operations remain in the driver graph. The existing `kashi.backend.compile_fx`
+continues to provide the direct FX-to-MLIR-to-FX round trip.
 
-For example, inspect the IREE graph during a normal `torch.compile` run:
+Set `KASHI_IREE_EXECUTION` before compilation to select the execution mode:
+
+- `cuda` (default): launch individual IREE-generated PTX kernels on PyTorch's
+  current CUDA stream. Inputs to a kernel must be contiguous and satisfy the
+  generated binding alignment.
+- `iree`: execute each compiled segment through the IREE VM runtime. This mode
+  synchronizes the calling stream and copies fresh results device-to-device
+  into PyTorch-owned buffers. It does not support CUDA graph capture; for vLLM,
+  set `cudagraph_mode=CUDAGraphMode.NONE`.
 
 ```python
 import torch
-from kashi.backend import compile_fx
-from kashi.iree_backend import compile_iree_fx
+from kashi.iree_backend import compile_iree_backend
 
-def inspect_iree(gm, example_inputs):
-    result = compile_iree_fx(gm, output_dir="/tmp/kashi-iree", cuda_target="sm_80")
-    print(result.graph.graph)
-    print(result.kernels_ptx)
-    return compile_fx(gm, example_inputs)
-
-torch.compile(lambda x: torch.ops.aten.relu.default(x), backend=inspect_iree)(torch.ones(8))
+model = torch.compile(lambda x: torch.ops.aten.relu.default(x), backend=compile_iree_backend)
+result = model(torch.randn(8, device="cuda"))
 ```
 
-Each call creates a unique artifact directory containing the partitioned and
-driver MLIR, IREE phase dumps, compiler log, raw PTX files and `kernels.ptx`.
-If `cuda_target` is omitted, `IREE_CUDA_TARGET` or the current CUDA device is
-used. Compiler and unsupported-operation errors propagate; there is no silent
-fallback. The returned graph is for inspection and further transformations:
-its opaque kernel calls cannot execute until kernel launching is implemented.
+For vLLM, use `backend="kashi.iree_backend.compile_iree_backend"` with
+`CompilationMode.DYNAMO_TRACE_ONCE`. The backend keeps temporary compiler
+artifacts for the lifetime of the compiled callable. To inspect persistent
+artifacts and the reconstructed graph, call `compile_iree_fx(gm, output_dir=...)`
+directly. `IREE_CUDA_TARGET` can override automatic CUDA architecture selection.
+Unknown execution modes, unsupported operations, and compiler failures raise
+errors; neither mode silently falls back to the ordinary backend.
 
-The existing round-trip and vLLM tests continue to validate executable PyTorch
-semantics. The IREE tests separately compile real kernels and check the returned
-graph's custom-op boundaries, kernel operands and output wiring.
-The CUDA/PTX compilation test is skipped on macOS; platform-independent IREE
-partitioning and reconstruction tests still run there.
+The CUDA/PTX compilation test is skipped on macOS, and GPU execution tests run
+only when CUDA is available. Platform-independent IREE tests still run there.
+
+To check Qwen3 inference against uncompiled vLLM on a CUDA GPU, run:
+
+```sh
+pixi run --locked test-python -v python/tests/test_iree_qwen3_integration.py
+```
+
+The two cases exercise direct CUDA launches (`cuda`) and IREE VMFB execution
+(`iree`). They use the same seeded, offline, one-layer dummy Qwen3 model and
+prompts as the uncompiled reference, and check that IREE executes during each
+compiled graph call, including request prefill and decode. The assertions in
+`python/tests/test_iree_qwen3_integration.py` and `assert_outputs_match` in
+`python/tests/vllm_test_utils.py` compare generated token IDs exactly and the
+selected-token log-probabilities with `rtol=1e-4`, `atol=1e-5`. Pytest reports
+pass or failure; it does not print the compared values. This is coverage for
+that test model and those inputs, not a proof for every model or checkpoint.
+Without CUDA the cases are skipped. To test individual operations and mutation
+semantics against eager PyTorch, run:
+
+```sh
+pixi run --locked test-python -v python/tests/test_iree_execution.py
+```
 
 ## Tests
 
@@ -135,6 +158,15 @@ Reinstall the editable package after C++ changes as shown above; the native
 test command configures and builds its own tree on each run. Until genuine
 C++ tests are added, it reports `no native tests yet` rather than claiming
 that an empty suite passed.
+
+Linux CPU CI sets `TRITON_INTERPRET=1` for the Python coverage run because
+vLLM's Triton CPU sampler can fail with an illegal instruction on some CI
+processors. The vLLM Qwen3 parity test still runs, but this job does not test
+Triton's native CPU JIT. In a Linux CPU Pixi environment, reproduce that test:
+
+```sh
+TRITON_INTERPRET=1 pixi run --locked test-python python/tests/test_qwen3_integration.py
+```
 
 For native test selection, first run `pixi run test-cpp` to configure and
 build, then use `pixi run ctest --test-dir build/test-cpp -C Debug -R '<test-name>'
@@ -167,9 +199,17 @@ Python, `cpp.txt` and (when coverage is available) `cpp.json` and `cpp.lcov` for
 Actions posts a summary and uploads the machine-readable reports and native
 summary as `coverage-reports`. On pull requests, more than 90% of added or
 modified executable lines must be covered across `python/src/kashi/`,
-`cpp/lib/`, and `cpp/include/`. Lines are compared against the PR base; a
-changed source file with no coverage data fails the check. Test-only changes
-do not affect the percentage. Push runs report coverage without enforcing it.
+`cpp/lib/`, and `cpp/include/`. Linux CPU-only CI explicitly excludes
+`python/src/kashi/iree_cuda.py` and `python/src/kashi/iree_runtime.py` from this
+gate; both files remain visible in the full coverage report and require CUDA
+tests for execution coverage. The summary names any excluded changed files.
+All other changed source files must have coverage data. Lines are compared
+against the PR base; test-only changes do not affect the percentage. Push runs
+report coverage without enforcing it.
+
+For a local GPU-inclusive changed-line check, run the coverage tasks above,
+then run `python scripts/check_diff_coverage.py <base-commit>` without
+`--exclude-gpu`.
 
 
 ## Native mutation testing

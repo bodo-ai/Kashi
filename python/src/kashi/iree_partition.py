@@ -1,7 +1,9 @@
-"""Split Torch-dialect graphs into IREE segments and a custom-op driver."""
+"""Split Torch-dialect graphs into IREE segments and a mutation-safe driver."""
 
 from dataclasses import dataclass
+from functools import cache
 
+import torch
 from iree.compiler import ir
 from iree.compiler.dialects import func
 
@@ -43,6 +45,52 @@ def _supported(type_: ir.Type) -> bool:
         text.startswith(("!torch.vtensor", "!torch.tensor", "!torch.list"))
         or text == "!torch.int"
     )
+
+
+@cache
+def _driver_boundary(name: str) -> bool:
+    """Keep custom, aliasing and mutating operations in the PyTorch driver.
+
+    IREE's tensor value semantics can materialize a view or elide a copy.
+    Keeping these operators outside compiled segments preserves the storage
+    identity that later in-place custom operations and graph outputs observe.
+    """
+    # Shape lists are PyTorch-side values: IREE's exported function ABI cannot
+    # pass !torch.list<int> across segment boundaries. Allocations consume
+    # those lists and should use the source framework's allocator and device.
+    if name in (
+        "torch.operator",
+        "torch.prim.ListUnpack",
+        "torch.aten.clone",
+        "torch.aten._to_copy",
+        "torch.aten.size",
+        "torch.aten.size.int",
+        "torch.aten.sym_size.int",
+        "torch.aten.empty.memory_format",
+    ):
+        return True
+    if not name.startswith("torch.aten."):
+        return False
+    base, _, overload = name.removeprefix("torch.aten.").partition(".")
+    packet = getattr(torch.ops.aten, base, None)
+    overload = overload or "default"
+    if (
+        not isinstance(packet, torch._ops.OpOverloadPacket)
+        or overload not in packet.overloads()
+    ):
+        raise NotImplementedError(f"Cannot determine alias semantics for {name}")
+    schema = getattr(packet, overload)._schema
+    return any(result.alias_info is not None for result in schema.returns) or any(
+        arg.alias_info is not None and arg.alias_info.is_write
+        for arg in schema.arguments
+    )
+
+
+def _is_boundary(operation) -> bool:
+    """Keep dynamic list construction in the driver; constants are cloned."""
+    if operation.name == "torch.prim.ListConstruct":
+        return True
+    return _driver_boundary(operation.name)
 
 
 def _clone(operation, mapping, *, rewrite_device: bool):
@@ -94,10 +142,10 @@ def _source_block(module: ir.Module):
 
 
 def _driver(block, operations, clonable, segment_io):
-    """Replace each run by a call while retaining custom ops in source order.
+    """Replace each run by a call while retaining mutation and alias boundaries.
 
     Declarations make calls verifiable without embedding segment bodies. Runs
-    are called immediately before their following custom op (or the return),
+    are called immediately before their following boundary (or the return),
     so all their inputs are available and mutation ordering remains intact.
     """
     driver = ir.Module.create()
@@ -139,27 +187,27 @@ def _driver(block, operations, clonable, segment_io):
             if operation.name == "func.return":
                 emit_call(index)
                 func.ReturnOp([mapping[value] for value in operation.operands])
-            elif operation.name == "torch.operator":
+            elif operation.results and operation.results[0] in clonable:
+                _clone(operation, mapping, rewrite_device=False)
+            elif _is_boundary(operation):
                 emit_call(index)
                 _clone(operation, mapping, rewrite_device=False)
                 index += 1
-            elif operation.results and operation.results[0] in clonable:
-                _clone(operation, mapping, rewrite_device=False)
     return driver
 
 
 def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
-    """Partition @main at custom ops without changing the source module.
+    """Partition @main at custom, aliasing and mutating operations.
 
     Each maximal ordinary-op run becomes a public segment function. Constants
     and lists made entirely from constants are duplicated in runs that use them;
     all other dependencies cross segment interfaces as SSA values. The driver
-    preserves the original custom calls, including zero-result mutation calls.
+    retains alias-sensitive operators and custom calls in their original order.
     Unsupported live-out types are recorded and prevent driver construction.
     """
     block, operations = _source_block(module)
     groups = [[]]
-    custom_ops = []
+    boundaries = []
     clonable_ops = []
     clonable = {}
     devices = set()
@@ -168,10 +216,7 @@ def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
         name = operation.name
         if name == "func.return":
             continue
-        if name == "torch.operator":
-            custom_ops.append(operation)
-            groups.append([])
-        elif _constant(name) or (
+        if _constant(name) or (
             name == "torch.prim.ListConstruct"
             and all(value in clonable for value in operation.operands)
         ):
@@ -182,6 +227,9 @@ def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
             for value in operation.results:
                 clonable[value] = len(clonable_ops)
             clonable_ops.append(operation)
+        elif _is_boundary(operation):
+            boundaries.append(operation)
+            groups.append([])
         else:
             groups[-1].append(operation)
     if len(devices) > 1:
@@ -197,9 +245,9 @@ def partition_at_custom_ops(module: ir.Module) -> PartitionResult:
         for operation in group:
             for value in operation.operands:
                 consumers.setdefault(value, set()).add(("segment", index))
-    for index, operation in enumerate(custom_ops):
+    for index, operation in enumerate(boundaries):
         for value in operation.operands:
-            consumers.setdefault(value, set()).add(("custom", index))
+            consumers.setdefault(value, set()).add(("boundary", index))
     for value in operations[-1].operands:
         consumers.setdefault(value, set()).add(("return", None))
 

@@ -38,7 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
+          # The event base can be older than the tested merge's first parent.
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
@@ -54,6 +55,10 @@ jobs:
         run: pixi run --locked test-python
       - name: Python tests with coverage
         if: runner.os == 'Linux'
+        env:
+          # vLLM's Triton CPU sampler can SIGILL on Zen2 GitHub runners.
+          # Interpret Triton while retaining the real vLLM parity tests.
+          TRITON_INTERPRET: "1"
         run: pixi run --locked coverage-python
       - name: Native tests
         if: runner.os != 'Linux'
@@ -87,7 +92,7 @@ jobs:
         shell: bash
         env:
           DIFF_BASE: ${{ github.event.pull_request.base.sha }}
-        run: python3 scripts/check_diff_coverage.py "$DIFF_BASE" | tee -a "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/check_diff_coverage.py --exclude-gpu "$DIFF_BASE" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Summarize coverage
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.pixi.outcome == 'success' }}
         run: |

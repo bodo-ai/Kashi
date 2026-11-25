@@ -1,9 +1,9 @@
-"""Splice IREE flow-phase segments into FX with opaque kernel calls.
+"""Splice IREE flow-phase segments into FX with kernel dispatch calls.
 
 Flow is the last tensor-level phase with segment boundaries and dispatches.
 The coarse-fences ABI's imports, exports and barriers only change IREE's
 runtime representation or ordering; they are aliases in the reconstructed FX
-graph. Dispatches are deliberately not executable kernel launches.
+graph. A compiler-provided executor makes each kernel call executable.
 """
 
 import operator
@@ -30,26 +30,27 @@ _ENTRY_POINT = re.compile(r"@(?P<executable>[^:]+)::@(?P<export>.+)")
 
 
 class IreeKernel:
-    """Stable FX call target identifying one IREE executable export.
+    """FX call target identifying one IREE executable export.
 
-    This is metadata, not a launcher: calling it always raises. Instances are
-    shared by dispatches referring to the same executable and export within a
-    parsed flow module.
+    A target built without an executor is inspection-only. Compiled graphs
+    attach an executor that loads and launches the corresponding kernel.
     """
 
-    def __init__(self, executable: str, export: str):
-        """Record the executable and export names used by the flow dispatch."""
+    def __init__(self, executable: str, export: str, executor=None):
+        """Record the executable, export and optional kernel executor."""
         self.executable = executable
         self.export = export
         self.__name__ = export
         self.__module__ = "iree_kernel"
+        self._executor = executor
 
     def __call__(self, *args, **kwargs):
-        """Reject execution because the reconstructed kernel is opaque."""
-        raise NotImplementedError(
-            f"{self.export}: the reassembled graph carries kernel calls as opaque "
-            "targets; launching them through the IREE runtime is not implemented"
-        )
+        """Run the configured kernel, or reject an inspection-only target."""
+        if self._executor is None:
+            raise NotImplementedError(
+                f"{self.export}: inspection-only opaque target has no executor"
+            )
+        return self._executor(*args, **kwargs)
 
     def __repr__(self):
         """Display the export when inspecting FX graphs."""
@@ -73,11 +74,12 @@ class _SegmentConverter:
     Fence arguments are synchronization plumbing, not segment data inputs.
     """
 
-    def __init__(self, func, graph, args, kernels, device):
+    def __init__(self, func, graph, args, kernels, device, kernel_factory):
         """Bind segment data arguments to the caller's FX values."""
         self.graph = graph
         self.kernels = kernels
         self.device = device
+        self.kernel_factory = kernel_factory
         self.name = ir.StringAttr(func.attributes["sym_name"]).value
         self.block = func.regions[0].blocks[0]
         self.values: dict[Any, Any] = {}
@@ -183,19 +185,18 @@ class _SegmentConverter:
         )
 
     def _dispatch(self, op):
-        """Emit an opaque kernel call and unpack its results when necessary.
+        """Emit a kernel call and unpack its results when necessary.
 
         Operand segments are workload, arguments, argument dimensions, and
         result dimensions. Only arguments are kernel inputs; workload and
         result types remain attached to the call as launch/result metadata.
-        Tied outputs (results written in place into an argument, e.g. IREE's
-        concatenation copies) are modeled as the call's own results; the tie is
-        kept as ``iree_tied_operands`` metadata, since these opaque kernels
-        cannot execute and so cannot observe the in-place write yet.
+        Tied outputs are represented as call results with their input ties in
+        ``iree_tied_operands`` metadata. Inspection-only targets cannot execute;
+        executable targets also receive the mapping so they can reuse the
+        correct input buffers.
         """
-        num_workload, num_args = list(
-            ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"])
-        )[:2]
+        sizes = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
+        num_workload, num_args, num_argument_dims, num_result_dims = sizes
         tied = [
             ir.IntegerAttr(a).value
             for a in ir.ArrayAttr(op.attributes["tied_operands"])
@@ -212,13 +213,45 @@ class _SegmentConverter:
             )
         key = (entry.group("executable"), entry.group("export"))
         if key not in self.kernels:
-            self.kernels[key] = IreeKernel(*key)
+            executor = (
+                self.kernel_factory(*key) if self.kernel_factory is not None else None
+            )
+            self.kernels[key] = IreeKernel(*key, executor=executor)
         operands = [self.values[v] for v in op.operands]
         workload = operands[:num_workload]
-        args = operands[num_workload : num_workload + num_args]
-        node = self.graph.call_function(
-            self.kernels[key], tuple(args), {"workload": workload}
-        )
+        args_start = num_workload
+        args_end = args_start + num_args
+        dims_end = args_end + num_argument_dims
+        result_end = dims_end + num_result_dims
+        args = operands[args_start:args_end]
+        kwargs = {"workload": workload}
+        if self.kernel_factory is not None:
+            # Flow separates dynamic result dimensions from kernel arguments.
+            # Preserve them in the FX call so the launcher can allocate outputs.
+            result_dims = operands[dims_end:result_end]
+            shapes, dtypes = [], []
+            offset = 0
+            for result in op.results:
+                tensor_type = ir.RankedTensorType(result.type)
+                count = sum(
+                    ir.ShapedType.is_dynamic_size(dim) for dim in tensor_type.shape
+                )
+                shapes.append(
+                    self._shape(result.type, result_dims[offset : offset + count])
+                )
+                dtypes.append(_dtype(tensor_type.element_type))
+                offset += count
+            if offset != len(result_dims):
+                raise ValueError(
+                    f"{self.name}: unexpected result dimensions in flow.dispatch"
+                )
+            kwargs.update(
+                argument_dims=operands[args_end:dims_end],
+                result_shapes=shapes,
+                result_dtypes=dtypes,
+                tied_operands=tied,
+            )
+        node = self.graph.call_function(self.kernels[key], tuple(args), kwargs)
         node.meta["iree_result_types"] = [str(result.type) for result in op.results]
         if any(t != -1 for t in tied):
             node.meta["iree_tied_operands"] = tied
@@ -248,27 +281,34 @@ _CONVERTERS = {
 class _SegmentHandler:
     """Keep the parsed module alive while splicing one function into FX."""
 
-    def __init__(self, module, func, kernels, device):
+    def __init__(self, module, func, kernels, device, kernel_factory):
         """Retain the function, module, shared kernels and source device."""
         self._module = module
         self._func = func
         self._kernels = kernels
         self._device = device
+        self._kernel_factory = kernel_factory
 
     def __call__(self, graph, args) -> list:
         """Append this segment's FX nodes and return its live-out values."""
         return _SegmentConverter(
-            self._func, graph, args, self._kernels, self._device
+            self._func, graph, args, self._kernels, self._device, self._kernel_factory
         ).convert()
 
 
-def flow_segment_handlers(flow_ir: str, *, device: str | None) -> dict[str, Callable]:
+def flow_segment_handlers(
+    flow_ir: str, *, device: str | None, kernel_factory=None
+) -> dict[str, Callable]:
     """Parse flow IR and return segment-name to FX-splicing callable mappings.
 
     Each handler accepts ``(graph, args)`` with live-ins in source order and
     returns live-outs in order. All handlers share kernel target identities.
     ``device`` restores the source device for flow tensor allocations; None
     leaves PyTorch's default device in effect.
+    ``kernel_factory``, when provided, accepts an executable and export name
+    and returns the callable used to execute that kernel.
+    Tied dispatches retain ``iree_tied_operands`` node metadata in both modes;
+    without a factory their targets remain inspection-only and cannot execute.
     """
     module = ir.Module.parse(flow_ir, ir.Context())
     kernels: dict[tuple[str, str], IreeKernel] = {}
@@ -279,6 +319,6 @@ def flow_segment_handlers(flow_ir: str, *, device: str | None) -> dict[str, Call
         name = ir.StringAttr(op.attributes["sym_name"]).value
         if name.endswith(ASYNC_SUFFIX):
             handlers[name.removesuffix(ASYNC_SUFFIX)] = _SegmentHandler(
-                module, op, kernels, device
+                module, op, kernels, device, kernel_factory
             )
     return handlers
