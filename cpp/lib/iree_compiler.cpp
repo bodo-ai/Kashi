@@ -165,33 +165,40 @@ const BackendConfig &getBackendConfig(const IreeCompileOptions &options,
   diagnostics.fail("configuration", "expected target cuda or vmvx");
 }
 
-Session createSession(const BackendConfig &backend,
-                      const std::optional<std::string> &architecture,
-                      Diagnostics &diagnostics) {
+Session createSession(Diagnostics &diagnostics) {
   // Keep the embedded pipeline from running IREE's JIT of constant
   // initializers on the host. This disables runtime-backed evaluation via
   // the local-task CPU driver, not ordinary IR constant folding.
-  llvm::SmallVector<const char *, 6> flags = {"--iree-plugin=kashi",
+  llvm::SmallVector<const char *, 3> flags = {"--iree-plugin=kashi",
                                               "--iree-input-type=torch",
                                               "--iree-opt-const-eval=false"};
-  flags.push_back(terminatedData(backend.deviceFlag));
-  llvm::SmallString<32> archFlag;
-  if (backend.architectureFlag && architecture) {
-    archFlag += *backend.architectureFlag;
-    archFlag += *architecture;
-    flags.push_back(archFlag.c_str());
-  } else if (!backend.architectureFlag && architecture) {
-    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
-  }
-  for (StringLiteral flag : backend.extraFlags) {
-    flags.push_back(terminatedData(flag));
-  }
   Session session(ireeCompilerSessionCreate());
   diagnostics.check(
       CompilerError(ireeCompilerSessionSetFlags(
           session.get(), static_cast<int>(flags.size()), flags.data())),
       "configuration");
   return session;
+}
+
+/// Configure the target only after native partitioning finds compilable work.
+void configureBackend(const Session &session, const BackendConfig &backend,
+                      const std::optional<std::string> &architecture,
+                      Diagnostics &diagnostics) {
+  llvm::SmallVector<const char *, 3> flags = {
+      terminatedData(backend.deviceFlag)};
+  llvm::SmallString<32> archFlag;
+  if (backend.architectureFlag && architecture) {
+    archFlag += *backend.architectureFlag;
+    archFlag += *architecture;
+    flags.push_back(archFlag.c_str());
+  }
+  for (StringLiteral flag : backend.extraFlags) {
+    flags.push_back(terminatedData(flag));
+  }
+  diagnostics.check(
+      CompilerError(ireeCompilerSessionSetFlags(
+          session.get(), static_cast<int>(flags.size()), flags.data())),
+      "configuration");
 }
 
 Source wrapSource(const Session &session, const std::string &assembly,
@@ -467,7 +474,11 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
   const fs::path dir = fs::absolute(options.artifactDir);
   Diagnostics diagnostics(dir / "iree-compile.log");
   const auto &backend = getBackendConfig(options, diagnostics);
-  const auto session = createSession(backend, options.cudaTarget, diagnostics);
+  if (!backend.architectureFlag && options.cudaTarget)
+    diagnostics.fail("configuration", "cuda_target is required only for CUDA");
+  // CPU-only IREE builds do not register CUDA flags. Parse and partition with
+  // common flags first, so driver-only graphs need no CUDA backend at all.
+  const auto session = createSession(diagnostics);
   const auto source = wrapSource(session, assembly, diagnostics);
   Invocation invocation(session, diagnostics);
   invocation.parse(source);
@@ -476,6 +487,7 @@ compile(const std::string &assembly, const IreeCompileOptions &options,
     return std::move(partition.sourceDevice);
   if (backend.architectureFlag && !options.cudaTarget)
     diagnostics.fail("configuration", "cuda_target is required only for CUDA");
+  configureBackend(session, backend, options.cudaTarget, diagnostics);
   std::error_code error;
   fs::create_directories(dir / "phases", error);
   if (error)

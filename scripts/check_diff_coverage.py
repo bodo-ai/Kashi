@@ -14,7 +14,8 @@ NATIVE = (Path("cpp/lib"), Path("cpp/include"))
 # These modules implement CUDA-only execution; CPU CI cannot exercise their
 # device paths. Keep the default gate comprehensive for runs with a GPU.
 GPU_ONLY = frozenset({PYTHON / "iree_cuda.py", PYTHON / "iree_runtime.py"})
-SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+CPP_HEADERS = {".h", ".hh", ".hpp", ".hxx"}
+SUFFIXES = {".cpp", ".cc", ".cxx"} | CPP_HEADERS
 HUNK = re.compile(rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
 

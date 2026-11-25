@@ -160,9 +160,12 @@ TEST_CASE("VMVX checkpoints produce a Flow snapshot without CUDA artifacts") {
 
 TEST_CASE("Empty CUDA partitions skip target discovery and lowering") {
   Artifacts artifacts;
+  std::optional<std::string> target;
+  SECTION("without a target") {}
+  SECTION("with an explicit target") { target = "sm_80"; }
   auto device =
       kashi::compileIree("module { func.func @main() { return } }",
-                         {artifacts.directory, IreeBackend::CUDA, {}});
+                         {artifacts.directory, IreeBackend::CUDA, target});
   REQUIRE_FALSE(device);
   REQUIRE(fs::exists(artifacts.directory / "partitioned.mlir"));
   REQUIRE(fs::exists(artifacts.directory / "driver.mlir"));
