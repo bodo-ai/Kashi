@@ -1,4 +1,4 @@
-"""Opt-in FX to IREE CUDA compilation and executable graph reconstruction."""
+"""Opt-in FX to IREE compilation and executable graph reconstruction."""
 
 import os
 import subprocess
@@ -8,8 +8,10 @@ from pathlib import Path
 
 import torch
 from iree.compiler.tools.binaries import find_tool
+from torch.utils import _pytree as pytree
 
 from kashi.importer import import_fx
+from kashi.iree_device import execution_mode, select_target
 from kashi.iree_partition import partition_at_custom_ops
 from kashi.iree_reassembly import flow_segment_handlers
 from kashi.mlir_to_fx import rebuild_fx
@@ -27,11 +29,12 @@ class IreeCompilation:
     """An IREE-reassembled FX graph and the artifacts from its compilation.
 
     ``graph`` preserves the original graph's inputs and output pytree.
-    ``execution_mode`` identifies the CUDA kernel or IREE segment executor.
-    ``artifact_dir`` contains partitioned and driver MLIR and, when there are
-    compiled segments, the VMFB module, compiler log, phase dumps and raw
-    kernel files. ``flow_ir`` and ``vmfb_path`` are None when no segments
-    require compilation. ``kernels_ptx`` is None when no PTX was emitted.
+    ``execution_mode`` identifies direct GPU launches or IREE segment calls.
+    ``target_device`` identifies the compilation family. ``artifact_dir``
+    contains partitioned and driver MLIR and, when there are compiled segments,
+    the VMFB module, compiler log, phase dumps and raw kernel files. ``flow_ir``
+    and ``vmfb_path`` are None when no segments require compilation.
+    ``kernels_ptx`` is None when no PTX was emitted.
     """
 
     graph: torch.fx.GraphModule
@@ -41,43 +44,47 @@ class IreeCompilation:
     kernels_ptx: Path | None
     vmfb_path: Path | None
     execution_mode: str
+    target_device: str
+    native_files: tuple[Path, ...]
+    hsaco_files: tuple[Path, ...]
 
 
 def _source_device(
     gm: torch.fx.GraphModule, partition_device: str | None
 ) -> str | None:
-    """Find the source tensor device so flow allocations use the original device."""
+    """Find a single source device from tensor inputs, outputs, and allocations."""
     devices = set()
-    for node in gm.graph.nodes:
-        if node.op != "placeholder":
-            continue
+    nodes = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    # Tensor-producing graphs may have no tensor inputs or explicit device
+    # constants; their captured output metadata still identifies the device.
+    for output in gm.graph.find_nodes(op="output"):
+        nodes.extend(
+            value
+            for value in pytree.tree_leaves(output.args[0])
+            if isinstance(value, torch.fx.Node)
+        )
+    for node in nodes:
         value = node.meta.get("val", node.meta.get("example_value"))
         if isinstance(value, torch.Tensor):
             devices.add(str(value.device))
     if partition_device is not None:
         devices.add(partition_device)
+    # An unindexed CUDA allocation means the current device, not necessarily
+    # device zero. Resolve it only when comparing it with indexed metadata.
+    if "cuda" in devices and any(device.startswith("cuda:") for device in devices):
+        try:
+            current = torch.cuda.current_device()
+        except Exception as error:
+            raise ValueError(
+                "Cannot resolve an unindexed CUDA source device"
+            ) from error
+        devices.remove("cuda")
+        devices.add(f"cuda:{current}")
     if len(devices) > 1:
         raise NotImplementedError(
             f"IREE reassembly requires one source tensor device, got {sorted(devices)}"
         )
     return next(iter(devices), None)
-
-
-def _cuda_target(cuda_target: str | None, source_device: str | None = None) -> str:
-    """Resolve an explicit target or the source CUDA tensor's architecture."""
-    target = cuda_target or os.environ.get("IREE_CUDA_TARGET")
-    if target:
-        return target
-    try:
-        device = torch.device(source_device) if source_device else None
-        if device is not None and device.type != "cuda":
-            device = None
-        major, minor = torch.cuda.get_device_capability(device)
-    except Exception as error:
-        raise ValueError(
-            "Set cuda_target or IREE_CUDA_TARGET when no CUDA device is available"
-        ) from error
-    return f"sm_{major}{minor}"
 
 
 def _asm(module, with_locations: bool) -> str:
@@ -147,16 +154,20 @@ def compile_iree_fx(
     *,
     output_dir: str | os.PathLike,
     cuda_target: str | None = None,
+    target_device: str | None = None,
+    rocm_target: str | None = None,
     compiler: str | os.PathLike | None = None,
     decompose_custom_ops: bool = False,
 ) -> IreeCompilation:
-    """Compile an FX graph to CUDA PTX and reconstruct an executable FX graph.
+    """Compile an FX graph with IREE and reconstruct an executable FX graph.
 
     Args:
         gm: Graph with Dynamo/FakeTensor metadata suitable for ``import_fx``.
         output_dir: Parent directory in which a unique artifact directory is created.
-        cuda_target: IREE CUDA architecture such as ``sm_80``. If omitted, use
-            ``IREE_CUDA_TARGET`` or the current CUDA device's capability.
+        cuda_target: Optional IREE CUDA architecture such as ``sm_80``.
+        target_device: Explicit ``cpu``, ``cuda``, or ``hip`` family for
+            cross-compilation; otherwise the graph's tensor device selects it.
+        rocm_target: Optional AMD target such as ``gfx942:sramecc+:xnack-``.
         compiler: Optional path to ``iree-compile``; by default use the IREE
             package's tool discovery.
         decompose_custom_ops: Rewrite supported vLLM custom ops into ATen ops
@@ -164,16 +175,19 @@ def compile_iree_fx(
             MLIR artifacts are written with locations so IREE sees them.
 
     Returns:
-        The executable graph and paths to the flow IR, VMFB and PTX artifacts.
-        ``KASHI_IREE_EXECUTION`` selects ``cuda`` (default) or ``iree``.
+        The executable graph and paths to the flow IR, VMFB and kernel artifacts.
+        ``KASHI_IREE_EXECUTION`` selects ``direct`` or ``iree``; the default is
+        ``iree`` for CPU and ``direct`` for a GPU target.
 
     Raises:
         NotImplementedError: If a segment cannot be represented or rebuilt.
         RuntimeError: If IREE compilation or its expected phase dump fails.
     """
-    mode = os.environ.get("KASHI_IREE_EXECUTION", "cuda")
-    if mode not in ("cuda", "iree"):
-        raise ValueError(f"KASHI_IREE_EXECUTION must be 'cuda' or 'iree', got {mode!r}")
+    requested_mode = os.environ.get("KASHI_IREE_EXECUTION")
+    if requested_mode not in (None, "direct", "iree"):
+        raise ValueError(
+            f"KASHI_IREE_EXECUTION must be 'direct' or 'iree', got {requested_mode!r}"
+        )
     imported = import_fx(gm, decompose_custom_ops=decompose_custom_ops)
     if not imported.module.operation.verify():
         raise RuntimeError(
@@ -190,6 +204,16 @@ def compile_iree_fx(
             f"Cannot build IREE driver; unsupported segment live-outs: {unsupported}"
         )
 
+    device = _source_device(gm, partition.device)
+    target = select_target(
+        device,
+        target_device=target_device,
+        cuda_target=cuda_target,
+        rocm_target=rocm_target,
+    )
+    # Validate selection before the no-segment shortcut: CPU direct is never valid.
+    mode = execution_mode(target)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = Path(tempfile.mkdtemp(prefix="kashi-iree-", dir=output_dir))
@@ -203,10 +227,9 @@ def compile_iree_fx(
         # compiled work. Execute its driver directly instead of feeding IREE
         # an empty module, which cannot produce a VMFB.
         graph = rebuild_fx(partition.driver, imported.out_spec, segment_handlers={})
-        return IreeCompilation(graph, artifact_dir, None, (), None, None, mode)
-
-    device = _source_device(gm, partition.device)
-    target = _cuda_target(cuda_target, device)
+        return IreeCompilation(
+            graph, artifact_dir, None, (), None, None, mode, target.family, (), ()
+        )
     compiler_path = (
         os.fspath(compiler) if compiler is not None else find_tool("iree-compile")
     )
@@ -216,8 +239,7 @@ def compile_iree_fx(
     command = [
         compiler_path,
         str(partitioned),
-        "--iree-hal-target-device=cuda",
-        f"--iree-cuda-target={target}",
+        *target.compiler_flags(),
         "--iree-hal-link-executables=false",
         f"--iree-hal-dump-executable-files-to={kernels_dir}",
         f"--dump-compilation-phases-to={phases_dir}",
@@ -251,6 +273,8 @@ def compile_iree_fx(
         )
     flow_ir = flow_files[0]
     ptx_files = tuple(sorted(kernels_dir.glob("*.ptx")))
+    native_files = tuple(sorted((*kernels_dir.glob("*.o"), *kernels_dir.glob("*.so"))))
+    hsaco_files = tuple(sorted(kernels_dir.glob("*.hsaco")))
     kernels_ptx = None
     if ptx_files:
         kernels_ptx = artifact_dir / "kernels.ptx"
@@ -258,26 +282,46 @@ def compile_iree_fx(
             "\n".join(f"// {path.name}\n{path.read_text()}" for path in ptx_files)
         )
 
-    if mode == "cuda":
-        from kashi.iree_cuda import create_cuda_kernel
+    if mode == "direct":
+        if target.family == "cuda":
+            from kashi.iree_cuda import create_cuda_kernel as create_kernel
+        else:
+            from kashi.iree_hip import create_hip_kernel as create_kernel
 
         def kernel_factory(executable, export):
-            """Bind a flow dispatch to its CUDA executable and launch metadata."""
-            return create_cuda_kernel(executable, export, artifact_dir=artifact_dir)
+            """Bind a flow dispatch to its device-specific executable metadata."""
+            return create_kernel(executable, export, artifact_dir=artifact_dir)
 
         handlers = flow_segment_handlers(
             flow_ir.read_text(), device=device, kernel_factory=kernel_factory
         )
         handlers = _preserve_segment_results(handlers, partition.segments)
     else:
-        from kashi.iree_runtime import runtime_segment_handlers
+        # A CPU cross-compilation accepts GPU fake metadata, but its runtime
+        # must validate actual arguments as CPU tensors when invoked.
+        partition.device = "cpu" if target.family == "cpu" else device
+        if target.family == "cpu":
+            from kashi.iree_cpu_runtime import runtime_segment_handlers
 
-        # Segments with no tensor live-ins still need the source device.
-        partition.device = device
-        handlers = runtime_segment_handlers(vmfb_path, partition)
+            handlers = runtime_segment_handlers(vmfb_path, partition)
+        else:
+            from kashi.iree_runtime import runtime_segment_handlers
+
+            handlers = runtime_segment_handlers(
+                vmfb_path, partition, target_device=target.family
+            )
     graph = rebuild_fx(partition.driver, imported.out_spec, segment_handlers=handlers)
     return IreeCompilation(
-        graph, artifact_dir, flow_ir, ptx_files, kernels_ptx, vmfb_path, mode
+        graph,
+        artifact_dir,
+        flow_ir,
+        ptx_files,
+        kernels_ptx,
+        vmfb_path,
+        mode,
+        target.family,
+        native_files,
+        hsaco_files,
     )
 
 
@@ -297,9 +341,10 @@ class _IreeBackendCallable:
 def compile_iree_backend(gm: torch.fx.GraphModule, example_inputs):
     """Compile an FX graph for ``torch.compile`` or a vLLM backend setting.
 
-    ``KASHI_IREE_EXECUTION`` selects direct CUDA kernels by default or ``iree``
-    for VMFB segment calls. Artifacts remain available for the lifetime of the
-    returned callable and are removed when that callable is released.
+    ``KASHI_IREE_EXECUTION`` selects direct GPU kernels or IREE VMFB calls;
+    CPU defaults to ``iree`` and GPU targets default to ``direct``. Artifacts
+    remain available for the lifetime of the returned callable and are removed
+    when that callable is released.
     ``example_inputs`` is provided by Dynamo; input metadata is read from ``gm``.
     """
     workspace = tempfile.TemporaryDirectory(prefix="kashi-iree-backend-")

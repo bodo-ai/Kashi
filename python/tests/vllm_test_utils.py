@@ -148,7 +148,13 @@ def generate(
         cleanup_dist_env_and_memory()
 
 
-def generate_qwen(model_dir, compilation_config, *, record_generation=False):
+def generate_qwen(
+    model_dir,
+    compilation_config,
+    *,
+    record_generation=False,
+    gpu_memory_utilization=0.1,
+):
     """Run the offline Qwen3 configuration with fixed seeds and engine options."""
     return generate(
         model_dir,
@@ -158,6 +164,9 @@ def generate_qwen(model_dir, compilation_config, *, record_generation=False):
         weight_scale=0.15,
         norm_scale=0.1,
         engine_options={
+            # The small model has an explicit 64 MiB KV cache and should not
+            # require most of a shared GPU to be free merely to start vLLM.
+            "gpu_memory_utilization": gpu_memory_utilization,
             "max_model_len": 64,
             "max_num_batched_tokens": 64,
             "max_num_seqs": 2,

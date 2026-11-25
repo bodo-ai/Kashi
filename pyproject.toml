@@ -58,6 +58,8 @@ kashi = { path = ".", editable = true }
 iree-base-compiler = "==3.14.0"
 iree-base-runtime = "==3.14.0"
 tabulate = "*"
+msgpack = ">=1.0"
+pyelftools = ">=0.31"
 
 [tool.pixi.tasks]
 test-python = "python -m pytest"
@@ -93,6 +95,15 @@ llvm-tools = "21.*"
 [tool.pixi.feature.cpp-coverage.tasks]
 coverage-cpp = "python scripts/test_cpp.py --coverage"
 
+[tool.pixi.feature.cpu-test]
+platforms = ["linux-64-cpu", "osx-arm64-cpu"]
+
+[tool.pixi.feature.cuda-test]
+platforms = ["linux-64-cuda"]
+
+[tool.pixi.feature.rocm-test]
+platforms = ["linux-64-rocm"]
+
 [tool.pixi.pypi-options]
 extra-index-urls = ["https://wheels.vllm.ai/rocm/0.33.0/rocm100"]
 
@@ -105,6 +116,11 @@ vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc
 
 [tool.pixi.target.linux-64-cpu.activation.env]
 TRITON_DEFAULT_BACKEND = "cpu"
+# vLLM's native extension needs libnuma even on minimal Linux installations.
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+[tool.pixi.target.linux-64-cpu.dependencies]
+libnuma = ">=2.0.16"
 
 [tool.pixi.target.linux-64-cpu.pypi-dependencies]
 torch = { version = "==2.14.0+cpu", index = "https://download.pytorch.org/whl/cpu" }
@@ -119,12 +135,25 @@ torchaudio = { version = "==2.11.0+cu130", index = "https://download.pytorch.org
 triton = { version = "==3.8.0", index = "https://pypi.org/simple" }
 vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.33.0rc3/vllm-0.33.0-cp38-abi3-manylinux_2_28_x86_64.whl" }
 
+[tool.pixi.target.linux-64-rocm.activation.env]
+# ROCm's PyTorch wheel also needs the environment's GNU OpenMP runtime.
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+[tool.pixi.target.linux-64-rocm.dependencies]
+libnuma = ">=2.0.16"
+
 [tool.pixi.target.linux-64-rocm.pypi-dependencies]
 torch = { version = "==2.13.0+rocm10.0.0", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
 torchvision = { version = "==0.28.0+rocm10.0.0", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
 torchaudio = { version = "==2.11.0+rocm10.0.0", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
 triton = { version = "==3.8.0+git669b31ac", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
 vllm = { version = "==0.33.0+rocm100", index = "https://wheels.vllm.ai/rocm/0.33.0/rocm100" }
+# The vLLM ROCm index omits RDNA2 kernel packs even though matching AMD wheels exist.
+amd-torch-device-gfx1030 = { url = "https://stable.repo.amd.com/rocm/pytorch/whl-next/amd-torch-device-gfx1030/amd_torch_device_gfx1030-2.13.0%2Brocm10.0.0-cp312-cp312-linux_x86_64.whl" }
+rocm-sdk-device-gfx1030 = { url = "https://stable.repo.amd.com/rocm/core/whl-next/rocm-sdk-device-gfx1030/rocm_sdk_device_gfx1030-10.0.0-py3-none-linux_x86_64.whl" }
 
 [tool.pixi.environments]
 cpp-coverage = ["cpp-coverage"]
+cpu-test = ["cpu-test"]
+cuda-test = ["cuda-test"]
+rocm-test = ["rocm-test"]

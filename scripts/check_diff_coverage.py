@@ -11,9 +11,15 @@ from xml.etree import ElementTree
 REPORTS = Path("build/coverage")
 PYTHON = Path("python/src/kashi")
 NATIVE = (Path("cpp/lib"), Path("cpp/include"))
-# These modules implement CUDA-only execution; CPU CI cannot exercise their
+# These modules implement GPU-only execution; CPU CI cannot exercise their
 # device paths. Keep the default gate comprehensive for runs with a GPU.
-GPU_ONLY = frozenset({PYTHON / "iree_cuda.py", PYTHON / "iree_runtime.py"})
+GPU_ONLY = frozenset(
+    {
+        PYTHON / "iree_cuda.py",
+        PYTHON / "iree_hip.py",
+        PYTHON / "iree_runtime.py",
+    }
+)
 SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 HUNK = re.compile(rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
@@ -61,7 +67,7 @@ def main():
     parser.add_argument(
         "--exclude-gpu",
         action="store_true",
-        help="exclude CUDA executor modules when coverage was collected on CPU-only CI",
+        help="exclude GPU executor modules when coverage was collected on CPU-only CI",
     )
     args = parser.parse_args()
     base = args.base
@@ -108,7 +114,7 @@ def main():
         if not any(count for _, count in hunks):
             continue
         if args.exclude_gpu and path in GPU_ONLY:
-            print(f"- `{path}`: excluded from CPU-only coverage gate (CUDA execution)")
+            print(f"- `{path}`: excluded from CPU-only coverage gate (GPU execution)")
             continue
         if reader not in reports:
             try:

@@ -100,7 +100,7 @@ def test_compile_iree_fx_reassembles_real_ptx_and_custom_boundary(tmp_path):
     assert isinstance(output, dict) and isinstance(output["result"], tuple)
 
 
-@pytest.mark.parametrize("mode", ["cuda", "iree"])
+@pytest.mark.parametrize("mode", ["direct", "iree"])
 def test_alias_only_graph_executes_without_iree_segments(tmp_path, monkeypatch, mode):
     """A graph containing only alias-sensitive operations needs no VMFB."""
     from kashi.iree_backend import compile_iree_fx
@@ -121,7 +121,7 @@ def test_backend_executes_alias_only_graph_and_retains_artifacts(monkeypatch):
 
     from kashi.iree_backend import compile_iree_backend
 
-    monkeypatch.setenv("KASHI_IREE_EXECUTION", "cuda")
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", "iree")
     compiled = compile_iree_backend(_alias_only_graph(), ())
     artifact_dir = compiled.compilation.artifact_dir
     source = torch.arange(4.0)

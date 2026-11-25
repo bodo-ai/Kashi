@@ -12,7 +12,7 @@ Complete the IREE compilation loop: the FX graph reconstructed from a compiled m
 ### Goals
 
 - Turn the existing inspection-only IREE graph into an executable graph without replacing its compiled computations with eager PyTorch or silently falling back to the original graph.
-- Provide two explicitly selectable execution modes: `cuda` for direct CUDA launches and `iree` for IREE runtime execution. Default to `cuda`; reject unknown modes.
+- Provide two explicitly selectable execution modes: `direct` for direct CUDA launches and `iree` for IREE runtime execution. Default to `direct` for CUDA; reject unknown modes. CPU and AMD mode selection is specified in [IREE Kernel Execution on CPU and AMD GPUs](iree-cpu-rocm-execution.md).
 - Preserve the graph's argument order, output structure, data dependencies, and execution order around existing PyTorch custom-operator boundaries.
 - Run both modes on CUDA tensors and compare their results with the corresponding uncompiled PyTorch computation. Keep the existing executable PyTorch-only backend separate and unchanged.
 - Expose a standard `torch.compile` backend and a vLLM-loadable backend entry point that use the selected IREE execution mode.
@@ -21,7 +21,7 @@ Complete the IREE compilation loop: the FX graph reconstructed from a compiled m
 
 ### Non-goals
 
-- Forking or vendoring IREE; support other accelerator backends, CPU execution of compiled segments, or training/backward compilation.
+- Forking or vendoring IREE, additional accelerator backends beyond NVIDIA and AMD, or training/backward compilation. CPU and AMD execution are specified in [IREE Kernel Execution on CPU and AMD GPUs](iree-cpu-rocm-execution.md).
 - Guaranteeing support for every IREE ABI, operation, tensor layout, or dtype. Reject an unsupported case rather than guessing how to execute it.
 - Changing the semantics of the separate FX → MLIR → FX PyTorch backend.
 
@@ -45,7 +45,7 @@ compile_iree_fx(
 ) -> IreeCompilation
 ```
 
-The returned `IreeCompilation.graph` must be a callable `torch.fx.GraphModule`, not an inspection-only placeholder. It retains the output pytree of the input graph. `KASHI_IREE_EXECUTION` selects the mode at compilation time: `cuda` by default, or `iree`. The result records the chosen mode and paths to the unique compilation directory, flow IR, VMFB, individual PTX files, and optional combined PTX listing.
+The returned `IreeCompilation.graph` must be a callable `torch.fx.GraphModule`, not an inspection-only placeholder. It retains the output pytree of the input graph. `KASHI_IREE_EXECUTION` selects the mode at compilation time: `direct` by default for CUDA, or `iree`. The result records the chosen mode and paths to the unique compilation directory, flow IR, VMFB, individual PTX files, and optional combined PTX listing. The CPU/AMD extension defines additional target options and mode defaults.
 
 Continue to import and verify the graph, partition it into compiled segments and a PyTorch driver, and compile segments with IREE's CUDA target. Retain the flow, stream, and executable-target phase dumps needed to identify dispatches and their launch ABI. Emit a VMFB as well as the existing PTX artifacts. An explicit CUDA target takes priority over `IREE_CUDA_TARGET`; otherwise use the captured CUDA tensor's device capability. An explicit compiler path overrides tool discovery.
 

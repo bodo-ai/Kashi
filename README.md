@@ -81,60 +81,107 @@ The importer supports dtype-only `Tensor.to(dtype)` conversions, including the
 casts captured in CPU Qwen3 graphs; device and tensor overloads are not supported.
 CPU RMS normalization and gated-activation operations are also normalized to ATen.
 
-## Experimental IREE CUDA execution
+## Experimental IREE execution
 
 `kashi.iree_backend.compile_iree_backend` is a `torch.compile` backend that
 partitions an FX graph, compiles ordinary segments with IREE, and executes the
-reconstructed graph on CUDA. Custom operations and alias-sensitive PyTorch
-operations remain in the driver graph. The existing `kashi.backend.compile_fx`
-continues to provide the direct FX-to-MLIR-to-FX round trip.
+reconstructed graph on CPU, NVIDIA CUDA, or AMD HIP. Custom operations and
+alias-sensitive PyTorch operations remain in the driver graph. The existing
+`kashi.backend.compile_fx` continues to provide the FX-to-MLIR-to-FX round trip.
 
-Set `KASHI_IREE_EXECUTION` before compilation to select the execution mode:
+Set `KASHI_IREE_EXECUTION` before compilation:
 
-- `cuda` (default): launch individual IREE-generated PTX kernels on PyTorch's
-  current CUDA stream. Inputs to a kernel must be contiguous and satisfy the
-  generated binding alignment.
-- `iree`: execute each compiled segment through the IREE VM runtime. This mode
-  synchronizes the calling stream and copies fresh results device-to-device
-  into PyTorch-owned buffers. It does not support CUDA graph capture; for vLLM,
-  set `cudagraph_mode=CUDAGraphMode.NONE`.
+- `direct`: launch generated GPU kernels on PyTorch's current stream. This is
+  the default for CUDA and HIP. CPU does not support direct calls.
+- `iree`: execute compiled segments through the IREE VM runtime. This is the
+  default for CPU and an alternative for either GPU family. GPU runtime calls
+  synchronize with PyTorch and return PyTorch-owned device buffers. For vLLM,
+  use `cudagraph_mode=CUDAGraphMode.NONE`.
+
+The former `cuda` mode name is no longer accepted; change it to `direct`.
+Unknown modes, unsupported operations, incompatible devices, and compiler or
+runtime failures raise errors. No mode falls back to another execution path.
 
 ```python
 import torch
 from kashi.iree_backend import compile_iree_backend
 
 model = torch.compile(lambda x: torch.ops.aten.relu.default(x), backend=compile_iree_backend)
-result = model(torch.randn(8, device="cuda"))
+result = model(torch.randn(8, device="cpu"))
 ```
 
 For vLLM, use `backend="kashi.iree_backend.compile_iree_backend"` with
-`CompilationMode.DYNAMO_TRACE_ONCE`. The backend keeps temporary compiler
-artifacts for the lifetime of the compiled callable. To inspect persistent
-artifacts and the reconstructed graph, call `compile_iree_fx(gm, output_dir=...)`
-directly. `IREE_CUDA_TARGET` can override automatic CUDA architecture selection.
-Unknown execution modes, unsupported operations, and compiler failures raise
-errors; neither mode silently falls back to the ordinary backend.
+`CompilationMode.DYNAMO_TRACE_ONCE`. The returned callable retains its temporary
+compiler artifacts. To retain artifacts explicitly, call
+`compile_iree_fx(gm, output_dir=...)`: the result contains the target family,
+execution mode, VMFB, flow IR and kernel artifact paths. CPU uses host-specific
+LLVM-CPU objects and embedded-ELF libraries, not PTX; CUDA emits PTX; HIP emits
+HSACO. The artifact directory also contains partition/driver IR, compiler logs,
+and IREE phase dumps. Host-specialized CPU artifacts are not portable across
+arbitrary processors.
 
-The CUDA/PTX compilation test is skipped on macOS, and GPU execution tests run
-only when CUDA is available. Platform-independent IREE tests still run there.
+The graph's tensor device selects the target, independent of other GPUs in the
+machine. PyTorch represents both GPU families as `cuda` devices; its build
+distinguishes NVIDIA from ROCm. `target_device="cpu"|"cuda"|"hip"` explicitly
+selects a family for cross-compilation. `cuda_target="sm_80"` or
+`IREE_CUDA_TARGET=sm_80` sets a CUDA architecture; `rocm_target="gfx942"`
+selects an AMD architecture without a GPU. ROCm target features reported by
+PyTorch, such as `gfx942:sramecc+:xnack-`, are passed to IREE separately.
+Explicit architecture arguments conflicting with the selected family are errors.
+Executing cross-compiled GPU artifacts still requires a matching GPU and driver.
 
-To check Qwen3 inference against uncompiled vLLM on a CUDA GPU, run:
+### IREE tests
+
+The ordinary Python suite always runs a seeded, offline one-layer Qwen3 case
+on CPU through the local IREE runtime, including on GPU-equipped machines. On
+a CUDA or ROCm PyTorch/vLLM wheel, install the separate locked CPU environment
+first; the test runs it in a subprocess with `VLLM_TARGET_DEVICE=cpu`:
 
 ```sh
-pixi run --locked test-python -v python/tests/test_iree_qwen3_integration.py
+pixi install --locked -e cpu-test
+pixi run --locked test-python
 ```
 
-The two cases exercise direct CUDA launches (`cuda`) and IREE VMFB execution
-(`iree`). They use the same seeded, offline, one-layer dummy Qwen3 model and
-prompts as the uncompiled reference, and check that IREE executes during each
-compiled graph call, including request prefill and decode. The assertions in
-`python/tests/test_iree_qwen3_integration.py` and `assert_outputs_match` in
-`python/tests/vllm_test_utils.py` compare generated token IDs exactly and the
-selected-token log-probabilities with `rtol=1e-4`, `atol=1e-5`. Pytest reports
-pass or failure; it does not print the compared values. This is coverage for
-that test model and those inputs, not a proof for every model or checkpoint.
-Without CUDA the cases are skipped. To test individual operations and mutation
-semantics against eager PyTorch, run:
+GPU tests require the matching NVIDIA/CUDA or AMD/ROCm PyTorch build, device,
+and driver. The `cuda-test` and `rocm-test` environments support hosts with
+both vendors; install each detected vendor's environment before running the
+suite. vLLM test processes explicitly select the appropriate platform on a
+mixed-vendor host. Missing software for a detected GPU is a test failure.
+
+On WSL, GPU detection queries Windows through PowerShell because GPU PCI devices
+are not exposed in Linux sysfs. Windows interop must be available to the test
+process. AMD GPU execution additionally requires a compatible Windows driver
+and ROCm WSL bridge; check AMD's [WSL compatibility matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/wsl/wsl_compatibility.html).
+The pinned IREE 3.14 compiler rejects `gfx1030` (for example, an RX 6800 XT) as
+an unknown HIP target, even if PyTorch detects the GPU. It is not substituted
+with a different architecture. Linux CPU and ROCm Pixi environments provide
+their own NUMA/OpenMP libraries for minimal installations.
+
+```sh
+pixi install --locked -e cuda-test  # NVIDIA, when needed
+pixi install --locked -e rocm-test  # AMD, when needed
+pixi run --locked -e cuda-test test-python -v python/tests/test_iree_qwen3_integration.py
+pixi run --locked -e rocm-test test-python -v python/tests/test_iree_qwen3_integration.py
+```
+
+The Qwen parity tests exercise real compiled prefill and decode, compare token
+IDs exactly, and compare selected-token log-probabilities with `rtol=1e-4` and
+`atol=1e-5`. GPU tests run both `direct` and `iree` modes. Offline HIP
+compilation and HSACO metadata tests can run without an AMD GPU, but do not
+verify AMD execution. By default, the CPU tests use Triton's interpreter for
+vLLM's greedy sampler; the compiled IREE CPU kernels still execute native code.
+
+The full-size Qwen3-0.6B architecture is a separate, resource-intensive test;
+it uses deterministic dummy weights, not a pretrained checkpoint or tokenizer:
+
+```sh
+VLLM_TARGET_DEVICE=cpu TRITON_INTERPRET=1 pixi run --locked -e cpu-test \
+  python -m pytest -q python/tests/qwen3_0_6b.py
+# Alternatively use -e cuda-test or -e rocm-test with a matching GPU, and set
+# KASHI_IREE_EXECUTION=direct or iree before running the same pytest command.
+```
+
+To test individual GPU operations, stream behavior, and mutation semantics:
 
 ```sh
 pixi run --locked test-python -v python/tests/test_iree_execution.py

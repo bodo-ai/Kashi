@@ -42,7 +42,8 @@ def test_vllm_matches_uncompiled_vllm(simple_vllm_model_dir):
         "weight_scale": WEIGHT_SCALE,
         "engine_options": {
             "max_model_len": 128,
-            "gpu_memory_utilization": 0.5,
+            # The fixed 64 MiB KV cache does not require half of a shared GPU.
+            "gpu_memory_utilization": 0.1,
             "seed": 0,
         },
         "sampling_options": {"max_tokens": 4, "temperature": 0, "logprobs": 5},
