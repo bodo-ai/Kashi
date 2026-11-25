@@ -102,6 +102,9 @@ bool isExplicitBoundary(StringRef name) {
          // which the compiled segment ABI can represent faithfully.
          name == "torch.aten._to_copy" ||
          name.starts_with("torch.aten._to_copy.") ||
+         // Custom kernels may only partially write an output buffer. Keep
+         // zero initialization and the subsequent mutation on the same storage.
+         name == "torch.aten.zeros" || name.starts_with("torch.aten.zeros.") ||
          name == "torch.aten.empty" || name.starts_with("torch.aten.empty.") ||
          name.starts_with("torch.aten.empty_") ||
          name == "torch.aten.new_empty" ||

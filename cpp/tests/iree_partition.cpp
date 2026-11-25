@@ -91,6 +91,44 @@ module {
 }
 
 TEST_CASE_METHOD(PartitionFixture,
+                 "Zero allocation stays in the driver across mutation",
+                 "[partition]") {
+  // GDN writes only part of its output, so the unmodified elements must stay
+  // zero and the custom op must receive the original PyTorch allocation.
+  auto source = parse(R"mlir(
+module {
+  func.func @main() -> !torch.vtensor<[4],f32> {
+    %four = torch.constant.int 4
+    %dtype = torch.constant.int 6
+    %none = torch.constant.none
+    %cuda = torch.constant.device "cuda:2"
+    %shape = torch.prim.ListConstruct %four : (!torch.int) -> !torch.list<int>
+    %buffer = torch.aten.zeros %shape, %dtype, %none, %cuda, %none : !torch.list<int>, !torch.int, !torch.none, !torch.Device, !torch.none -> !torch.vtensor<[4],f32>
+    torch.operator "torch.test.mutate"(%buffer) : (!torch.vtensor<[4],f32>) -> ()
+    return %buffer : !torch.vtensor<[4],f32>
+  }
+}
+)mlir");
+  auto result = partition(*source);
+  CHECK(result.segments->getBody()->empty());
+  auto main = result.driver->lookupSymbol<func::FuncOp>("main");
+  REQUIRE(main);
+  Operation *allocation = nullptr;
+  Operation *mutation = nullptr;
+  for (Operation &op : main.getBody().front()) {
+    if (op.getName().getStringRef() == "torch.aten.zeros")
+      allocation = &op;
+    else if (op.getName().getStringRef() == "torch.operator")
+      mutation = &op;
+  }
+  REQUIRE(allocation);
+  REQUIRE(mutation);
+  CHECK(mutation->getOperand(0) == allocation->getResult(0));
+  CHECK(main.getBody().front().back().getOperand(0) ==
+        allocation->getResult(0));
+}
+
+TEST_CASE_METHOD(PartitionFixture,
                  "Partition preserves a non-CUDA device clone", "[partition]") {
   auto source = parse(R"mlir(
 module {
