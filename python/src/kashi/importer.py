@@ -7,7 +7,36 @@ import torch
 from iree.compiler import ir
 from iree.compiler.extras.fx_importer import ContextCache, FxImporter, IrType
 from torch._library.fake_class_registry import FakeScriptObject
+from torch._library.opaque_object import get_opaque_type_name, register_opaque_type
+from torch._opaque_base import OpaqueBase
 from torch.utils import _pytree as pytree
+
+from kashi import decompose
+
+# vLLM's attention writes its result into ``output`` and returns nothing, which
+# value-semantic MLIR cannot express. ``import_fx`` replaces it with the
+# functional ``kashi::unified_attention``, which returns the result, and
+# ``rebuild_fx`` expands that back into the vLLM op writing a fresh buffer.
+_VLLM_ATTENTION = "vllm::unified_attention_with_output"
+_LIB = torch.library.Library("kashi", "FRAGMENT")
+
+
+class _LayerName(OpaqueBase):
+    """Names vLLM's opaque ``layer_name`` type in the schema below. Schemas
+    report every opaque type as ``PyObject``, which cannot be parsed back."""
+
+
+register_opaque_type(_LayerName, typ="reference")
+_LIB.define(
+    "unified_attention(Tensor query, Tensor key, Tensor value, "
+    f"{get_opaque_type_name(_LayerName)} layer_name, "
+    "Tensor? kv_cache_dummy_dep=None) -> Tensor"
+)
+
+
+@torch.library.register_fake("kashi::unified_attention", lib=_LIB)
+def _(query, key, value, layer_name, kv_cache_dummy_dep=None):
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
 
 
 @dataclass(frozen=True)
@@ -19,12 +48,17 @@ class ImportedModule:
     out_spec: pytree.TreeSpec
 
 
-def import_fx(gm: torch.fx.GraphModule) -> ImportedModule:
+def import_fx(
+    gm: torch.fx.GraphModule, *, decompose_custom_ops: bool = False
+) -> ImportedModule:
     """Import ``gm`` as a Torch-dialect MLIR module.
 
     The input graph is not modified; normalization runs on a structural copy.
+    With ``decompose_custom_ops``, supported vLLM custom ops are rewritten into
+    ATen ops whose MLIR locations name the call they came from (see
+    :mod:`kashi.decompose`).
     """
-    normalized = _normalize(gm)
+    normalized = _normalize(gm, decompose_custom_ops=decompose_custom_ops)
     (output,) = normalized.graph.find_nodes(op="output")
     # FxImporter represents FX graph outputs as a sequence of MLIR function results.
     # For example: x, (x,), and [x] all lower to the same `return %x` in MLIR.
@@ -56,6 +90,18 @@ class _OpaqueContextCache(ContextCache):
                 return IrType.parse("!torch.list<int>", self._c)
         return super().value_info_to_type(val, tensor_meta=tensor_meta, mutable=mutable)
 
+    def get_node_location(self, node):
+        """Wrap a decomposed op's location in a NameLoc naming its origin call."""
+        location = super().get_node_location(node)
+        tag = node.meta.get(decompose.DECOMPOSED_FROM_KEY)
+        if tag is None:
+            return location
+        return ir.Location.name(
+            f"kashi.decomposed:{tag}",
+            childLoc=location or ir.Location.unknown(self._c),
+            context=self._c,
+        )
+
 
 def _use_opaque_types(importer: FxImporter) -> None:
     """Adapter: install the opaque-aware cache on this importer only. Uses
@@ -65,7 +111,9 @@ def _use_opaque_types(importer: FxImporter) -> None:
     )
 
 
-def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def _normalize(
+    gm: torch.fx.GraphModule, *, decompose_custom_ops: bool = False
+) -> torch.fx.GraphModule:
     """Normalize a raw Dynamo FX graph into a form supported by FxImporter.
 
     FxImporter expects a functionalized graph consisting of ATen operators. Such graphs
@@ -85,9 +133,22 @@ def _normalize(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         _normalize_meta(node)
         if node.op in ("call_function", "call_method"):
             _rewrite(graph, node)
+    if decompose_custom_ops:
+        decompose.decompose_custom_ops(graph)
 
+    graph.eliminate_dead_code(is_impure_node=_is_impure)
     graph.lint()
     return torch.fx.GraphModule(gm, graph)
+
+
+def _is_impure(node: torch.fx.Node) -> bool:
+    """Keep every non-ATen operator during dead-code elimination: custom ops can
+    have side effects their schemas do not declare, e.g. vLLM's KV-cache update
+    and the attention that consumes its dependency."""
+    target = node.target
+    if isinstance(target, torch._ops.OpOverload) and target.namespace != "aten":
+        return True
+    return node.is_impure()
 
 
 def _expand_split_outputs(graph: torch.fx.Graph) -> None:
@@ -163,8 +224,10 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
     if node.op == "call_function":
         if isinstance(target, torch._ops.OpOverloadPacket):
             _resolve_packet(node)
-            return
+            target = node.target
         if isinstance(target, torch._ops.OpOverload):
+            if target._schema.name == _VLLM_ATTENTION:
+                _functionalize_attention(graph, node)
             return
         if target is operator.getitem:
             source, index = node.args
@@ -356,6 +419,73 @@ def _resolve_packet(node: torch.fx.Node) -> None:
             f"{node.format_node()}"
         )
     node.target = getattr(packet, overloads[0])
+
+
+def _functionalize_attention(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
+    """Replace vLLM's ``unified_attention_with_output`` call with equivalent
+    functional version ``kashi.unified_attention`` (a dummy without implementation).
+
+    Only safe when nothing else can observe the write: ``output`` must be a
+    contiguous, query-shaped view of a fresh ``empty`` that nothing reads
+    after the call through another alias.
+    """
+
+    def reject(reason):
+        raise NotImplementedError(
+            f"Cannot functionalize attention, {reason}: {node.format_node()}"
+        )
+
+    # Check output shape and other properties to match pattern
+    bound = torch.fx.operator_schemas.normalize_function(
+        node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
+    ).kwargs
+    output, query = bound["output"], bound["query"]
+    if bound["output_scale"] is not None or bound["output_block_scale"] is not None:
+        reject("output_scale and output_block_scale are unsupported")
+    out, q = output.meta["val"], query.meta["val"]
+    if not out.is_contiguous():
+        reject("output is not contiguous")
+    if (out.shape, out.dtype) != (q.shape, q.dtype):
+        reject("output and query differ in shape or dtype")
+    base = output
+    while base.target is torch.ops.aten.view.default:
+        base = base.args[0]
+    if base.target is not torch.ops.aten.empty.memory_format:
+        reject(f"output is not a fresh buffer (it comes from {base.name})")
+
+    node_order = {n: i for i, n in enumerate(graph.nodes)}
+    for alias in _derived_before(base, node, node_order) - {output}:
+        if any(node_order[user] > node_order[node] for user in alias.users):
+            reject(f"{alias.name} aliases output and is used after the call")
+
+    output_users = [
+        user for user in output.users if node_order[user] > node_order[node]
+    ]
+    with graph.inserting_before(node):
+        result = graph.call_function(
+            torch.ops.kashi.unified_attention.default,
+            (query, bound["key"], bound["value"], bound["layer_name"]),
+            {"kv_cache_dummy_dep": bound["kv_cache_dummy_dep"]},
+        )
+    result.meta = dict(output.meta)
+    for user in output_users:
+        user.replace_input_with(output, result)
+    graph.erase_node(node)
+
+
+def _derived_before(base: torch.fx.Node, call: torch.fx.Node, node_order) -> set:
+    """``base`` and every node computed from it before ``call``."""
+    found, stack = {base}, [base]
+    while stack:
+        for user in stack.pop().users:
+            if (
+                user is not call
+                and node_order[user] < node_order[call]
+                and user not in found
+            ):
+                found.add(user)
+                stack.append(user)
+    return found
 
 
 def _is_shape_list_node(value) -> bool:

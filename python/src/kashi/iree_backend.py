@@ -91,6 +91,7 @@ def compile_iree_fx(
     *,
     output_dir: str | os.PathLike,
     cuda_target: str | None = None,
+    decompose_custom_ops: bool = False,
 ) -> IreeCompilation:
     """Compile an FX graph to CUDA PTX and reconstruct its opaque-kernel FX graph.
 
@@ -99,6 +100,9 @@ def compile_iree_fx(
         output_dir: Parent directory in which a unique artifact directory is created.
         cuda_target: IREE CUDA architecture such as ``sm_80``. If omitted, use
             ``IREE_CUDA_TARGET`` or the current CUDA device's capability.
+        decompose_custom_ops: Rewrite supported vLLM custom ops into ATen ops
+            before import. Their MLIR locations name the original call, and the
+            MLIR artifacts are written with locations so IREE sees them.
 
     Returns:
         The reassembled graph and paths to the flow IR and PTX artifacts. Kernel
@@ -108,7 +112,7 @@ def compile_iree_fx(
         NotImplementedError: If a segment cannot be represented or rebuilt.
         RuntimeError: If IREE compilation or its expected phase dump fails.
     """
-    imported = import_fx(gm)
+    imported = import_fx(gm, decompose_custom_ops=decompose_custom_ops)
     if not imported.module.operation.verify():
         raise RuntimeError(
             f"Verification failed for imported module:\n{imported.module}"

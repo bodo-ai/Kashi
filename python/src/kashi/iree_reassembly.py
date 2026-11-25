@@ -186,7 +186,10 @@ class _SegmentConverter:
         Operand segments are workload, arguments, argument dimensions, and
         result dimensions. Only arguments are kernel inputs; workload and
         result types remain attached to the call as launch/result metadata.
-        Tied outputs imply mutation and cannot be modeled by this pure call.
+        Tied outputs (results written in place into an argument, e.g. IREE's
+        concatenation copies) are modeled as the call's own results; the tie is
+        kept as ``iree_tied_operands`` metadata, since these opaque kernels
+        cannot execute and so cannot observe the in-place write yet.
         """
         num_workload, num_args = list(
             ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"])
@@ -195,10 +198,6 @@ class _SegmentConverter:
             ir.IntegerAttr(a).value
             for a in ir.ArrayAttr(op.attributes["tied_operands"])
         ]
-        if any(t != -1 for t in tied):
-            raise NotImplementedError(
-                f"flow.dispatch with tied operands in {self.name}"
-            )
         entries = ir.ArrayAttr(op.attributes["entry_points"])
         if len(entries) != 1:
             raise NotImplementedError(
@@ -219,6 +218,8 @@ class _SegmentConverter:
             self.kernels[key], tuple(args), {"workload": workload}
         )
         node.meta["iree_result_types"] = [str(result.type) for result in op.results]
+        if any(t != -1 for t in tied):
+            node.meta["iree_tied_operands"] = tied
         if len(op.results) == 1:
             self.values[op.results[0]] = node
         else:
