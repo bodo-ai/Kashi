@@ -266,3 +266,31 @@ def test_iree_graph_preserves_unsigned_dtype(monkeypatch, mode):
     x = torch.tensor([0, 127, 254, 255], dtype=torch.uint8, device="cuda")
     result = torch.compile(model, backend=compile_iree_backend, fullgraph=True)(x)
     torch.testing.assert_close(result, model(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.parametrize("mode", ["cuda", "iree"])
+def test_iree_zero_buffer_preserves_partial_mutation(monkeypatch, mode):
+    """A GDN-like custom op writes only part of its zero-initialized buffer."""
+    from kashi.iree_backend import compile_iree_backend
+
+    monkeypatch.setenv("KASHI_IREE_EXECUTION", mode)
+    torch._dynamo.reset()
+
+    def model(source):
+        output = torch.zeros(
+            (source.shape[0], 4), dtype=source.dtype, device=source.device
+        )
+        torch.ops.kashi_iree_execution.increment.default(output[..., :2])
+        return torch.ops.aten.add.Tensor(output, source)
+
+    compiled = torch.compile(
+        model, backend=compile_iree_backend, dynamic=True, fullgraph=True
+    )
+    for rows in (3, 5):
+        source = torch.arange(rows * 4, device="cuda", dtype=torch.float32).reshape(
+            rows, 4
+        )
+        expected = source.clone()
+        expected[:, :2] += 3
+        torch.testing.assert_close(compiled(source), expected)

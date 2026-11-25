@@ -259,8 +259,25 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
         if target is torch.chunk:
             _rewrite_chunk(graph, node)
             return
-        if target is torch.empty:
-            size = node.args[0] if len(node.args) == 1 else node.args
+        if target in (torch.empty, torch.zeros):
+            kwargs = dict(node.kwargs)
+            if "out" in kwargs:
+                # The functional ATen allocation cannot represent an out= write.
+                raise NotImplementedError(
+                    f"Unsupported allocation out=: {node.format_node()}"
+                )
+            if "size" in kwargs:
+                if node.args:
+                    raise NotImplementedError(
+                        f"Duplicate allocation size: {node.format_node()}"
+                    )
+                size = kwargs.pop("size")
+            elif node.args:
+                size = node.args[0] if len(node.args) == 1 else node.args
+            else:
+                raise NotImplementedError(
+                    f"Missing allocation size: {node.format_node()}"
+                )
             # A size() result is already a runtime list; an individual
             # symbolic dimension instead needs to be wrapped as a list.
             if not _is_shape_list_node(size):
@@ -268,9 +285,11 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
             _replace(
                 graph,
                 node,
-                torch.ops.aten.empty.memory_format,
+                torch.ops.aten.empty.memory_format
+                if target is torch.empty
+                else torch.ops.aten.zeros.default,
                 (size,),
-                node.kwargs,
+                kwargs,
             )
             return
         if target is torch.Size:
@@ -284,14 +303,13 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
             if isinstance(dtype, torch.dtype):
                 _replace(graph, node, torch.ops.aten.to.dtype, node.args, node.kwargs)
                 return
-        if target == "long":
+        if target in ("long", "float"):
             if len(node.args) != 1 or node.kwargs:
                 raise NotImplementedError(
-                    f"Unsupported Tensor.long: {node.format_node()}"
+                    f"Unsupported Tensor.{target}: {node.format_node()}"
                 )
-            _replace(
-                graph, node, torch.ops.aten.to.dtype, (node.args[0], torch.int64), {}
-            )
+            dtype = torch.int64 if target == "long" else torch.float32
+            _replace(graph, node, torch.ops.aten.to.dtype, (node.args[0], dtype), {})
             return
         if (
             target == "pow"
@@ -310,6 +328,50 @@ def _rewrite(graph: torch.fx.Graph, node: torch.fx.Node) -> None:
             return
         if target == "split":
             _rewrite_split(graph, node)
+            return
+        if target == "permute":
+            if not node.args or node.kwargs:
+                raise NotImplementedError(
+                    f"Unsupported Tensor.permute: {node.format_node()}"
+                )
+            source, *dims = node.args
+            # Tensor.permute accepts either positional dimensions or one tuple.
+            if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+                dims = list(dims[0])
+            _replace(graph, node, torch.ops.aten.permute.default, (source, dims), {})
+            return
+        if target == "contiguous":
+            if (
+                len(node.args) != 1
+                or set(node.kwargs) - {"memory_format"}
+                or (
+                    "memory_format" in node.kwargs
+                    and not isinstance(
+                        node.kwargs["memory_format"], torch.memory_format
+                    )
+                )
+            ):
+                raise NotImplementedError(
+                    f"Unsupported Tensor.contiguous: {node.format_node()}"
+                )
+            _replace(
+                graph, node, torch.ops.aten.contiguous.default, node.args, node.kwargs
+            )
+            return
+        if target == "flatten":
+            if (
+                not node.args
+                or len(node.args) > 3
+                or set(node.kwargs) - {"start_dim", "end_dim"}
+                or (len(node.args) > 1 and "start_dim" in node.kwargs)
+                or (len(node.args) > 2 and "end_dim" in node.kwargs)
+            ):
+                raise NotImplementedError(
+                    f"Unsupported Tensor.flatten: {node.format_node()}"
+                )
+            _replace(
+                graph, node, torch.ops.aten.flatten.using_ints, node.args, node.kwargs
+            )
             return
         if target in ("view", "reshape"):
             if not node.args or node.kwargs:
@@ -412,6 +474,11 @@ def _resolve_packet(node: torch.fx.Node) -> None:
     operators such as vllm.unified_kv_cache_update.
     """
     packet = node.target
+    # Dynamo emits numpy_T as a packet; PyTorch's default and `a` overloads
+    # have identical signatures for this view, so use the canonical default.
+    if packet is torch.ops.aten.numpy_T:
+        node.target = packet.default
+        return
     overloads = packet.overloads()
     if len(overloads) != 1:
         raise NotImplementedError(

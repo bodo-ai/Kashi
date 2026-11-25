@@ -274,7 +274,7 @@ def test_rebuild_empty_decodes_dtype_and_device():
     [
         ({"dtype": "%int99"}, "ScalarType"),
         ({"layout": "%int0"}, "layout"),
-        ({"memory_format": "%int0"}, "memory_format"),
+        ({"memory_format": "%int99"}, "memory_format"),
     ],
     ids=["unknown-dtype", "layout", "memory_format"],
 )

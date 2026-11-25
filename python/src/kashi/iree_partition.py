@@ -67,6 +67,7 @@ def _driver_boundary(name: str) -> bool:
         "torch.aten.size.int",
         "torch.aten.sym_size.int",
         "torch.aten.empty.memory_format",
+        "torch.aten.zeros",
     ):
         return True
     if not name.startswith("torch.aten."):

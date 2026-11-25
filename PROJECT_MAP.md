@@ -45,21 +45,21 @@ benchmark artifacts.
 - `python/src/kashi/` — Python package implementing both compiler paths.
   - `python/src/kashi/__init__.py` — Marks the package; defines no public entry points.
   - `python/src/kashi/backend.py` — TorchDynamo backend for the eager FX→MLIR→FX round trip.
-  - `python/src/kashi/importer.py` — Copies and normalizes FX graphs and metadata, handles supported attention functionalization, and imports Torch MLIR with its output pytree specification.
+  - `python/src/kashi/importer.py` — Copies and normalizes FX graphs and metadata, including Qwen3.8 casts, allocations, and view methods; handles attention functionalization and imports Torch MLIR with its output pytree specification.
   - `python/src/kashi/decompose.py` — Rewrites supported vLLM custom operations to ATen while checking mutation and alias safety and preserving provenance.
-  - `python/src/kashi/mlir_to_fx.py` — Reconstructs supported Torch MLIR operations, constants, custom calls, segment calls, and output pytrees as FX.
+  - `python/src/kashi/mlir_to_fx.py` — Reconstructs supported Torch MLIR operations, constants, memory formats, custom calls, segment calls, and output pytrees as FX.
   - `python/src/kashi/iree_backend.py` — Orchestrates IREE CUDA compilation, artifact retention, partitioning, and executable driver reconstruction; exposes the Dynamo backend.
-  - `python/src/kashi/iree_partition.py` — Splits Torch MLIR around custom, mutation, alias, and shape boundaries and records segment interfaces and source device.
+  - `python/src/kashi/iree_partition.py` — Splits Torch MLIR around custom, mutation, alias, shape, and zero-allocation boundaries and records segment interfaces and source device.
   - `python/src/kashi/iree_reassembly.py` — Converts supported IREE flow segment operations and dispatches into FX handlers, binding optional kernel executors.
   - `python/src/kashi/iree_cuda.py` — Validates flow/stream/target/PTX dispatch metadata and launches CUDA kernels on PyTorch's current stream.
   - `python/src/kashi/iree_runtime.py` — Executes CUDA VMFB segments with IREE, DLPack imports, synchronization, PyTorch-owned outputs, and alias handling.
 - `python/tests/` — Python unit, integration, and operational regression tests.
   - `python/tests/.gitkeep` — Preserves the test directory when it is empty.
-  - `python/tests/conftest.py` — Supplies isolated local model configurations and shared fixtures.
+  - `python/tests/conftest.py` — Supplies isolated local model configurations, including the two-layer Qwen3.8 fixture, and shared fixtures.
   - `python/tests/backend_spy.py` — Records compiled graphs and token counts through a vLLM-loadable backend wrapper.
   - `python/tests/fx_test_utils.py` — Supplies fake-metadata recording, round-trip, target-inspection, and pytree comparison helpers.
   - `python/tests/kashi_test_ops.py` — Defines test-only custom/opaque operations and capture helpers for mutation and alias scenarios.
-  - `python/tests/vllm_test_utils.py` — Creates seeded vLLM runs, isolates test settings, and compares generated tokens and log probabilities.
+  - `python/tests/vllm_test_utils.py` — Creates seeded vLLM runs, including full-width two-layer Qwen3.8 with deterministic FP8 scales, and compares generated tokens and scores.
   - `python/tests/test_import.py` — Smoke-tests package and native extension imports.
   - `python/tests/test_import_fx.py` — Covers FX import, metadata, custom operations, and vLLM attention functionalization.
   - `python/tests/test_mlir_to_fx.py` — Covers reconstruction of Torch MLIR, custom calls, output structures, and invalid IR.
@@ -73,8 +73,10 @@ benchmark artifacts.
   - `python/tests/test_iree_runtime.py` — Tests CUDA VMFB calls, device selection, output lifetime, aliasing, and capture rejection.
   - `python/tests/test_iree_execution.py` — Exercises both CUDA execution modes with real operations, mutations, graph capture, and dtypes.
   - `python/tests/test_iree_qwen3_integration.py` — Compares real vLLM Qwen3 inference through both IREE modes with uncompiled generation.
-  - `python/tests/test_qwen3_components_roundtrip.py` — Checks Qwen3-style normalization, gating, splits, and argument handling through the round trip.
+  - `python/tests/test_qwen3_components_roundtrip.py` — Checks Qwen3 and Qwen3.8 normalization, layout, allocation, gating, splits, and argument handling through the round trip.
   - `python/tests/test_qwen3_integration.py` — Compares compiled and uncompiled vLLM Qwen3 prefill/decode tokens and scores.
+  - `python/tests/test_qwen38_integration.py` — Compares two-layer Qwen3.8-27B FP8 and BF16 generation against uncompiled vLLM for the FX and IREE paths.
+  - `python/tests/test_qwen38_weight_init.py` — Checks deterministic, distinct FP8 layer weights and scales before vLLM kernel packing.
   - `python/tests/test_vllm_integration.py` — Compares compiled and uncompiled seeded SimpleVllm generation.
   - `python/tests/test_runpod_controller.py` — Covers Runpod provisioning, artifact download, request handling, and cleanup.
   - `python/tests/test_runpod_recovery.py` — Covers journal transitions, locks, API retries, and conservative pod reconciliation.
@@ -82,6 +84,7 @@ benchmark artifacts.
   - `python/tests/test_mutation_workflow.py` — Tests native mutation toolchain requirements and changed-file policy.
   - `python/tests/models/`
     - `python/tests/models/simple_vllm_model.py` — Minimal compile-enabled vLLM attention model and causal-LM wrapper for integration tests.
+    - `python/tests/models/qwen38_27b_config.json` — Pinned Qwen3.8-27B-FP8 model configuration truncated to its first two text layers.
 - `cpp/` — Native extension and reserved locations for project-owned native code.
   - `cpp/bindings/module.cpp` — Defines the currently empty nanobind `_native` module.
   - `cpp/lib/.gitkeep`, `cpp/include/.gitkeep`, and `cpp/tests/.gitkeep` — Preserve currently empty locations for native sources, headers, and tests.
@@ -118,5 +121,6 @@ benchmark artifacts.
     - `specs/vllm-mlir-compilation-plugin/optional-custom-op-decomposition-design.md` — Optional vLLM custom-op decomposition design.
 - `docs/` — Development guides and implementation plans.
   - `docs/development/agentic-workflow.md` — Local agent setup and review workflow.
+  - `docs/development/qwen3-27b-feature-report.md` — Records Qwen3.8-27B features, compatibility changes, validation, and test limitations relative to Qwen3-0.6B.
   - `docs/superpowers/plans/2026-11-18-functional-attention.md` — Functional attention implementation plan.
   - `docs/superpowers/plans/2026-11-18-iree-kernel-execution.md` — IREE CUDA kernel execution implementation plan.
