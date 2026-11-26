@@ -269,12 +269,19 @@ def test_rebuild_empty_decodes_dtype_and_device():
     assert out.shape == (2, 3) and out.dtype == torch.float16
 
 
+def test_rebuild_empty_decodes_memory_format():
+    gm = rebuild_fx(_parse(_empty(memory_format="%int0")))
+    result = gm()
+    assert result.shape == (2, 3)
+    assert result.is_contiguous()
+
+
 @pytest.mark.parametrize(
     "operand, match",
     [
         ({"dtype": "%int99"}, "ScalarType"),
         ({"layout": "%int0"}, "layout"),
-        ({"memory_format": "%int0"}, "memory_format"),
+        ({"memory_format": "%int99"}, "memory_format"),
     ],
     ids=["unknown-dtype", "layout", "memory_format"],
 )

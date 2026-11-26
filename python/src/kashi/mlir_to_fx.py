@@ -5,7 +5,10 @@ from collections.abc import Callable, Mapping
 
 import torch
 from iree.compiler import ir
-from iree.compiler.extras.fx_importer import TORCH_DTYPE_TO_INT
+from iree.compiler.extras.fx_importer import (
+    TORCH_DTYPE_TO_INT,
+    TORCH_MEMORY_FORMAT_TO_INT,
+)
 from torch.utils import _pytree as pytree
 
 # --- Adapter: private PyTorch APIs used for schema-driven binding. ----------
@@ -41,6 +44,7 @@ def _resolve(op, name: str) -> torch._ops.OpOverload:
 # The importer encodes dtypes with this table; decoding with its inverse keeps
 # both directions in step.
 _INT_TO_DTYPE = {v: k for k, v in TORCH_DTYPE_TO_INT.items()}
+_INT_TO_MEMORY_FORMAT = {v: k for k, v in TORCH_MEMORY_FORMAT_TO_INT.items()}
 
 
 def _decode(argument, value, op):
@@ -65,7 +69,11 @@ def _decode(argument, value, op):
         return _INT_TO_DTYPE[value]
     if kind == "Device" and isinstance(value, str):
         return torch.device(value)
-    if kind in ("Layout", "MemoryFormat") and value is not None:
+    if kind == "MemoryFormat" and value is not None:
+        if value not in _INT_TO_MEMORY_FORMAT:
+            raise _error(op, f"{argument.name}: unknown MemoryFormat {value}")
+        return _INT_TO_MEMORY_FORMAT[value]
+    if kind == "Layout" and value is not None:
         raise _error(op, f"{argument.name}: only None is supported for {kind}")
     return value
 

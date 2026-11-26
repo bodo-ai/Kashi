@@ -262,7 +262,8 @@ LogicalResult writeCudaManifest(ModuleOp module,
     }
     (*manifest.getObject(identity.executable))[identity.exportName] =
         llvm::json::Object{{"file", StringRef(it->second.file)},
-                           {"entry", it->second.entry}};
+                           {"entry", it->second.entry},
+                           {"stable", identity.stableName}};
   }
   return writeFile(module, directory / "kernel_manifest.json", [&](auto &out) {
     out << llvm::json::Value(std::move(manifest)) << '\n';

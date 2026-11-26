@@ -61,19 +61,16 @@ std::string print(ModuleOp module) {
 }
 } // namespace
 
-TEST_CASE_METHOD(
-    PartitionFixture,
-    "Partition clones only needed constants and rewrites only CUDA clones",
-    "[partition]") {
+TEST_CASE_METHOD(PartitionFixture,
+                 "Allocation stays in the driver with the original device",
+                 "[partition]") {
   auto source = parse(R"mlir(
 module {
   func.func @main() -> !torch.vtensor<[4],f32> {
     %four = torch.constant.int 4
-    %unused = torch.constant.int 99
     %dtype = torch.constant.int 6
     %none = torch.constant.none
     %cuda = torch.constant.device "cuda:2"
-    %same = torch.constant.device "cuda:2"
     %shape = torch.prim.ListConstruct %four : (!torch.int) -> !torch.list<int>
     %buffer = torch.aten.empty.memory_format %shape, %dtype, %none, %cuda, %none, %none : !torch.list<int>, !torch.int, !torch.none, !torch.Device, !torch.none, !torch.none -> !torch.vtensor<[4],f32>
     return %buffer : !torch.vtensor<[4],f32>
@@ -86,33 +83,49 @@ module {
   CHECK(succeeded(verify(*result.driver)));
   CHECK(result.sourceDevice == "cuda:2");
   CHECK(print(*source) == before);
+  CHECK(result.segments->getBody()->empty());
+  CHECK_THAT(print(*result.driver),
+             ContainsSubstring("torch.aten.empty.memory_format"));
   CHECK_THAT(print(*result.driver),
              ContainsSubstring("torch.constant.device \"cuda:2\""));
+}
 
-  auto segment = result.segments->lookupSymbol<func::FuncOp>("segment_0");
-  REQUIRE(segment);
-  CHECK(segment.getNumArguments() == 0);
-  auto &body = segment.getBody().front();
-  REQUIRE(llvm::range_size(body) == 7);
-  auto op = body.begin();
-  Value four = op++->getResult(0);
-  Value dtype = op++->getResult(0);
-  Value none = op++->getResult(0);
-  Operation &device = *op++;
-  auto deviceName = device.getAttrOfType<StringAttr>("value");
-  REQUIRE(deviceName);
-  CHECK(deviceName.getValue() == "cpu");
-  Operation &shape = *op++;
-  REQUIRE(shape.getNumOperands() == 1);
-  CHECK(shape.getOperand(0) == four);
-  Operation &buffer = *op++;
-  REQUIRE(buffer.getNumOperands() == 6);
-  CHECK(buffer.getOperand(0) == shape.getResult(0));
-  CHECK(buffer.getOperand(1) == dtype);
-  CHECK(buffer.getOperand(2) == none);
-  CHECK(buffer.getOperand(3) == device.getResult(0));
-  CHECK(buffer.getOperand(4) == none);
-  CHECK(buffer.getOperand(5) == none);
+TEST_CASE_METHOD(PartitionFixture,
+                 "Zero allocation stays in the driver across mutation",
+                 "[partition]") {
+  // GDN writes only part of its output, so the unmodified elements must stay
+  // zero and the custom op must receive the original PyTorch allocation.
+  auto source = parse(R"mlir(
+module {
+  func.func @main() -> !torch.vtensor<[4],f32> {
+    %four = torch.constant.int 4
+    %dtype = torch.constant.int 6
+    %none = torch.constant.none
+    %cuda = torch.constant.device "cuda:2"
+    %shape = torch.prim.ListConstruct %four : (!torch.int) -> !torch.list<int>
+    %buffer = torch.aten.zeros %shape, %dtype, %none, %cuda, %none : !torch.list<int>, !torch.int, !torch.none, !torch.Device, !torch.none -> !torch.vtensor<[4],f32>
+    torch.operator "torch.test.mutate"(%buffer) : (!torch.vtensor<[4],f32>) -> ()
+    return %buffer : !torch.vtensor<[4],f32>
+  }
+}
+)mlir");
+  auto result = partition(*source);
+  CHECK(result.segments->getBody()->empty());
+  auto main = result.driver->lookupSymbol<func::FuncOp>("main");
+  REQUIRE(main);
+  Operation *allocation = nullptr;
+  Operation *mutation = nullptr;
+  for (Operation &op : main.getBody().front()) {
+    if (op.getName().getStringRef() == "torch.aten.zeros")
+      allocation = &op;
+    else if (op.getName().getStringRef() == "torch.operator")
+      mutation = &op;
+  }
+  REQUIRE(allocation);
+  REQUIRE(mutation);
+  CHECK(mutation->getOperand(0) == allocation->getResult(0));
+  CHECK(main.getBody().front().back().getOperand(0) ==
+        allocation->getResult(0));
 }
 
 TEST_CASE_METHOD(PartitionFixture,
@@ -132,7 +145,8 @@ module {
 )mlir");
   auto result = partition(*source);
   CHECK(result.sourceDevice == "meta");
-  CHECK_THAT(print(*result.segments),
+  CHECK(result.segments->getBody()->empty());
+  CHECK_THAT(print(*result.driver),
              ContainsSubstring("torch.constant.device \"meta\""));
 }
 
@@ -296,4 +310,138 @@ module {
   CHECK(call.getOperand(0) == second.getResult(0));
   CHECK(last.getOperand(0) == call.getResult(0));
   CHECK(op->getOperand(0) == last.getResult(0));
+}
+
+TEST_CASE_METHOD(PartitionFixture,
+                 "View and split preserve storage across mutation",
+                 "[partition]") {
+  auto source = parse(R"mlir(
+module {
+  func.func @main(%x: !torch.vtensor<[4],f32>) -> (!torch.vtensor<[4],f32>, !torch.vtensor<[2],f32>) {
+    %two = torch.constant.int 2
+    %zero = torch.constant.int 0
+    %sizes = torch.prim.ListConstruct %two, %two : (!torch.int, !torch.int) -> !torch.list<int>
+    %parts = torch.aten.split_with_sizes %x, %sizes, %zero : !torch.vtensor<[4],f32>, !torch.list<int>, !torch.int -> !torch.list<vtensor>
+    %left, %right = torch.prim.ListUnpack %parts : !torch.list<vtensor> -> !torch.vtensor<[2],f32>, !torch.vtensor<[2],f32>
+    torch.operator "torch.test.mutate"(%left) : (!torch.vtensor<[2],f32>) -> ()
+    return %x, %left : !torch.vtensor<[4],f32>, !torch.vtensor<[2],f32>
+  }
+}
+)mlir");
+  auto result = partition(*source);
+  CHECK(result.segments->getBody()->empty());
+  auto text = print(*result.driver);
+  CHECK_THAT(text, ContainsSubstring("torch.aten.split_with_sizes"));
+  CHECK_THAT(text, ContainsSubstring("torch.prim.ListUnpack"));
+  CHECK_THAT(text, ContainsSubstring("torch.test.mutate"));
+  auto main = result.driver->lookupSymbol<func::FuncOp>("main");
+  REQUIRE(main);
+  auto &body = main.getBody().front();
+  Operation *split = nullptr;
+  Operation *unpack = nullptr;
+  Operation *mutation = nullptr;
+  for (Operation &op : body) {
+    auto name = op.getName().getStringRef();
+    if (name == "torch.aten.split_with_sizes")
+      split = &op;
+    else if (name == "torch.prim.ListUnpack")
+      unpack = &op;
+    else if (name == "torch.operator")
+      mutation = &op;
+  }
+  REQUIRE(split);
+  REQUIRE(unpack);
+  REQUIRE(mutation);
+  CHECK(split->getOperand(0) == body.getArgument(0));
+  CHECK(unpack->getOperand(0) == split->getResult(0));
+  CHECK(mutation->getOperand(0) == unpack->getResult(0));
+  auto &ret = body.back();
+  CHECK(ret.getOperand(0) == body.getArgument(0));
+  CHECK(ret.getOperand(1) == unpack->getResult(0));
+  CHECK(succeeded(verify(*result.driver)));
+}
+
+TEST_CASE_METHOD(PartitionFixture,
+                 "Dynamic shapes and lists stay in the driver", "[partition]") {
+  auto source = parse(R"mlir(
+module {
+  func.func @main(%x: !torch.vtensor<[?],f32>, %dim: !torch.int) -> !torch.vtensor<[?],f32> {
+    %size = torch.aten.size.int %x, %dim : !torch.vtensor<[?],f32>, !torch.int -> !torch.int
+    %shape = torch.prim.ListConstruct %size : (!torch.int) -> !torch.list<int>
+    %view = torch.aten.view %x, %shape : !torch.vtensor<[?],f32>, !torch.list<int> -> !torch.vtensor<[?],f32>
+    return %view : !torch.vtensor<[?],f32>
+  }
+}
+)mlir");
+  auto result = partition(*source);
+  CHECK(result.segments->getBody()->empty());
+  auto text = print(*result.driver);
+  CHECK_THAT(text, ContainsSubstring("torch.aten.size.int"));
+  CHECK_THAT(text, ContainsSubstring("torch.prim.ListConstruct"));
+  CHECK_THAT(text, ContainsSubstring("torch.aten.view"));
+  CHECK(succeeded(verify(*result.driver)));
+}
+
+TEST_CASE_METHOD(PartitionFixture, "An empty graph has no outlined segments",
+                 "[partition]") {
+  auto source = parse("module { func.func @main() { return } }");
+  auto result = partition(*source);
+  CHECK(result.segments->getBody()->empty());
+  CHECK(succeeded(verify(*result.driver)));
+}
+
+TEST_CASE_METHOD(PartitionFixture,
+                 "Schema metadata is cached and controls boundaries",
+                 "[partition]") {
+  auto source = parse(R"mlir(
+module {
+  func.func @main(%x: !torch.vtensor<[4],f32>) -> !torch.vtensor<[4],f32> {
+    %a = torch.aten.relu %x : !torch.vtensor<[4],f32> -> !torch.vtensor<[4],f32>
+    %b = torch.aten.relu %a : !torch.vtensor<[4],f32> -> !torch.vtensor<[4],f32>
+    return %b : !torch.vtensor<[4],f32>
+  }
+}
+)mlir");
+  int queries = 0;
+  auto result =
+      kashi::partitionTorchModule(*source, [&](std::string_view name) {
+        CHECK(name == "torch.aten.relu");
+        ++queries;
+        return std::optional<bool>(true);
+      });
+  REQUIRE(succeeded(result));
+  CHECK(queries == 1);
+  // FailureOr hides has_value(); REQUIRE above aborts if the value is absent.
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  auto partition = std::move(*result);
+  CHECK(partition.segments->getBody()->empty());
+  CHECK(succeeded(verify(*partition.driver)));
+
+  std::string diagnostics;
+  ScopedDiagnosticHandler handler(&context, [&](Diagnostic &diagnostic) {
+    diagnostics = diagnostic.str();
+    return success();
+  });
+  auto unknown = kashi::partitionTorchModule(
+      *source,
+      [](std::string_view) -> std::optional<bool> { return std::nullopt; });
+  CHECK(failed(unknown));
+  CHECK_THAT(diagnostics, ContainsSubstring("unknown ATen schema"));
+}
+
+TEST_CASE_METHOD(PartitionFixture, "Clone remains a driver allocation",
+                 "[partition]") {
+  auto source = parse(R"mlir(
+module {
+  func.func @main(%x: !torch.vtensor<[4],f32>) -> !torch.vtensor<[4],f32> {
+    %none = torch.constant.none
+    %copy = torch.aten.clone %x, %none : !torch.vtensor<[4],f32>, !torch.none -> !torch.vtensor<[4],f32>
+    return %copy : !torch.vtensor<[4],f32>
+  }
+}
+)mlir");
+  auto result = partition(*source);
+  CHECK(result.segments->getBody()->empty());
+  CHECK_THAT(print(*result.driver), ContainsSubstring("torch.aten.clone"));
+  CHECK(succeeded(verify(*result.driver)));
 }

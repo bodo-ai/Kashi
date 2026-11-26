@@ -1,10 +1,5 @@
-// Split the single-block Torch @main at torch.operator boundaries. Outline
-// each nonempty run into a compilable function: SSA uses determine its ordered
-// inputs and outputs, and needed constants are cloned into the function.
-// Build a separate driver for FX reassembly by replaying the source order,
-// replacing each outlined run with a call and leaving custom ops in place.
-// Remap call results to their original SSA values so later calls and custom
-// ops consume the same values as before partitioning.
+// Outline value-semantic Torch runs and replay aliasing, mutation, allocation,
+// shape and container boundaries in the driver in their original order.
 
 #include "kashi/iree_partition.h"
 
@@ -18,6 +13,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <utility>
 
@@ -36,11 +32,12 @@ struct Segment {
 using ConstantOps = llvm::SmallSetVector<Operation *, 8>;
 
 struct PartitionPlan {
-  // Keep the empty runs too: each custom op ends a run, and the original run
-  // index determines the segment symbol even if some runs are not outlined.
+  // Keep empty runs: each driver boundary ends a run, and its original index
+  // determines the segment symbol even if some runs are not outlined.
   SmallVector<Segment> segments;
   llvm::DenseMap<Operation *, size_t> membership;
   ConstantOps constants;
+  llvm::DenseSet<Operation *> boundaries;
   std::optional<std::string> sourceDevice;
 };
 
@@ -50,9 +47,101 @@ bool supportsBoundaryType(Type type) {
 }
 
 bool isCustomOp(Operation &op) {
-  // Classify by name so this also accepts Torch IR parsed with unregistered
-  // ops.
   return op.getName().getStringRef() == Torch::OperatorOp::getOperationName();
+}
+
+bool containsTensor(Type type) {
+  if (isa<Torch::BaseTensorType>(type))
+    return true;
+  if (auto list = dyn_cast<Torch::ListType>(type))
+    return containsTensor(list.getContainedType());
+  return false;
+}
+
+bool containsInt(Type type) {
+  if (isa<Torch::IntType>(type))
+    return true;
+  if (auto list = dyn_cast<Torch::ListType>(type))
+    return containsInt(list.getContainedType());
+  return false;
+}
+
+bool isDriverList(Operation &op, const PartitionPlan &plan) {
+  StringRef name = op.getName().getStringRef();
+  if (name == Torch::PrimListConstructOp::getOperationName()) {
+    auto list = dyn_cast<Torch::ListType>(op.getResult(0).getType());
+    if (!list)
+      return false;
+    Type element = list.getContainedType();
+    return containsTensor(element) ||
+           (containsInt(element) &&
+            !llvm::all_of(op.getOperands(), [&](Value value) {
+              return plan.constants.contains(value.getDefiningOp());
+            }));
+  }
+  if (name == Torch::PrimListUnpackOp::getOperationName()) {
+    auto list = dyn_cast<Torch::ListType>(op.getOperand(0).getType());
+    return list && (containsTensor(list.getContainedType()) ||
+                    !plan.constants.contains(op.getOperand(0).getDefiningOp()));
+  }
+  return false;
+}
+
+bool isExplicitBoundary(StringRef name) {
+  return name == "torch.aten.size" || name.starts_with("torch.aten.size.") ||
+         name == "torch.aten.sym_size" ||
+         name.starts_with("torch.aten.sym_size.") ||
+         name == "torch.aten._unsafe_view" ||
+         name.starts_with("torch.aten._unsafe_view.") ||
+         name == "torch.aten.unsafe_split" ||
+         name.starts_with("torch.aten.unsafe_split.") ||
+         name == "torch.aten.unsafe_split_with_sizes" ||
+         name.starts_with("torch.aten.unsafe_split_with_sizes.") ||
+         name == "torch.aten.clone" || name.starts_with("torch.aten.clone.") ||
+         // Copies can change devices or consume strided inputs, neither of
+         // which the compiled segment ABI can represent faithfully.
+         name == "torch.aten._to_copy" ||
+         name.starts_with("torch.aten._to_copy.") ||
+         // Custom kernels may only partially write an output buffer. Keep
+         // zero initialization and the subsequent mutation on the same storage.
+         name == "torch.aten.zeros" || name.starts_with("torch.aten.zeros.") ||
+         name == "torch.aten.empty" || name.starts_with("torch.aten.empty.") ||
+         name.starts_with("torch.aten.empty_") ||
+         name == "torch.aten.new_empty" ||
+         name.starts_with("torch.aten.new_empty.") ||
+         name.starts_with("torch.aten.new_empty_");
+}
+
+/// Determine whether the PyTorch driver must retain this operation.
+FailureOr<bool> isDriverBoundary(
+    Operation &op, const PartitionPlan &plan,
+    const std::function<std::optional<bool>(std::string_view)> &schema,
+    llvm::StringMap<std::optional<bool>> &schemaCache) {
+  StringRef name = op.getName().getStringRef();
+  bool boundary =
+      isCustomOp(op) || isExplicitBoundary(name) || isDriverList(op, plan);
+  if (name.starts_with("torch.aten.") && schema) {
+    auto [it, inserted] = schemaCache.try_emplace(name);
+    if (inserted)
+      it->second = schema(std::string_view(name.data(), name.size()));
+    if (!it->second)
+      return op.emitError("unknown ATen schema: ") << name;
+    boundary = boundary || *it->second;
+  } else if (name.starts_with("torch.aten.")) {
+    if (!op.getName().isRegistered())
+      return op.emitError("unknown ATen operation: ") << name;
+    boundary = boundary || !op.hasTrait<Torch::OpTrait::HasValueSemantics>();
+  }
+  if (!boundary && !name.starts_with("torch.aten.") &&
+      !name.starts_with("torch.constant.") &&
+      name != Torch::ValueTensorLiteralOp::getOperationName() &&
+      name != Torch::PrimListConstructOp::getOperationName() &&
+      name != Torch::PrimListUnpackOp::getOperationName()) {
+    if (!op.getName().isRegistered())
+      return op.emitError("unknown Torch operation: ") << name;
+    boundary = !op.hasTrait<Torch::OpTrait::HasValueSemantics>();
+  }
+  return boundary;
 }
 
 /// Resolve values in order; a missing mapping is a partition construction bug.
@@ -62,7 +151,10 @@ SmallVector<Value> mapped(ValueRange values, const IRMapping &mapping) {
 }
 
 /// Classify source operations in block order without changing the source.
-LogicalResult classifySourceOps(Block &body, PartitionPlan &plan) {
+LogicalResult classifySourceOps(
+    Block &body, PartitionPlan &plan,
+    const std::function<std::optional<bool>(std::string_view)> &schema) {
+  llvm::StringMap<std::optional<bool>> schemaCache;
   plan.segments.emplace_back();
   for (Operation &op : body.without_terminator()) {
     StringRef name = op.getName().getStringRef();
@@ -72,7 +164,13 @@ LogicalResult classifySourceOps(Block &body, PartitionPlan &plan) {
     if (!name.starts_with("torch.")) {
       return op.emitError("unsupported source operation: ") << name;
     }
-    if (isCustomOp(op)) {
+    auto boundary = isDriverBoundary(op, plan, schema, schemaCache);
+    if (failed(boundary))
+      return failure();
+    // FailureOr hides has_value(); the failed() check above proves success.
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+    if (*boundary) {
+      plan.boundaries.insert(&op);
       plan.segments.emplace_back();
       continue;
     }
@@ -250,7 +348,7 @@ void buildDriver(ModuleOp driver, const PartitionPlan &plan, func::FuncOp main,
 
   size_t index = 0;
   for (Operation &op : sourceBody.without_terminator()) {
-    if (isCustomOp(op)) {
+    if (plan.boundaries.contains(&op)) {
       callSegment(builder, op.getLoc(), plan.segments[index++], mapping);
     } else if (!plan.constants.contains(&op)) {
       continue;
@@ -262,7 +360,9 @@ void buildDriver(ModuleOp driver, const PartitionPlan &plan, func::FuncOp main,
 }
 } // namespace
 
-FailureOr<Partition> partitionTorchModule(ModuleOp source) {
+FailureOr<Partition> partitionTorchModule(
+    ModuleOp source,
+    const std::function<std::optional<bool>(std::string_view)> &schema) {
   auto &operations = source.getBody()->getOperations();
   if (!llvm::hasSingleElement(operations)) {
     return source.emitError(
@@ -280,7 +380,7 @@ FailureOr<Partition> partitionTorchModule(ModuleOp source) {
   }
 
   PartitionPlan plan;
-  if (failed(classifySourceOps(body, plan))) {
+  if (failed(classifySourceOps(body, plan, schema))) {
     return failure();
   }
 

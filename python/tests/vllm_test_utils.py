@@ -4,9 +4,11 @@ import gc
 import math
 from contextlib import contextmanager
 from functools import partial
+from unittest.mock import patch
 
 import torch
 from backend_spy import VLLM_SPY
+from gpu_test_utils import GPU_MEMORY_UTILIZATION
 
 # Local configs and token IDs avoid downloading a model or tokenizer. A head
 # size of 64 is supported by both vLLM's CPU and GPU attention backends.
@@ -41,6 +43,7 @@ QWEN_PROMPTS = [
     {"prompt_token_ids": [10, 11, 12, 13, 14, 15, 16, 17, 18]},
 ]
 QWEN_MAX_TOKENS = 4
+_QWEN38_WEIGHT_SEED = 18
 
 
 @contextmanager
@@ -95,6 +98,40 @@ def fill_weights(model, *, seed, scale, norm_scale=None):
             param.copy_(values)
 
 
+def fill_qwen38_weights(model, *, seed=_QWEN38_WEIGHT_SEED):
+    """Initialize distinct layer weights and valid scales before vLLM packs them.
+
+    vLLM's dummy loader repeats its seed for each tensor. Distinct seeds make
+    erroneous cross-layer weight reuse observable. Initializing scales before
+    kernel processing also preserves transformations such as Marlin's bias.
+    The seed avoids tied top-token scores for the fixed prompts on the tested
+    GPUs with both full and reduced-precision BF16 reductions.
+
+    Args:
+        model: vLLM model whose parameters have already been loaded.
+        seed: Base seed for deterministic per-parameter generators.
+    """
+    from vllm.model_executor.model_loader.weight_utils import (
+        initialize_single_dummy_weight,
+    )
+
+    generators = {}
+    with torch.no_grad():
+        for index, (name, param) in enumerate(sorted(model.named_parameters())):
+            if name.endswith("weight_scale_inv"):
+                param.fill_(0.01)
+            elif name.endswith(("embed_tokens.weight", "lm_head.weight")):
+                if param.device not in generators:
+                    generators[param.device] = torch.Generator(
+                        device=param.device
+                    ).manual_seed(seed)
+                param.uniform_(-0.02, 0.02, generator=generators[param.device])
+            elif param.dtype == torch.float8_e4m3fn or (
+                "layers." in name and name.endswith(".weight")
+            ):
+                initialize_single_dummy_weight(param, seed=seed + index, name=name)
+
+
 def generate(
     model_dir,
     compilation_config,
@@ -107,6 +144,8 @@ def generate(
     sampling_options,
     generation_options=None,
     record_generation=False,
+    dtype="float32",
+    weights_preinitialized=False,
 ):
     """Generate completions from a seeded dummy model and always clean up vLLM."""
     from vllm import LLM, SamplingParams
@@ -118,7 +157,7 @@ def generate(
             model=str(model_dir),
             skip_tokenizer_init=True,
             load_format="dummy",
-            dtype="float32",
+            dtype=dtype,
             kv_cache_memory_bytes=64 * 1024 * 1024,
             compilation_config=compilation_config,
             # The startup warmup compiles a random sampler that can abort in Triton
@@ -126,14 +165,15 @@ def generate(
             kernel_config={"enable_jit_warmup": False},
             **engine_options,
         )
-        llm.apply_model(
-            partial(
-                fill_weights,
-                seed=weight_seed,
-                scale=weight_scale,
-                norm_scale=norm_scale,
+        if not weights_preinitialized:
+            llm.apply_model(
+                partial(
+                    fill_weights,
+                    seed=weight_seed,
+                    scale=weight_scale,
+                    norm_scale=norm_scale,
+                )
             )
-        )
         if record_generation:
             # Exclude vLLM's startup/profile calls: these counts must come from
             # the actual requests, not warmup of the compiled graph.
@@ -161,6 +201,7 @@ def generate_qwen(model_dir, compilation_config, *, record_generation=False):
             "max_model_len": 64,
             "max_num_batched_tokens": 64,
             "max_num_seqs": 2,
+            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_chunked_prefill": False,
             "enable_prefix_caching": False,
             "async_scheduling": False,
@@ -176,6 +217,66 @@ def generate_qwen(model_dir, compilation_config, *, record_generation=False):
         generation_options={"use_tqdm": False},
         record_generation=record_generation,
     )
+
+
+@contextmanager
+def _qwen38_dummy_loader():
+    """Initialize raw checkpoint-format tensors before vLLM's kernel packing."""
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
+    original = DummyModelLoader.load_weights
+
+    def load_weights(loader, model, model_config):
+        original(loader, model, model_config)
+        fill_qwen38_weights(model)
+
+    # These integration engines disable multiprocessing, so the patch is
+    # local to the model load and is restored even if initialization fails.
+    with patch.object(DummyModelLoader, "load_weights", load_weights):
+        yield
+
+
+def generate_qwen38(model_dir, compilation_config, *, record_generation=False):
+    """Generate fixed-token completions from a two-layer Qwen3.8 model.
+
+    Args:
+        model_dir: Offline model configuration directory.
+        compilation_config: vLLM compilation mode and backend selection.
+        record_generation: Keep backend token counts for request invocations.
+
+    Returns:
+        The first completion for each fixed prompt, including log probabilities.
+    """
+    with _qwen38_dummy_loader():
+        return generate(
+            model_dir,
+            compilation_config,
+            QWEN_PROMPTS,
+            weight_seed=_QWEN38_WEIGHT_SEED,
+            weight_scale=0.15,
+            dtype="bfloat16",
+            weights_preinitialized=True,
+            engine_options={
+                "language_model_only": True,
+                "max_model_len": 64,
+                "max_num_batched_tokens": 64,
+                "max_num_seqs": 2,
+                "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+                "enable_chunked_prefill": False,
+                "enable_prefix_caching": False,
+                "async_scheduling": False,
+                "seed": 42,
+            },
+            sampling_options={
+                "max_tokens": QWEN_MAX_TOKENS,
+                "temperature": 0,
+                "seed": 42,
+                "logprobs": 5,
+                "ignore_eos": True,
+            },
+            generation_options={"use_tqdm": False},
+            record_generation=record_generation,
+        )
 
 
 def assert_outputs_match(

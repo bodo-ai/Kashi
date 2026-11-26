@@ -23,6 +23,7 @@
 #include "iree/schemas/cuda_executable_def_builder.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
+#include "llvm/Support/JSON.h"
 
 namespace {
 namespace fs = std::filesystem;
@@ -150,6 +151,36 @@ TEST_CASE("VMVX checkpoints produce a Flow snapshot without CUDA artifacts") {
   REQUIRE(artifacts.read("flow.mlir").find("flow.dispatch") !=
           std::string::npos);
   REQUIRE(!fs::exists(artifacts.directory / "kernel_manifest.json"));
+  REQUIRE(!artifacts.read("module.vmfb").empty());
+  REQUIRE(artifacts.read("phases/module.flow.mlir").find("flow.dispatch") !=
+          std::string::npos);
+  REQUIRE(!artifacts.read("phases/module.stream.mlir").empty());
+  REQUIRE(!artifacts.read("phases/module.executable-targets.mlir").empty());
+}
+
+TEST_CASE("Empty CUDA partitions skip target discovery and lowering") {
+  Artifacts artifacts;
+  std::optional<std::string> target;
+  SECTION("without a target") {}
+  SECTION("with an explicit target") { target = "sm_80"; }
+  auto device =
+      kashi::compileIree("module { func.func @main() { return } }",
+                         {artifacts.directory, IreeBackend::CUDA, target});
+  REQUIRE_FALSE(device);
+  REQUIRE(fs::exists(artifacts.directory / "partitioned.mlir"));
+  REQUIRE(fs::exists(artifacts.directory / "driver.mlir"));
+  REQUIRE_FALSE(fs::exists(artifacts.directory / "module.vmfb"));
+  REQUIRE_FALSE(fs::exists(artifacts.directory / "flow.mlir"));
+}
+
+TEST_CASE("Nonempty CUDA partitions require a target after partitioning") {
+  Artifacts artifacts;
+  REQUIRE_THROWS_WITH(
+      kashi::compileIree(fixture, {artifacts.directory, IreeBackend::CUDA, {}}),
+      Catch::Matchers::ContainsSubstring("configuration failed"));
+  REQUIRE(fs::exists(artifacts.directory / "partitioned.mlir"));
+  REQUIRE(fs::exists(artifacts.directory / "driver.mlir"));
+  REQUIRE_FALSE(fs::exists(artifacts.directory / "module.vmfb"));
 }
 
 TEST_CASE(
@@ -179,6 +210,13 @@ TEST_CASE(
     REQUIRE_THROWS_WITH(
         kashi::compileIree(fixture, {dir, IreeBackend::VMVX, {}}),
         Catch::Matchers::ContainsSubstring("write driver.mlir failed"));
+  }
+  SECTION("the VM bytecode cannot be opened") {
+    fs::create_directory(dir / "module.vmfb");
+    REQUIRE_THROWS_WITH(
+        kashi::compileIree(fixture, {dir, IreeBackend::VMVX, {}}),
+        Catch::Matchers::ContainsSubstring("write VM bytecode failed"));
+    REQUIRE(fs::exists(dir / "flow.mlir"));
   }
   SECTION("the entry point is not supported") {
     REQUIRE_THROWS_AS(
@@ -238,6 +276,15 @@ TEST_CASE("CUDA manifest resolves entries in the selected serialized image") {
       REQUIRE(mlir::succeeded(result));
       REQUIRE(diagnostic.empty());
       REQUIRE(fs::exists(manifest));
+      auto json = llvm::json::parse(artifacts.read("kernel_manifest.json"));
+      REQUIRE(static_cast<bool>(json));
+      auto *root = json->getAsObject();
+      REQUIRE(root);
+      auto *original = root->getObject("original");
+      REQUIRE(original);
+      auto *exported = original->getObject("exported");
+      REQUIRE(exported);
+      REQUIRE(exported->getString("stable") == "stable");
     } else {
       REQUIRE(mlir::failed(result));
       REQUIRE(diagnostic == "serialized CUDA export has no matching PTX entry");
