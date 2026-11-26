@@ -92,7 +92,8 @@ jobs:
           # vLLM's Triton CPU sampler can SIGILL on Zen2 GitHub runners.
           # Interpret Triton while retaining the real vLLM parity tests.
           TRITON_INTERPRET: "1"
-        run: pixi run --locked coverage-python
+        # Show where an unusually slow test is blocked without aborting it.
+        run: pixi run --locked coverage-python -o faulthandler_timeout=300
       - name: Reclaim editable build space before native coverage
         if: runner.os == 'Linux'
         # Python coverage is complete; native coverage builds its own test binary.

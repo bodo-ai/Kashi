@@ -22,6 +22,48 @@ _MIN_GPU_BYTES = 7 * 1024**3
 _MIN_CPU_BYTES = 10 * 1024**3
 
 
+def test_cpu_memory_guard_respects_nested_cgroup_limit(tmp_path, monkeypatch):
+    """An ancestor's limit must stop a model that cannot fit in its cgroup."""
+    from types import SimpleNamespace
+
+    import psutil
+
+    gib = 1024**3
+    root = tmp_path / "cgroup"
+    parent = root / "runner"
+    child = parent / "job"
+    child.mkdir(parents=True)
+    (root / "memory.max").write_text("max")
+    (root / "memory.current").write_text("0")
+    (parent / "memory.max").write_text(str(10 * gib))
+    (parent / "memory.current").write_text(str(2 * gib))
+    (child / "memory.max").write_text(str(20 * gib))
+    (child / "memory.current").write_text(str(1 * gib))
+    membership = tmp_path / "membership"
+    membership.write_text("0::/runner/job\n")
+    real_path = Path
+
+    def scoped_path(path):
+        if path == "/proc/self/cgroup":
+            return membership
+        if path.startswith("/sys/fs/cgroup"):
+            return root / path.removeprefix("/sys/fs/cgroup").lstrip("/")
+        return real_path(path)
+
+    monkeypatch.setattr(sys.modules[__name__], "Path", scoped_path)
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=40 * gib)
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_compare", lambda *a, **k: None)
+    request = SimpleNamespace(
+        node=SimpleNamespace(
+            callspec=SimpleNamespace(params={"qwen38_model_dir": "bf16"})
+        )
+    )
+    with pytest.raises(pytest.skip.Exception, match="at least 10 GiB"):
+        test_qwen38_cpu_matches_uncompiled(tmp_path, request)
+
+
 def test_gpu_selection_preserves_visible_mig_identifier_on_ties(monkeypatch):
     """The selected child inherits the actual visible MIG instance, even on ties."""
     from types import SimpleNamespace
@@ -271,12 +313,26 @@ def test_qwen38_cpu_matches_uncompiled(qwen38_model_dir, request):
             )
 
     available = psutil.virtual_memory().available
-    limit = Path("/sys/fs/cgroup/memory.max")
-    usage = Path("/sys/fs/cgroup/memory.current")
-    if limit.is_file() and usage.is_file():
-        raw = limit.read_text().strip()
-        if raw != "max":
-            available = min(available, int(raw) - int(usage.read_text()))
+    root = Path("/sys/fs/cgroup")
+    membership = Path("/proc/self/cgroup")
+    group = root
+    if membership.is_file():
+        for line in membership.read_text().splitlines():
+            if line.startswith("0::"):
+                group = root / line[3:].lstrip("/")
+                break
+    # A cgroup can have ample space while an ancestor limits the whole job.
+    # Check every level, including the root, against that level's own usage.
+    while True:
+        limit = group / "memory.max"
+        usage = group / "memory.current"
+        if limit.is_file() and usage.is_file():
+            raw = limit.read_text().strip()
+            if raw != "max":
+                available = min(available, int(raw) - int(usage.read_text()))
+        if group == root:
+            break
+        group = group.parent
     if available < _MIN_CPU_BYTES:
         pytest.skip(
             "two-layer Qwen3.8 BF16 requires at least 10 GiB of available CPU memory"
