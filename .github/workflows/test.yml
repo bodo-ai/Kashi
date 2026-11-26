@@ -93,7 +93,7 @@ jobs:
           # Interpret Triton while retaining the real vLLM parity tests.
           TRITON_INTERPRET: "1"
         # Show where an unusually slow test is blocked without aborting it.
-        run: pixi run --locked coverage-python -o faulthandler_timeout=300
+        run: pixi run --locked coverage-python -o faulthandler_timeout=600
       - name: Reclaim editable build space before native coverage
         if: runner.os == 'Linux'
         # Python coverage is complete; native coverage builds its own test binary.
