@@ -45,7 +45,7 @@ def test_gpu_selection_preserves_visible_mig_identifier_on_ties(monkeypatch):
 
 
 def test_gpu_selection_respects_vllm_memory_budget(monkeypatch):
-    """A larger free byte count is unusable if vLLM's 90% budget exceeds it."""
+    """A larger free byte count is unusable if vLLM's budget exceeds it."""
     from types import SimpleNamespace
 
     gib = 1024**3

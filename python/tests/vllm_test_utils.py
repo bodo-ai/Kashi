@@ -43,6 +43,7 @@ QWEN_PROMPTS = [
     {"prompt_token_ids": [10, 11, 12, 13, 14, 15, 16, 17, 18]},
 ]
 QWEN_MAX_TOKENS = 4
+_QWEN38_WEIGHT_SEED = 18
 
 
 @contextmanager
@@ -97,14 +98,14 @@ def fill_weights(model, *, seed, scale, norm_scale=None):
             param.copy_(values)
 
 
-def fill_qwen38_weights(model, *, seed=2):
+def fill_qwen38_weights(model, *, seed=_QWEN38_WEIGHT_SEED):
     """Initialize distinct layer weights and valid scales before vLLM packs them.
 
     vLLM's dummy loader repeats its seed for each tensor. Distinct seeds make
     erroneous cross-layer weight reuse observable. Initializing scales before
     kernel processing also preserves transformations such as Marlin's bias.
-    The seed gives the fixed test prompts separated top-token scores, so
-    minor BF16 reduction differences do not turn ties into spurious failures.
+    The seed avoids tied top-token scores for the fixed prompts on the tested
+    GPUs with both full and reduced-precision BF16 reductions.
 
     Args:
         model: vLLM model whose parameters have already been loaded.
@@ -251,7 +252,7 @@ def generate_qwen38(model_dir, compilation_config, *, record_generation=False):
             model_dir,
             compilation_config,
             QWEN_PROMPTS,
-            weight_seed=2,
+            weight_seed=_QWEN38_WEIGHT_SEED,
             weight_scale=0.15,
             dtype="bfloat16",
             weights_preinitialized=True,
