@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 from backend_spy import VLLM_SPY
+from gpu_test_utils import GPU_MEMORY_UTILIZATION
 
 # Local configs and token IDs avoid downloading a model or tokenizer. A head
 # size of 64 is supported by both vLLM's CPU and GPU attention backends.
@@ -199,6 +200,7 @@ def generate_qwen(model_dir, compilation_config, *, record_generation=False):
             "max_model_len": 64,
             "max_num_batched_tokens": 64,
             "max_num_seqs": 2,
+            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_chunked_prefill": False,
             "enable_prefix_caching": False,
             "async_scheduling": False,
@@ -258,7 +260,7 @@ def generate_qwen38(model_dir, compilation_config, *, record_generation=False):
                 "max_model_len": 64,
                 "max_num_batched_tokens": 64,
                 "max_num_seqs": 2,
-                "gpu_memory_utilization": 0.9,
+                "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
                 "enable_chunked_prefill": False,
                 "enable_prefix_caching": False,
                 "async_scheduling": False,

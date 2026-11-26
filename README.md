@@ -201,10 +201,12 @@ compiled graph call, including request prefill and decode. The assertions in
 `python/tests/test_iree_qwen3_integration.py` and `assert_outputs_match` in
 `python/tests/vllm_test_utils.py` compare generated token IDs exactly and the
 selected-token log-probabilities with `rtol=1e-4`, `atol=1e-5`. Pytest reports
-pass or failure; it does not print the compared values. This is coverage for
-that test model and those inputs, not a proof for every model or checkpoint.
-Without CUDA the cases are skipped. To test individual operations and mutation
-semantics against eager PyTorch, run:
+pass or failure; it does not print the compared values. The tests select a
+usable GPU within `CUDA_VISIBLE_DEVICES` and execute in a fresh process; add
+`-s` to the pytest command to see child progress. This is coverage for that
+test model and those inputs, not a proof for every model or checkpoint. Without
+CUDA or sufficient free GPU memory the cases are skipped. To test individual
+operations and mutation semantics against eager PyTorch, run:
 
 ```sh
 pixi run --locked test-python -v python/tests/test_iree_execution.py

@@ -1,6 +1,9 @@
 """Compare executable IREE backends against real vLLM Qwen3 inference."""
 
+import os
+
 import backend_spy
+import gpu_test_utils
 import pytest
 from backend_spy import VLLM_BACKEND, VLLM_SPY
 from vllm_test_utils import (
@@ -14,16 +17,30 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 pytestmark = pytest.mark.integration
+_CHILD = "KASHI_QWEN3_IREE_TEST_CHILD"
+_MIN_GPU_BYTES = 1024**3
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() and os.environ.get(_CHILD) != "1",
+    reason="CUDA device required",
+)
 @pytest.mark.parametrize("mode", ["cuda", "iree"])
-def test_iree_qwen3_matches_uncompiled_generation(
-    qwen_model_dir, tmp_path, monkeypatch, mode
-):
+def test_iree_qwen3_matches_uncompiled_generation(request, tmp_path, monkeypatch, mode):
     """Both modes preserve prefill, decode, token IDs and selected log-probabilities."""
+    if os.environ.get(_CHILD) != "1":
+        gpu_test_utils.run_gpu_child(
+            request.node.nodeid, child_marker=_CHILD, min_free_bytes=_MIN_GPU_BYTES
+        )
+        return
+    # A missing GPU in the child is a visibility failure, not a successful
+    # parent test. Only the parent is allowed to skip for absent hardware.
+    assert torch.cuda.is_available(), "selected CUDA device is not visible to child"
+
     from kashi.iree_backend import compile_iree_fx
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+
+    qwen_model_dir = request.getfixturevalue("qwen_model_dir")
 
     monkeypatch.setenv("KASHI_IREE_EXECUTION", mode)
     compiled_graphs = []

@@ -1,10 +1,11 @@
 """Exercise the first two full-width Qwen3.8-27B text layers end to end."""
 
 import os
-import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import gpu_test_utils
 import pytest
 import torch
 from backend_spy import VLLM_BACKEND, VLLM_SPY
@@ -37,45 +38,62 @@ def test_gpu_selection_preserves_visible_mig_identifier_on_ties(monkeypatch):
         lambda _: SimpleNamespace(major=8, uuid=object()),
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "MIG-first,MIG-second")
-    assert _select_gpu() == "MIG-first"
-
-
-def _select_gpu():
-    """Find a CUDA device with enough free memory for the real-width model."""
-    if not torch.version.cuda or not torch.cuda.is_available():
-        pytest.skip("two-layer Qwen3.8 FP8 requires an available NVIDIA CUDA device")
-    candidates = []
-    for index in range(torch.cuda.device_count()):
-        free, _ = torch.cuda.mem_get_info(index)
-        properties = torch.cuda.get_device_properties(index)
-        if free >= _MIN_GPU_BYTES and properties.major >= 8:
-            candidates.append((free, index))
-    if not candidates:
-        pytest.skip("two-layer Qwen3.8 FP8 requires 7 GiB free on a BF16-capable GPU")
-    _, index = max(candidates, key=lambda candidate: candidate[0])
-    # CUDA ordinals are relative to the parent visibility mask. Pass its
-    # original entry to the child, including MIG identifiers when present.
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    return visible.split(",")[index].strip() if visible is not None else str(index)
-
-
-def _run_gpu_child(nodeid):
-    """Select a GPU before CUDA initializes and fail if the child test fails."""
-    device = _select_gpu()
-    env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES=device, **{_CHILD: "1"})
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", nodeid],
-        cwd=Path(__file__).resolve().parents[2],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1800,
-        check=False,
+    assert (
+        gpu_test_utils.select_gpu(min_free_bytes=_MIN_GPU_BYTES, min_cuda_major=8)
+        == "MIG-first"
     )
-    assert result.returncode == 0, (
-        f"Qwen3.8 {device} test failed:\n{result.stdout}\n{result.stderr}"
+
+
+def test_gpu_selection_respects_vllm_memory_budget(monkeypatch):
+    """A larger free byte count is unusable if vLLM's 90% budget exceeds it."""
+    from types import SimpleNamespace
+
+    gib = 1024**3
+    memory = [(10 * gib, 16 * gib), (8 * gib, 8 * gib)]
+    monkeypatch.setattr(torch.version, "cuda", "test")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda index: memory[index])
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _: SimpleNamespace(major=8)
     )
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert (
+        gpu_test_utils.select_gpu(min_free_bytes=_MIN_GPU_BYTES, min_cuda_major=8)
+        == "1"
+    )
+
+
+def test_gpu_child_exits_without_waiting_for_descendant_output(tmp_path, monkeypatch):
+    """A descendant holding inherited output must not keep the parent waiting."""
+    executable = tmp_path / "pytest-child"
+    release = tmp_path / "release"
+    grandchild = (
+        "import pathlib,time; "
+        f"release=pathlib.Path({str(release)!r}); "
+        "deadline=time.monotonic()+15; "
+        "exec('while not release.exists() and time.monotonic() < deadline:\\n time.sleep(0.01)')"
+    )
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess,sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(executable))
+    monkeypatch.setattr(gpu_test_utils, "select_gpu", lambda **kwargs: "0")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        child = pool.submit(
+            gpu_test_utils.run_gpu_child,
+            "unused-node-id",
+            child_marker=_CHILD,
+            min_free_bytes=_MIN_GPU_BYTES,
+            min_cuda_major=8,
+        )
+        try:
+            child.result(timeout=5)
+        finally:
+            release.touch()
 
 
 def _assert_two_gdn_layers(*, expect_fp8):
@@ -148,7 +166,12 @@ def test_qwen38_fp8_gpu_matches_uncompiled(
 ):
     """Match 0.6B's FX, direct CUDA, and IREE-runtime parity tests using FP8."""
     if os.environ.get(_CHILD) != "1":
-        _run_gpu_child(request.node.nodeid)
+        gpu_test_utils.run_gpu_child(
+            request.node.nodeid,
+            child_marker=_CHILD,
+            min_free_bytes=_MIN_GPU_BYTES,
+            min_cuda_major=8,
+        )
         return
 
     import backend_spy
